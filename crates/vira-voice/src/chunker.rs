@@ -47,10 +47,15 @@ impl Default for ChunkerConfig {
                 "vs".to_string(),
                 "etc".to_string(),
                 "tp".to_string(),
+                "tphcm".to_string(),
                 "ths".to_string(),
                 "ts".to_string(),
+                "pgs".to_string(),
+                "gs".to_string(),
                 "eg".to_string(),
                 "ie".to_string(),
+                "vv".to_string(),
+                "th".to_string(),
             ],
         }
     }
@@ -114,10 +119,16 @@ impl SentenceChunker {
         let mut chunks = Vec::new();
 
         while let Some((chunk_end, next_start)) = self.find_next_chunk() {
-            let chunk = self.buffer[..chunk_end].trim().to_string();
+            let chunk = self.buffer[..chunk_end].trim();
+            let is_speakable = contains_speakable_content(chunk);
+            let cleaned = if is_speakable {
+                Some(normalize_whitespace(chunk))
+            } else {
+                None
+            };
             self.buffer.drain(..next_start);
-            if !chunk.is_empty() {
-                chunks.push(chunk);
+            if let Some(c) = cleaned {
+                chunks.push(c);
             }
         }
 
@@ -129,18 +140,24 @@ impl SentenceChunker {
         let mut chunks = Vec::new();
 
         while let Some((chunk_end, next_start)) = self.find_next_chunk() {
-            let chunk = self.buffer[..chunk_end].trim().to_string();
+            let chunk = self.buffer[..chunk_end].trim();
+            let is_speakable = contains_speakable_content(chunk);
+            let cleaned = if is_speakable {
+                Some(normalize_whitespace(chunk))
+            } else {
+                None
+            };
             self.buffer.drain(..next_start);
-            if !chunk.is_empty() {
-                chunks.push(chunk);
+            if let Some(c) = cleaned {
+                chunks.push(c);
             }
         }
 
-        let remaining = self.buffer.trim().to_string();
-        self.buffer.clear();
-        if !remaining.is_empty() {
-            chunks.push(remaining);
+        let remaining = self.buffer.trim();
+        if contains_speakable_content(remaining) {
+            chunks.push(normalize_whitespace(remaining));
         }
+        self.buffer.clear();
 
         chunks
     }
@@ -161,13 +178,20 @@ impl SentenceChunker {
         };
 
         let search_slice = &text[start_byte..];
+        let mut char_count = 0;
+        let mut has_alphanumeric = false;
 
         for (offset, ch) in search_slice.char_indices() {
             let curr_byte = start_byte + offset;
             let after_curr = curr_byte + ch.len_utf8();
+            char_count += 1;
+
+            if ch.is_alphanumeric() {
+                has_alphanumeric = true;
+            }
 
             // 1. Newlines always force a chunk boundary
-            if ch == '\n' || ch == '\r' {
+            if (ch == '\n' || ch == '\r') && has_alphanumeric {
                 let chunk_end = curr_byte;
                 let next_start = text[after_curr..]
                     .char_indices()
@@ -178,11 +202,16 @@ impl SentenceChunker {
             }
 
             // 2. Strong sentence delimiters (. ! ? etc.)
-            if self.config.sentence_delimiters.contains(&ch) {
+            if self.config.sentence_delimiters.contains(&ch) && ch != '\n' && ch != '\r' {
+                // Must have seen at least one speakable word before delimiter can terminate a sentence
+                if !has_alphanumeric {
+                    continue;
+                }
+
                 let prev_char = text[..curr_byte].chars().last();
                 let next_char = text[after_curr..].chars().next();
 
-                // Numbers with decimals like 3.14
+                // Numbers with decimals like 3.14 or 100.000
                 if ch == '.' {
                     if let (Some(p), Some(n)) = (prev_char, next_char) {
                         if p.is_ascii_digit() && n.is_ascii_digit() {
@@ -194,8 +223,25 @@ impl SentenceChunker {
                         return None;
                     }
 
-                    // Abbreviation check (e.g. Dr., tp., Prof.)
+                    // Domain names, URLs, filenames (e.g. www.rust-lang.org, example.com, main.rs)
+                    if let Some(n) = next_char {
+                        if !n.is_whitespace()
+                            && !is_closing_bracket_or_quote(n)
+                            && (n.is_alphanumeric() || n == '/' || n == '-')
+                            && !n.is_uppercase()
+                        {
+                            continue;
+                        }
+                    }
+
+                    // Numbered list item check: e.g. "1. " or "10. " at the start of chunk
                     let prefix = &text[start_byte..curr_byte];
+                    if prefix.chars().all(|c| c.is_ascii_digit()) {
+                        // Entire prefix before '.' is just digits (e.g. "1." or "2.")
+                        continue;
+                    }
+
+                    // Abbreviation check (e.g. Dr., tp., Prof., Th.S., PGS.TS., e.g., i.e.)
                     let word = prefix
                         .split(|c: char| c.is_whitespace() || c == '(' || c == '[' || c == '"' || c == '\'')
                         .next_back()
@@ -203,22 +249,38 @@ impl SentenceChunker {
                     let clean_word = word
                         .trim_matches(|c: char| !c.is_alphabetic())
                         .to_ascii_lowercase();
+                    let dotless = clean_word.replace('.', "");
+                    let last_part = clean_word.rsplit('.').next().unwrap_or("");
 
-                    if self
-                        .config
-                        .abbreviations
-                        .iter()
-                        .any(|abbr| abbr.eq_ignore_ascii_case(&clean_word))
-                    {
+                    if self.config.abbreviations.iter().any(|abbr| {
+                        abbr.eq_ignore_ascii_case(&clean_word)
+                            || abbr.eq_ignore_ascii_case(&dotless)
+                            || (!last_part.is_empty() && abbr.eq_ignore_ascii_case(last_part))
+                    }) {
                         continue;
+                    }
+
+                    // Single-letter initial check (e.g. "J. K. Rowling" or "George W. Bush")
+                    if clean_word.chars().count() == 1
+                        && word.chars().any(|c| c.is_uppercase())
+                        && next_char == Some(' ')
+                    {
+                        let next_word_char = text[after_curr..]
+                            .chars()
+                            .find(|c| !c.is_whitespace());
+                        if next_word_char.is_some_and(|c| c.is_alphabetic()) {
+                            continue;
+                        }
                     }
                 }
 
                 // Consume consecutive delimiters (e.g. "...", "!!!", "?!")
                 let mut delim_end = after_curr;
                 while let Some((_, next_delim)) = text[delim_end..].char_indices().next() {
-                    if self.config.sentence_delimiters.contains(&next_delim)
-                        || self.config.clause_delimiters.contains(&next_delim)
+                    if (self.config.sentence_delimiters.contains(&next_delim)
+                        || self.config.clause_delimiters.contains(&next_delim))
+                        && next_delim != '\n'
+                        && next_delim != '\r'
                     {
                         delim_end += next_delim.len_utf8();
                     } else {
@@ -247,10 +309,14 @@ impl SentenceChunker {
 
             // 3. Clause delimiters (, ; : —) for lower TTFA
             if self.config.split_on_clauses && self.config.clause_delimiters.contains(&ch) {
+                if !has_alphanumeric {
+                    continue;
+                }
+
                 let prev_char = text[..curr_byte].chars().last();
                 let next_char = text[after_curr..].chars().next();
 
-                // Numbers with commas like 100,000
+                // Numbers with commas like 100,000 or 3,14
                 if ch == ',' {
                     if let (Some(p), Some(n)) = (prev_char, next_char) {
                         if p.is_ascii_digit() && n.is_ascii_digit() {
@@ -262,8 +328,32 @@ impl SentenceChunker {
                     }
                 }
 
-                let clause_chars = text[start_byte..curr_byte].chars().count();
-                if clause_chars >= self.config.min_clause_chars {
+                // Colon `:` guards:
+                // - Timestamps like 9:30 or 14:00
+                // - URLs like https:// or http://
+                // - Must be followed by whitespace/quote or end of string to introduce a clause
+                if ch == ':' {
+                    if let (Some(p), Some(n)) = (prev_char, next_char) {
+                        if p.is_ascii_digit() && n.is_ascii_digit() {
+                            continue;
+                        }
+                    }
+                    if prev_char.is_some_and(|p| p.is_ascii_digit()) && next_char.is_none() {
+                        return None;
+                    }
+                    // URL protocol check: e.g. "https://" or "http://"
+                    if text[after_curr..].starts_with("//") {
+                        continue;
+                    }
+                    // In natural language, a colon introducing a clause is followed by whitespace or quote
+                    if let Some(n) = next_char {
+                        if !n.is_whitespace() && !is_closing_bracket_or_quote(n) {
+                            continue;
+                        }
+                    }
+                }
+
+                if char_count >= self.config.min_clause_chars {
                     let mut chunk_end = after_curr;
                     while let Some((_, closing)) = text[chunk_end..].char_indices().next() {
                         if is_closing_bracket_or_quote(closing) {
@@ -284,8 +374,7 @@ impl SentenceChunker {
             }
 
             // 4. Max length safeguard for run-on sentences
-            let current_chars = text[start_byte..curr_byte].chars().count();
-            if current_chars >= self.config.max_chunk_chars {
+            if self.config.max_chunk_chars > 0 && char_count >= self.config.max_chunk_chars {
                 if let Some(last_ws_offset) = text[start_byte..curr_byte].rfind(char::is_whitespace) {
                     let chunk_end = start_byte + last_ws_offset;
                     let next_start = text[chunk_end..]
@@ -293,10 +382,13 @@ impl SentenceChunker {
                         .find(|(_, c)| !c.is_whitespace())
                         .map(|(i, _)| chunk_end + i)
                         .unwrap_or(text.len());
-                    return Some((chunk_end, next_start));
-                } else {
-                    return Some((curr_byte, curr_byte));
+                    if next_start > 0 {
+                        return Some((chunk_end, next_start));
+                    }
                 }
+                let chunk_end = after_curr.max(start_byte + 1);
+                let next_start = chunk_end;
+                return Some((chunk_end, next_start));
             }
         }
 
@@ -304,8 +396,38 @@ impl SentenceChunker {
     }
 }
 
+fn contains_speakable_content(s: &str) -> bool {
+    s.chars().any(|c| c.is_alphanumeric())
+}
+
+fn normalize_whitespace(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut in_ws = false;
+
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !in_ws && !result.is_empty() {
+                result.push(' ');
+                in_ws = true;
+            }
+        } else {
+            result.push(ch);
+            in_ws = false;
+        }
+    }
+
+    if result.ends_with(' ') {
+        result.pop();
+    }
+
+    result
+}
+
 fn is_closing_bracket_or_quote(c: char) -> bool {
-    matches!(c, '"' | '\'' | '”' | '’' | '»' | ')' | ']' | '}')
+    matches!(
+        c,
+        '"' | '\'' | '”' | '’' | '»' | ')' | ']' | '}' | '」' | '』' | '〉' | '》'
+    )
 }
 
 #[cfg(test)]

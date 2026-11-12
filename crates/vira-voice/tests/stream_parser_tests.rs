@@ -116,6 +116,74 @@ fn test_stream_parser_reset() {
 }
 
 #[test]
+fn test_numbered_lists_not_split() {
+    let mut chunker = SentenceChunker::new();
+    let chunks = chunker.feed("1. Bước đầu tiên là chuẩn bị.\n2. Bước thứ hai là thực hiện.");
+    assert_eq!(
+        chunks,
+        vec![
+            "1. Bước đầu tiên là chuẩn bị.",
+            "2. Bước thứ hai là thực hiện."
+        ]
+    );
+}
+
+#[test]
+fn test_timestamp_with_colon_not_split() {
+    let mut chunker = SentenceChunker::new();
+    let chunks = chunker.feed("Cuộc họp sẽ bắt đầu lúc 9:30 sáng nay tại phòng họp.");
+    assert_eq!(
+        chunks,
+        vec!["Cuộc họp sẽ bắt đầu lúc 9:30 sáng nay tại phòng họp."]
+    );
+}
+
+#[test]
+fn test_pure_punctuation_leading_ellipsis() {
+    let mut chunker = SentenceChunker::new();
+    let chunks = chunker.feed("... Chào bạn! Tôi là Vira.");
+    assert_eq!(
+        chunks,
+        vec!["... Chào bạn!", "Tôi là Vira."]
+    );
+}
+
+#[test]
+fn test_vietnamese_multi_dot_abbreviations() {
+    let mut chunker = SentenceChunker::new();
+    let chunks = chunker.feed("Hôm nay chúng ta gặp Th.S. Nam và PGS.TS. Bình. Buổi gặp rất quan trọng!");
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0], "Hôm nay chúng ta gặp Th.S. Nam và PGS.TS. Bình.");
+    assert_eq!(chunks[1], "Buổi gặp rất quan trọng!");
+}
+
+#[test]
+fn test_unclosed_bracket_does_not_swallow_subsequent_tag() {
+    let mut parser = StreamParser::new();
+    let events = parser.feed("[ghi chú [wave] Xin chào bạn!");
+    assert!(
+        events.contains(&ParsedStreamEvent::Gesture("wave".to_string())),
+        "Tag [wave] after unclosed bracket must not be swallowed"
+    );
+}
+
+#[test]
+fn test_words_not_smashed_around_tags() {
+    let mut parser = StreamParser::new();
+    let events = parser.feed("Xin chào[wave]bạn nhé!");
+    let flushed = parser.finish();
+    let all_events = [events, flushed].concat();
+    assert!(
+        all_events.contains(&ParsedStreamEvent::Gesture("wave".to_string())),
+        "Tag should be extracted"
+    );
+    assert!(
+        all_events.contains(&ParsedStreamEvent::SpeakableText("Xin chào bạn nhé!".to_string())),
+        "Words 'chào' and 'bạn' should have a space separating them, not 'chàobạn'"
+    );
+}
+
+#[test]
 fn test_sentence_chunker_basic_delimiters() {
     let mut chunker = SentenceChunker::new();
     let chunks = chunker.feed("Câu thứ nhất. Câu thứ hai! Câu thứ ba? Dòng mới\nTiếp tục câu.");
@@ -231,4 +299,78 @@ fn test_sentence_chunker_max_length_safeguard() {
     for c in &chunks {
         assert!(c.chars().count() <= 40);
     }
+}
+
+#[test]
+fn test_unclosed_bracket_with_punctuation_does_not_stall() {
+    let mut parser = StreamParser::new();
+    // Contains punctuation inside unclosed bracket; should NOT stall waiting for 48 chars or finish
+    let events = parser.feed("[Draft 1.0! Xin chào bạn.");
+    assert_eq!(
+        events,
+        vec![
+            ParsedStreamEvent::SpeakableText("[Draft 1.0!".to_string()),
+            ParsedStreamEvent::SpeakableText("Xin chào bạn.".to_string())
+        ]
+    );
+}
+
+#[test]
+fn test_initial_abbreviations_rowling() {
+    let mut chunker = SentenceChunker::new();
+    let chunks = chunker.feed("Tác giả J. K. Rowling đã viết tác phẩm này. Bạn đã đọc chưa?");
+    assert_eq!(
+        chunks,
+        vec![
+            "Tác giả J. K. Rowling đã viết tác phẩm này.",
+            "Bạn đã đọc chưa?"
+        ]
+    );
+}
+
+#[test]
+fn test_fullwidth_cjk_punctuation_and_attached_quotes() {
+    let mut chunker = SentenceChunker::new();
+    let chunks = chunker.feed("「こんにちは！」 次の文です。");
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0], "「こんにちは！」");
+    assert_eq!(chunks[1], "次の文です。");
+}
+
+#[test]
+fn test_markdown_links_not_swallowed() {
+    let mut parser = StreamParser::new();
+    let events = parser.feed("[wave] Xem tại [Rust Lang](https://www.rust-lang.org) để bắt đầu. [happy]");
+    assert_eq!(
+        events,
+        vec![
+            ParsedStreamEvent::Gesture("wave".to_string()),
+            ParsedStreamEvent::SpeakableText("Xem tại [Rust Lang](https://www.rust-lang.org) để bắt đầu.".to_string()),
+            ParsedStreamEvent::Emotion("happy".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn test_multiple_consecutive_tags() {
+    let mut parser = StreamParser::new();
+    let events = parser.feed("[happy][wave][nod] Chào bạn!");
+    assert_eq!(
+        events,
+        vec![
+            ParsedStreamEvent::Emotion("happy".to_string()),
+            ParsedStreamEvent::Gesture("wave".to_string()),
+            ParsedStreamEvent::Gesture("nod".to_string()),
+            ParsedStreamEvent::SpeakableText("Chào bạn!".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn test_url_with_colon_not_split_early() {
+    let mut chunker = SentenceChunker::new();
+    let chunks = chunker.feed("Hãy truy cập http://localhost:8080/api ngay hôm nay. Hẹn gặp lại!");
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0], "Hãy truy cập http://localhost:8080/api ngay hôm nay.");
+    assert_eq!(chunks[1], "Hẹn gặp lại!");
 }

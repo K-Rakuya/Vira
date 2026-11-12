@@ -94,6 +94,8 @@ impl ParsedStreamEvent {
 pub struct StreamParser {
     chunker: SentenceChunker,
     pending_raw: String,
+    last_char: Option<char>,
+    tag_just_stripped: bool,
     custom_gestures: HashSet<String>,
 }
 
@@ -109,6 +111,8 @@ impl StreamParser {
         Self {
             chunker: SentenceChunker::new(),
             pending_raw: String::new(),
+            last_char: None,
+            tag_just_stripped: false,
             custom_gestures: HashSet::new(),
         }
     }
@@ -118,6 +122,8 @@ impl StreamParser {
         Self {
             chunker: SentenceChunker::with_config(config),
             pending_raw: String::new(),
+            last_char: None,
+            tag_just_stripped: false,
             custom_gestures: HashSet::new(),
         }
     }
@@ -146,11 +152,48 @@ impl StreamParser {
     pub fn reset(&mut self) {
         self.pending_raw.clear();
         self.chunker.reset();
+        self.last_char = None;
+        self.tag_just_stripped = false;
+    }
+
+    fn push_text_to_chunker(&mut self, text: &str, events: &mut Vec<ParsedStreamEvent>) {
+        if let Some(last) = text.chars().last() {
+            self.last_char = Some(last);
+        }
+        let chunks = self.chunker.feed(text);
+        for chunk in chunks {
+            events.push(ParsedStreamEvent::SpeakableText(chunk));
+        }
+    }
+
+    fn on_tag_removed(&mut self, c_idx: usize) {
+        let after_tag_char = self.pending_raw[c_idx + 1..].chars().next();
+        let need_space_before = self.last_char.is_some_and(|c| c.is_alphanumeric());
+
+        self.pending_raw.drain(..=c_idx);
+
+        if let Some(next_c) = after_tag_char {
+            if need_space_before && next_c.is_alphanumeric() {
+                self.pending_raw.insert(0, ' ');
+            }
+            self.tag_just_stripped = false;
+        } else {
+            self.tag_just_stripped = need_space_before;
+        }
     }
 
     /// Ingests an incoming token chunk from LLM stream and returns any extracted avatar events
     /// and complete speakable sentence chunks.
     pub fn feed(&mut self, text: &str) -> Vec<ParsedStreamEvent> {
+        if self.tag_just_stripped {
+            if let Some(first_c) = text.chars().next() {
+                if first_c.is_alphanumeric() {
+                    self.pending_raw.push(' ');
+                }
+            }
+            self.tag_just_stripped = false;
+        }
+
         self.pending_raw.push_str(text);
         let mut events = Vec::new();
 
@@ -160,20 +203,14 @@ impl StreamParser {
                 None => {
                     // No open brackets present; the entire pending string is speakable text
                     let text = std::mem::take(&mut self.pending_raw);
-                    let chunks = self.chunker.feed(&text);
-                    for chunk in chunks {
-                        events.push(ParsedStreamEvent::SpeakableText(chunk));
-                    }
+                    self.push_text_to_chunker(&text, &mut events);
                     break;
                 }
                 Some(idx) => {
                     // If there is text before the opening bracket, feed it to the sentence chunker
                     if idx > 0 {
                         let text_before = self.pending_raw[..idx].to_string();
-                        let chunks = self.chunker.feed(&text_before);
-                        for chunk in chunks {
-                            events.push(ParsedStreamEvent::SpeakableText(chunk));
-                        }
+                        self.push_text_to_chunker(&text_before, &mut events);
                         self.pending_raw.drain(..idx);
                     }
 
@@ -181,50 +218,60 @@ impl StreamParser {
                     let close_idx = self.pending_raw.find(']');
                     match close_idx {
                         Some(c_idx) => {
-                            let inner = self.pending_raw[1..c_idx].trim();
+                            let inner_slice = &self.pending_raw[1..c_idx];
+                            // If there is another '[' before ']', the first '[' is plain text
+                            if let Some(second_open) = inner_slice.find('[') {
+                                let non_tag = self.pending_raw[..1 + second_open].to_string();
+                                self.pending_raw.drain(..1 + second_open);
+                                self.push_text_to_chunker(&non_tag, &mut events);
+                                continue;
+                            }
+
+                            let inner = inner_slice.trim();
 
                             if let Some((kind, val)) = inner.split_once(':') {
                                 let kind = kind.trim().to_ascii_lowercase();
                                 let val = val.trim().to_ascii_lowercase();
                                 if kind == "emotion" && !val.is_empty() {
                                     events.push(ParsedStreamEvent::Emotion(val));
-                                    self.pending_raw.drain(..=c_idx);
+                                    self.on_tag_removed(c_idx);
                                 } else if kind == "gesture" && !val.is_empty() {
                                     events.push(ParsedStreamEvent::Gesture(val));
-                                    self.pending_raw.drain(..=c_idx);
+                                    self.on_tag_removed(c_idx);
                                 } else {
                                     let non_tag = self.pending_raw[..=c_idx].to_string();
                                     self.pending_raw.drain(..=c_idx);
-                                    let chunks = self.chunker.feed(&non_tag);
-                                    for chunk in chunks {
-                                        events.push(ParsedStreamEvent::SpeakableText(chunk));
-                                    }
+                                    self.push_text_to_chunker(&non_tag, &mut events);
                                 }
                             } else if self.is_known_gesture(inner) {
                                 events.push(ParsedStreamEvent::Gesture(inner.to_ascii_lowercase()));
-                                self.pending_raw.drain(..=c_idx);
+                                self.on_tag_removed(c_idx);
                             } else if self.is_known_emotion(inner) {
                                 events.push(ParsedStreamEvent::Emotion(inner.to_ascii_lowercase()));
-                                self.pending_raw.drain(..=c_idx);
+                                self.on_tag_removed(c_idx);
                             } else {
                                 // Not a tag (e.g. citation `[1]` or markdown `[Link]`). Treat as regular text.
                                 let non_tag = self.pending_raw[..=c_idx].to_string();
                                 self.pending_raw.drain(..=c_idx);
-                                let chunks = self.chunker.feed(&non_tag);
-                                for chunk in chunks {
-                                    events.push(ParsedStreamEvent::SpeakableText(chunk));
-                                }
+                                self.push_text_to_chunker(&non_tag, &mut events);
                             }
                         }
                         None => {
                             // Incomplete bracket tag (e.g. `[em` or `[gesture:wa`).
-                            // If it exceeds reasonable tag length or spans newlines, it's regular text.
-                            if self.pending_raw.len() > 64 || self.pending_raw.contains('\n') {
+                            let slice = &self.pending_raw[1..];
+                            let has_invalid_tag_char = slice.chars().any(|c| {
+                                matches!(c, '.' | '!' | '?' | ',' | ';' | '\n' | '\r' | '(' | ')' | '{' | '}')
+                            });
+                            let has_second_open = slice.contains('[');
+
+                            if has_invalid_tag_char || self.pending_raw.len() > 48 {
                                 let not_tag = std::mem::take(&mut self.pending_raw);
-                                let chunks = self.chunker.feed(&not_tag);
-                                for chunk in chunks {
-                                    events.push(ParsedStreamEvent::SpeakableText(chunk));
-                                }
+                                self.push_text_to_chunker(&not_tag, &mut events);
+                            } else if has_second_open {
+                                let second_open = slice.find('[').unwrap();
+                                let not_tag = self.pending_raw[..1 + second_open].to_string();
+                                self.pending_raw.drain(..1 + second_open);
+                                self.push_text_to_chunker(&not_tag, &mut events);
                             }
                             // Otherwise wait for the closing bracket in subsequent chunks
                             break;
@@ -254,6 +301,8 @@ impl StreamParser {
             events.push(ParsedStreamEvent::SpeakableText(chunk));
         }
 
+        self.last_char = None;
+        self.tag_just_stripped = false;
         events
     }
 
