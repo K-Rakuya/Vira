@@ -1,12 +1,13 @@
 use std::sync::Mutex;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use serde::{Deserialize, Serialize};
 use vira_ports::audio::{AudioError, AudioPlaybackPort};
 
 use crate::clock::MasterAudioClock;
 use crate::ring_buffer::{AudioConsumer, AudioProducer, AudioRingBuffer};
 
 /// Configuration parameters for native audio playback.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaybackConfig {
     /// Sample rate in Hz (default: 48000).
     pub sample_rate: u32,
@@ -103,20 +104,19 @@ impl PlaybackEngine {
                         let read = consumer.pop_slice(data);
                         clock_clone.advance_samples(read as u64);
                     } else {
-                        let frames = data.len() / channels;
-                        let mut frames_read = 0;
-                        for frame_idx in 0..frames {
-                            let sample = if let Some(s) = consumer.pop() {
-                                frames_read += 1;
-                                s
-                            } else {
-                                0.0
-                            };
-                            for ch in 0..channels {
-                                data[frame_idx * channels + ch] = sample;
+                        let mut mono_buf = [0.0f32; 512];
+                        let mut total_rendered = 0u64;
+                        for chunk in data.chunks_mut(512 * channels) {
+                            let frames = chunk.len() / channels;
+                            let read = consumer.pop_slice(&mut mono_buf[..frames]);
+                            total_rendered += read as u64;
+                            for (i, &sample) in mono_buf[..frames].iter().enumerate() {
+                                for ch in 0..channels {
+                                    chunk[i * channels + ch] = sample;
+                                }
                             }
                         }
-                        clock_clone.advance_samples(frames_read as u64);
+                        clock_clone.advance_samples(total_rendered);
                     }
                 },
                 err_callback,

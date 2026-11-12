@@ -236,3 +236,71 @@ fn test_multi_thread_audio_pipeline_stress() {
     assert!(total_rendered > 0);
     assert!(playback.get_sample_clock() > 0);
 }
+
+#[test]
+fn test_ring_buffer_preserves_audio_after_barge_in() {
+    let (playback, mut consumer) = PlaybackEngine::new_virtual(48000, 2048);
+    let playback = Arc::new(playback);
+    let controller = BargeInController::new(playback.clone());
+
+    // 1. Play first utterance
+    playback.enqueue_samples(&[0.5; 500]).unwrap();
+    assert_eq!(playback.buffered_samples(), 500);
+
+    // 2. Barge in occurs!
+    let report = controller.trigger_barge_in().unwrap();
+    assert_eq!(report.interrupted_at_ms, 0);
+    assert_eq!(playback.buffered_samples(), 0);
+
+    // 3. Immediately enqueue second utterance (TTS response to interruption)
+    playback.enqueue_samples(&[0.9; 200]).unwrap();
+    assert_eq!(playback.buffered_samples(), 200);
+
+    // 4. Consumer reads: old 500 must be discarded, new 200 must be delivered cleanly!
+    assert_eq!(consumer.slots(), 200);
+    let mut out = [0.0f32; 200];
+    let read = consumer.pop_slice(&mut out);
+    assert_eq!(read, 200);
+    assert_eq!(out, [0.9f32; 200]);
+    assert_eq!(playback.buffered_samples(), 0);
+}
+
+#[test]
+fn test_viseme_sample_at_explicit_timestamp() {
+    let clock = MasterAudioClock::new(48000);
+    let visemes = vec![
+        TimedViseme::new(0, VisemeWeights::new(0.0, 0.0, 0.0, 0.0, 0.0)),
+        TimedViseme::new(100, VisemeWeights::new(1.0, 0.0, 0.0, 0.0, 0.0)),
+    ];
+
+    // Sampling at explicit timestamp 50ms without advancing the main clock
+    assert_eq!(clock.current_sample(), 0);
+    let v_50 = clock.sample_viseme_at_ms(&visemes, 50);
+    assert!((v_50.aa - 0.5).abs() < 1e-4);
+    assert_eq!(clock.current_sample(), 0);
+}
+
+#[test]
+fn test_configs_and_reports_serde() {
+    use vira_voice::barge_in::BargeInReport;
+    use vira_voice::capture::CaptureConfig;
+    use vira_voice::playback::PlaybackConfig;
+
+    let pb_config = PlaybackConfig::default();
+    let pb_json = serde_json::to_string(&pb_config).unwrap();
+    let pb_dec: PlaybackConfig = serde_json::from_str(&pb_json).unwrap();
+    assert_eq!(pb_config, pb_dec);
+
+    let cap_config = CaptureConfig::default();
+    let cap_json = serde_json::to_string(&cap_config).unwrap();
+    let cap_dec: CaptureConfig = serde_json::from_str(&cap_json).unwrap();
+    assert_eq!(cap_config, cap_dec);
+
+    let report = BargeInReport {
+        interrupted_at_ms: 450,
+        interrupted_sample: 21600,
+    };
+    let report_json = serde_json::to_string(&report).unwrap();
+    let report_dec: BargeInReport = serde_json::from_str(&report_json).unwrap();
+    assert_eq!(report, report_dec);
+}

@@ -6,7 +6,8 @@ use vira_ports::audio::AudioError;
 ///
 /// Provides zero-allocation, lock-free communication between background async tasks (producer)
 /// and high-priority OS audio callbacks (consumer).
-/// Supports sub-millisecond atomic buffer flushing for instant (<10ms) user barge-in.
+/// Supports sub-millisecond atomic buffer flushing for instant (<10ms) user barge-in without
+/// discarding any new audio written after the flush.
 #[derive(Debug)]
 pub struct AudioRingBuffer;
 
@@ -14,19 +15,22 @@ impl AudioRingBuffer {
     /// Creates a lock-free SPSC ring buffer pair with the specified sample capacity.
     pub fn create(capacity: usize) -> (AudioProducer, AudioConsumer) {
         let (producer, consumer) = rtrb::RingBuffer::<f32>::new(capacity);
-        let flush_generation = Arc::new(AtomicU64::new(0));
+        let total_written = Arc::new(AtomicU64::new(0));
+        let total_read = Arc::new(AtomicU64::new(0));
+        let discard_target = Arc::new(AtomicU64::new(0));
 
         let p = AudioProducer {
             inner: producer,
-            flush_generation: flush_generation.clone(),
+            total_written: total_written.clone(),
+            total_read: total_read.clone(),
+            discard_target: discard_target.clone(),
             capacity,
-            flushed: false,
         };
 
         let c = AudioConsumer {
             inner: consumer,
-            flush_generation,
-            seen_generation: 0,
+            total_read,
+            discard_target,
             capacity,
         };
 
@@ -39,9 +43,10 @@ impl AudioRingBuffer {
 /// Thread-safe for writing from worker or async threads.
 pub struct AudioProducer {
     inner: rtrb::Producer<f32>,
-    flush_generation: Arc<AtomicU64>,
+    total_written: Arc<AtomicU64>,
+    total_read: Arc<AtomicU64>,
+    discard_target: Arc<AtomicU64>,
     capacity: usize,
-    flushed: bool,
 }
 
 impl AudioProducer {
@@ -63,15 +68,21 @@ impl AudioProducer {
         self.inner.is_full()
     }
 
-    /// Returns the estimated number of buffered samples awaiting playback.
-    /// Returns 0 immediately after a flush.
+    /// Returns the number of valid queued samples awaiting playback.
+    /// Excludes flushed / discarded samples even before the consumer runs.
     #[inline]
     pub fn buffered_samples(&self) -> usize {
-        if self.flushed {
-            0
-        } else {
-            self.capacity.saturating_sub(self.inner.slots())
-        }
+        let written = self.total_written.load(Ordering::Acquire);
+        let discard = self.discard_target.load(Ordering::Acquire);
+        let read = self.total_read.load(Ordering::Acquire);
+        let effective_read = discard.max(read);
+        written.saturating_sub(effective_read) as usize
+    }
+
+    /// Monotonic count of total samples pushed by this producer.
+    #[inline]
+    pub fn total_written(&self) -> u64 {
+        self.total_written.load(Ordering::Acquire)
     }
 
     /// Pushes an exact slice of PCM 32-bit float samples into the ring buffer.
@@ -86,16 +97,15 @@ impl AudioProducer {
             });
         }
 
-        for &sample in samples {
-            if self.inner.push(sample).is_err() {
-                return Err(AudioError::BufferOverflow {
-                    requested: samples.len(),
-                    available: self.inner.slots(),
-                });
-            }
-        }
+        self.inner
+            .push_entire_slice(samples)
+            .map_err(|_| AudioError::BufferOverflow {
+                requested: samples.len(),
+                available: self.inner.slots(),
+            })?;
 
-        self.flushed = false;
+        self.total_written
+            .fetch_add(samples.len() as u64, Ordering::Release);
         Ok(())
     }
 
@@ -103,19 +113,13 @@ impl AudioProducer {
     ///
     /// Returns the number of samples actually written. Never overflows.
     pub fn push_partial(&mut self, samples: &[f32]) -> Result<usize, AudioError> {
-        let available = self.inner.slots();
-        let to_write = samples.len().min(available);
-
-        for &sample in &samples[..to_write] {
-            if self.inner.push(sample).is_err() {
-                break;
-            }
+        let (written, _) = self.inner.push_partial_slice(samples);
+        let count = written.len();
+        if count > 0 {
+            self.total_written
+                .fetch_add(count as u64, Ordering::Release);
         }
-
-        if to_write > 0 {
-            self.flushed = false;
-        }
-        Ok(to_write)
+        Ok(count)
     }
 
     /// Pushes a single float sample.
@@ -124,17 +128,18 @@ impl AudioProducer {
             requested: 1,
             available: self.inner.slots(),
         })?;
-        self.flushed = false;
+        self.total_written.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
-    /// Instantly triggers a flush of all pending audio in the buffer.
+    /// Instantly triggers a flush of all pending audio currently written up to this point.
     ///
-    /// The consumer will discard all queued audio on its next check or audio callback cycle.
+    /// Any audio pushed AFTER this flush call will be preserved and played normally.
     #[inline]
     pub fn flush(&mut self) {
-        self.flushed = true;
-        self.flush_generation.fetch_add(1, Ordering::SeqCst);
+        let current_written = self.total_written.load(Ordering::Acquire);
+        self.discard_target
+            .fetch_max(current_written, Ordering::SeqCst);
     }
 }
 
@@ -147,21 +152,28 @@ unsafe impl Send for AudioProducer {}
 /// Completely lock-free and wait-free without heap allocations.
 pub struct AudioConsumer {
     inner: rtrb::Consumer<f32>,
-    flush_generation: Arc<AtomicU64>,
-    seen_generation: u64,
+    total_read: Arc<AtomicU64>,
+    discard_target: Arc<AtomicU64>,
     capacity: usize,
 }
 
 impl AudioConsumer {
-    /// Internal helper to drain the buffer if a flush was signaled by the producer.
-    fn check_and_apply_flush(&mut self) {
-        let current_gen = self.flush_generation.load(Ordering::Acquire);
-        if current_gen > self.seen_generation {
-            self.seen_generation = current_gen;
-            let unread = self.inner.slots();
-            if unread > 0 {
-                if let Ok(chunk) = self.inner.read_chunk(unread) {
+    /// Internal helper to drain samples marked for discard during barge-in.
+    #[inline]
+    fn apply_discard(&mut self) {
+        let discard_target = self.discard_target.load(Ordering::Acquire);
+        let current_read = self.total_read.load(Ordering::Acquire);
+
+        if discard_target > current_read {
+            let needed = (discard_target - current_read) as usize;
+            let available = self.inner.slots();
+            let to_discard = needed.min(available);
+
+            if to_discard > 0 {
+                if let Ok(chunk) = self.inner.read_chunk(to_discard) {
                     chunk.commit_all();
+                    self.total_read
+                        .fetch_add(to_discard as u64, Ordering::Release);
                 }
             }
         }
@@ -176,7 +188,7 @@ impl AudioConsumer {
     /// Returns the number of readable samples currently buffered.
     /// Automatically applies pending flushes if signaled.
     pub fn slots(&mut self) -> usize {
-        self.check_and_apply_flush();
+        self.apply_discard();
         self.inner.slots()
     }
 
@@ -185,36 +197,41 @@ impl AudioConsumer {
         self.slots() == 0
     }
 
-    /// Pops a single sample if available. Returns None if empty or flushed.
-    pub fn pop(&mut self) -> Option<f32> {
-        self.check_and_apply_flush();
-        self.inner.pop().ok()
+    /// Monotonic count of total samples read or discarded by this consumer.
+    #[inline]
+    pub fn total_read(&self) -> u64 {
+        self.total_read.load(Ordering::Acquire)
     }
 
-    /// Reads samples into `output`.
+    /// Pops a single sample if available. Returns None if empty or flushed.
+    pub fn pop(&mut self) -> Option<f32> {
+        self.apply_discard();
+        if let Ok(sample) = self.inner.pop() {
+            self.total_read.fetch_add(1, Ordering::Release);
+            Some(sample)
+        } else {
+            None
+        }
+    }
+
+    /// Reads samples into `output` using zero-copy / SIMD memory copy.
     ///
     /// If fewer samples are available than `output.len()`, the remainder of `output`
     /// is zeroed with silence (0.0). Returns the number of actual audio samples read.
     pub fn pop_slice(&mut self, output: &mut [f32]) -> usize {
-        self.check_and_apply_flush();
+        self.apply_discard();
 
-        let available = self.inner.slots();
-        let to_read = output.len().min(available);
+        let (read_slice, unread_slice) = self.inner.pop_partial_slice(output);
+        let count = read_slice.len();
 
-        for out in output.iter_mut().take(to_read) {
-            if let Ok(sample) = self.inner.pop() {
-                *out = sample;
-            } else {
-                *out = 0.0;
-            }
+        if count > 0 {
+            self.total_read.fetch_add(count as u64, Ordering::Release);
         }
 
-        // Fill remaining output buffer with silence
-        for out in output.iter_mut().skip(to_read) {
-            *out = 0.0;
-        }
+        // Fill remainder with silence
+        unread_slice.fill(0.0);
 
-        to_read
+        count
     }
 }
 
@@ -270,5 +287,45 @@ mod tests {
         let written = producer.push_partial(&[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
         assert_eq!(written, 4);
         assert_eq!(consumer.slots(), 4);
+    }
+
+    #[test]
+    fn test_ring_buffer_preserves_audio_after_flush() {
+        let (mut producer, mut consumer) = AudioRingBuffer::create(1024);
+        producer.push_slice(&[1.0; 100]).expect("push old");
+        assert_eq!(consumer.slots(), 100);
+        assert_eq!(producer.buffered_samples(), 100);
+
+        // Interruption / flush
+        producer.flush();
+        assert_eq!(producer.buffered_samples(), 0);
+
+        // Push new utterance immediately
+        producer.push_slice(&[2.0; 50]).expect("push new");
+        assert_eq!(producer.buffered_samples(), 50);
+
+        // Consumer reads: old 100 should be discarded, new 50 should be read!
+        assert_eq!(consumer.slots(), 50);
+        let mut out = [0.0f32; 50];
+        let read = consumer.pop_slice(&mut out);
+        assert_eq!(read, 50);
+        assert_eq!(out, [2.0f32; 50]);
+        assert_eq!(producer.buffered_samples(), 0);
+    }
+
+    #[test]
+    fn test_ring_buffer_accounting_during_read() {
+        let (mut producer, mut consumer) = AudioRingBuffer::create(1024);
+        producer.push_slice(&[0.5; 300]).unwrap();
+        assert_eq!(producer.buffered_samples(), 300);
+
+        let mut out = [0.0; 100];
+        let read = consumer.pop_slice(&mut out);
+        assert_eq!(read, 100);
+        assert_eq!(producer.buffered_samples(), 200);
+
+        producer.flush();
+        assert_eq!(producer.buffered_samples(), 0);
+        assert_eq!(consumer.slots(), 0);
     }
 }

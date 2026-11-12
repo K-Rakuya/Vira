@@ -1,14 +1,17 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use async_trait::async_trait;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use vira_ports::audio::{AudioCapturePort, AudioError};
 
+use crate::ring_buffer::AudioRingBuffer;
+
 /// Configuration parameters for microphone audio capture.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureConfig {
     /// Sample rate in Hz (default: 16000 Hz, standard for VAD and STT).
     pub sample_rate: u32,
@@ -50,7 +53,7 @@ struct StreamHandle(#[allow(dead_code)] cpal::Stream);
 unsafe impl Send for StreamHandle {}
 unsafe impl Sync for StreamHandle {}
 
-/// Real-time microphone audio capture engine powered by `cpal`.
+/// Real-time microphone audio capture engine powered by `cpal` and lock-free SPSC buffers.
 ///
 /// Implements `AudioCapturePort` from `vira-ports`.
 pub struct CaptureEngine {
@@ -59,6 +62,7 @@ pub struct CaptureEngine {
     is_capturing: Arc<AtomicBool>,
     broadcast_tx: broadcast::Sender<Vec<f32>>,
     _stream: Option<StreamHandle>,
+    _worker_cancel: Option<CancellationToken>,
 }
 
 impl CaptureEngine {
@@ -77,12 +81,17 @@ impl CaptureEngine {
             is_capturing: Arc::new(AtomicBool::new(true)),
             broadcast_tx,
             _stream: None,
+            _worker_cancel: None,
         };
 
         (engine, feed)
     }
 
     /// Initializes a live native audio capture engine using `cpal` and the system's microphone.
+    ///
+    /// The high-priority OS audio callback pushes directly to a lock-free `AudioRingBuffer`
+    /// without mutexes or heap allocations. A background async task consumes chunks and broadcasts
+    /// them downstream.
     pub fn new_native(config: CaptureConfig) -> Result<Self, AudioError> {
         let host = cpal::default_host();
         let device = if let Some(ref name) = config.device_name {
@@ -101,13 +110,16 @@ impl CaptureEngine {
             buffer_size: cpal::BufferSize::Default,
         };
 
+        let ring_capacity = config.chunk_size.max(512) * 16;
+        let (mut producer, mut consumer) = AudioRingBuffer::create(ring_capacity);
+
         let (broadcast_tx, _) = broadcast::channel(128);
-        let tx_clone = broadcast_tx.clone();
-        let chunk_size = config.chunk_size;
         let is_capturing = Arc::new(AtomicBool::new(true));
         let is_capturing_clone = is_capturing.clone();
 
-        let accumulator = Arc::new(Mutex::new(Vec::with_capacity(chunk_size * 2)));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let notify_audio = notify.clone();
+        let channels = config.channels as usize;
 
         let err_callback = |err| {
             eprintln!("Audio capture stream error: {err}");
@@ -121,13 +133,24 @@ impl CaptureEngine {
                         return;
                     }
 
-                    if let Ok(mut acc) = accumulator.lock() {
-                        acc.extend_from_slice(data);
-                        while acc.len() >= chunk_size {
-                            let chunk: Vec<f32> = acc.drain(..chunk_size).collect();
-                            let _ = tx_clone.send(chunk);
+                    if channels == 1 {
+                        let _ = producer.push_partial(data);
+                    } else {
+                        // Downmix multi-channel to mono via stack buffer - zero heap allocations
+                        let mut mono_buf = [0.0f32; 512];
+                        for chunk in data.chunks(512 * channels) {
+                            let frames = chunk.len() / channels;
+                            for (i, mono) in mono_buf[..frames].iter_mut().enumerate() {
+                                let mut sum = 0.0f32;
+                                for ch in 0..channels {
+                                    sum += chunk[i * channels + ch];
+                                }
+                                *mono = sum / channels as f32;
+                            }
+                            let _ = producer.push_partial(&mono_buf[..frames]);
                         }
                     }
+                    notify_audio.notify_one();
                 },
                 err_callback,
                 None,
@@ -138,18 +161,52 @@ impl CaptureEngine {
             .play()
             .map_err(|e| AudioError::Stream(e.to_string()))?;
 
+        // Background worker to consume from lock-free ring buffer and dispatch chunks to broadcast channel
+        let worker_cancel = CancellationToken::new();
+        let worker_cancel_task = worker_cancel.clone();
+        let worker_tx = broadcast_tx.clone();
+        let chunk_size = config.chunk_size;
+        let is_capturing_worker = is_capturing.clone();
+
+        tokio::spawn(async move {
+            let mut chunk_buf = vec![0.0f32; chunk_size];
+            while !worker_cancel_task.is_cancelled() {
+                if consumer.slots() >= chunk_size {
+                    let read = consumer.pop_slice(&mut chunk_buf);
+                    if read == chunk_size && is_capturing_worker.load(Ordering::Relaxed) {
+                        let _ = worker_tx.send(chunk_buf.clone());
+                    }
+                } else {
+                    tokio::select! {
+                        _ = worker_cancel_task.cancelled() => break,
+                        _ = notify.notified() => {},
+                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(5)) => {},
+                    }
+                }
+            }
+        });
+
         Ok(Self {
             sample_rate: config.sample_rate,
             chunk_size: config.chunk_size,
             is_capturing,
             broadcast_tx,
             _stream: Some(StreamHandle(stream)),
+            _worker_cancel: Some(worker_cancel),
         })
     }
 
     /// Returns the chunk size in samples.
     pub fn chunk_size(&self) -> usize {
         self.chunk_size
+    }
+}
+
+impl Drop for CaptureEngine {
+    fn drop(&mut self) {
+        if let Some(ref cancel) = self._worker_cancel {
+            cancel.cancel();
+        }
     }
 }
 
@@ -281,5 +338,18 @@ mod tests {
 
         engine.start_capture().unwrap();
         assert!(engine.is_capturing());
+    }
+
+    #[test]
+    fn test_capture_config_serde() {
+        let config = CaptureConfig {
+            sample_rate: 16000,
+            channels: 1,
+            chunk_size: 512,
+            device_name: Some("default_mic".to_string()),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let decoded: CaptureConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config, decoded);
     }
 }

@@ -101,15 +101,11 @@ impl MasterAudioClock {
         }
     }
 
-    /// Samples and linearly interpolates the active viseme blendshapes at the current playhead time.
-    ///
-    /// Enables 60Hz Viseme lip-sync aligned precisely to the audio speaker output.
-    pub fn sample_viseme(&self, visemes: &[TimedViseme]) -> VisemeWeights {
+    /// Samples and linearly interpolates the active viseme blendshapes at an explicit timestamp in milliseconds.
+    pub fn sample_viseme_at_ms(&self, visemes: &[TimedViseme], now_ms: u64) -> VisemeWeights {
         if visemes.is_empty() {
             return VisemeWeights::zero();
         }
-
-        let now_ms = self.current_time_ms();
 
         // Before first keyframe
         if now_ms <= visemes[0].timestamp_ms {
@@ -139,6 +135,13 @@ impl MasterAudioClock {
         let alpha = (elapsed as f32 / span as f32).clamp(0.0, 1.0);
 
         v0.weights.lerp(&v1.weights, alpha)
+    }
+
+    /// Samples and linearly interpolates the active viseme blendshapes at the current playhead time.
+    ///
+    /// Enables 60Hz Viseme lip-sync aligned precisely to the audio speaker output.
+    pub fn sample_viseme(&self, visemes: &[TimedViseme]) -> VisemeWeights {
+        self.sample_viseme_at_ms(visemes, self.current_time_ms())
     }
 }
 

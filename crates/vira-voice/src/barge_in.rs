@@ -1,10 +1,11 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use vira_ports::audio::{AudioError, AudioPlaybackPort};
 
 /// Report generated when user barge-in interruption is triggered.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BargeInReport {
     /// Playback timestamp in milliseconds when interruption was triggered.
     pub interrupted_at_ms: u64,
@@ -18,7 +19,7 @@ pub struct BargeInReport {
 pub struct BargeInController {
     playback: Arc<dyn AudioPlaybackPort>,
     cancel_token: Mutex<CancellationToken>,
-    energy_threshold: Mutex<f32>,
+    energy_threshold_bits: AtomicU32,
     enabled: AtomicBool,
 }
 
@@ -28,7 +29,7 @@ impl BargeInController {
         Self {
             playback,
             cancel_token: Mutex::new(CancellationToken::new()),
-            energy_threshold: Mutex::new(0.03), // default RMS speech threshold
+            energy_threshold_bits: AtomicU32::new(0.03f32.to_bits()), // default RMS speech threshold
             enabled: AtomicBool::new(true),
         }
     }
@@ -41,7 +42,7 @@ impl BargeInController {
         Self {
             playback,
             cancel_token: Mutex::new(token),
-            energy_threshold: Mutex::new(0.03),
+            energy_threshold_bits: AtomicU32::new(0.03f32.to_bits()),
             enabled: AtomicBool::new(true),
         }
     }
@@ -60,14 +61,17 @@ impl BargeInController {
     }
 
     /// Sets the RMS audio energy threshold for speech interruption detection.
+    /// Completely lock-free.
     pub fn set_energy_threshold(&self, threshold: f32) {
-        let mut guard = self.energy_threshold.lock().unwrap();
-        *guard = threshold.max(0.0);
+        let clamped = threshold.max(0.0);
+        self.energy_threshold_bits
+            .store(clamped.to_bits(), Ordering::Release);
     }
 
     /// Returns the current RMS audio energy threshold.
+    /// Completely lock-free.
     pub fn energy_threshold(&self) -> f32 {
-        *self.energy_threshold.lock().unwrap()
+        f32::from_bits(self.energy_threshold_bits.load(Ordering::Acquire))
     }
 
     /// Enables or disables automatic energy-based barge-in triggering.
@@ -81,13 +85,25 @@ impl BargeInController {
     }
 
     /// Computes Root-Mean-Square (RMS) amplitude of a PCM frame.
+    /// Filters out non-finite samples (NaN / Inf) for numeric robustness.
     #[inline]
     pub fn compute_rms(samples: &[f32]) -> f32 {
         if samples.is_empty() {
             return 0.0;
         }
-        let sum_squares: f32 = samples.iter().map(|&s| s * s).sum();
-        (sum_squares / samples.len() as f32).sqrt()
+        let mut sum_squares = 0.0f32;
+        let mut valid_count = 0usize;
+        for &s in samples {
+            if s.is_finite() {
+                sum_squares += s * s;
+                valid_count += 1;
+            }
+        }
+        if valid_count == 0 {
+            0.0
+        } else {
+            (sum_squares / valid_count as f32).sqrt()
+        }
     }
 
     /// Checks an incoming captured PCM audio frame against the energy threshold.
@@ -204,5 +220,27 @@ mod tests {
         assert!(res_loud.is_some());
         assert!(!playback.is_playing());
         assert_eq!(playback.buffered_samples(), 0);
+    }
+
+    #[test]
+    fn test_barge_in_rms_nan_inf_robustness() {
+        let non_finite = vec![f32::NAN, f32::INFINITY, 0.5f32, -0.5f32];
+        let rms = BargeInController::compute_rms(&non_finite);
+        assert!((rms - 0.5).abs() < 1e-4);
+
+        let all_nan = vec![f32::NAN, f32::NAN];
+        assert_eq!(BargeInController::compute_rms(&all_nan), 0.0);
+        assert_eq!(BargeInController::compute_rms(&[]), 0.0);
+    }
+
+    #[test]
+    fn test_barge_in_report_serde() {
+        let report = BargeInReport {
+            interrupted_at_ms: 1234,
+            interrupted_sample: 59232,
+        };
+        let json = serde_json::to_string(&report).expect("serialize report");
+        let decoded: BargeInReport = serde_json::from_str(&json).expect("deserialize report");
+        assert_eq!(report, decoded);
     }
 }
