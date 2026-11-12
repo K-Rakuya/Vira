@@ -1,0 +1,12 @@
+[package]
+name = "vira-domain"
+version.workspace = true
+edition.workspace = true
+description = "Hexagonal domain core models for Vira AI companion"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/*",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Vira Contributors"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+thiserror = "2.0"
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = "0.7"
+async-trait = "0.1"
