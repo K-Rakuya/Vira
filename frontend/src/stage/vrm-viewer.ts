@@ -305,8 +305,8 @@ export class VRMViewer {
     this.controls?.update();
 
     if (this.currentVrm) {
-      this.lipSyncAnimator.update(this.currentVrm, dt);
       this.proceduralAnimator.update(this.currentVrm, dt, this.time, { mouth: this.lipSyncAnimator.mouthEnergy });
+      this.lipSyncAnimator.update(this.currentVrm, dt);
       this.updateLookTarget();
       this.currentVrm.update(dt);
     } else if (this.placeholderMesh) {

@@ -74,10 +74,10 @@ impl FromStr for TutorMode {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().replace(['-', ' '], "_").as_str() {
-            "english" | "en" => Ok(TutorMode::English),
-            "japanese" | "ja" | "jp" => Ok(TutorMode::Japanese),
-            "vietnamese" | "vi" | "vn" => Ok(TutorMode::Vietnamese),
-            "general_assistant" | "general" | "assistant" | "default" => {
+            "english" | "en" | "english_tutor" | "englishtutor" => Ok(TutorMode::English),
+            "japanese" | "ja" | "jp" | "japanese_tutor" | "japanesetutor" => Ok(TutorMode::Japanese),
+            "vietnamese" | "vi" | "vn" | "vietnamese_tutor" | "vietnamesetutor" => Ok(TutorMode::Vietnamese),
+            "general_assistant" | "general" | "assistant" | "default" | "general_tutor" | "generaltutor" => {
                 Ok(TutorMode::GeneralAssistant)
             }
             other => Err(format!("Unknown tutor mode: '{other}'")),
@@ -88,10 +88,12 @@ impl FromStr for TutorMode {
 /// User application settings payload for persistent configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct AppSettingsPayload {
+    #[serde(alias = "llm_base_url")]
     pub llm_endpoint: Option<String>,
     pub llm_model: Option<String>,
     pub llm_api_key: Option<String>,
     pub tts_voice: Option<String>,
+    #[serde(alias = "speech_rate")]
     pub tts_speed: Option<f32>,
     pub stt_model: Option<String>,
     pub tutor_mode: Option<String>,
@@ -328,14 +330,34 @@ mod tests {
     #[test]
     fn test_tutor_mode_parsing() {
         assert_eq!("english".parse::<TutorMode>().unwrap(), TutorMode::English);
+        assert_eq!("english_tutor".parse::<TutorMode>().unwrap(), TutorMode::English);
+        assert_eq!("englishtutor".parse::<TutorMode>().unwrap(), TutorMode::English);
         assert_eq!("japanese".parse::<TutorMode>().unwrap(), TutorMode::Japanese);
+        assert_eq!("japanese_tutor".parse::<TutorMode>().unwrap(), TutorMode::Japanese);
         assert_eq!("vietnamese".parse::<TutorMode>().unwrap(), TutorMode::Vietnamese);
+        assert_eq!("vietnameseTutor".parse::<TutorMode>().unwrap(), TutorMode::Vietnamese);
         assert_eq!(
             "general_assistant".parse::<TutorMode>().unwrap(),
             TutorMode::GeneralAssistant
         );
+        assert_eq!("general".parse::<TutorMode>().unwrap(), TutorMode::GeneralAssistant);
         assert_eq!("default".parse::<TutorMode>().unwrap(), TutorMode::GeneralAssistant);
         assert!("invalid_mode".parse::<TutorMode>().is_err());
+    }
+
+    #[test]
+    fn test_app_settings_deserialization_aliases() {
+        let json = r#"{
+            "llm_base_url": "http://127.0.0.1:11434/v1",
+            "llm_model": "llama3.2",
+            "speech_rate": 1.15,
+            "tutor_mode": "vietnameseTutor"
+        }"#;
+        let payload: AppSettingsPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.llm_endpoint.as_deref(), Some("http://127.0.0.1:11434/v1"));
+        assert_eq!(payload.llm_model.as_deref(), Some("llama3.2"));
+        assert_eq!(payload.tts_speed, Some(1.15));
+        assert_eq!(payload.tutor_mode.as_deref(), Some("vietnameseTutor"));
     }
 
     #[test]

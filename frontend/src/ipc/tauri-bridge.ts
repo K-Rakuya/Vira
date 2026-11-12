@@ -10,7 +10,7 @@ export type EventCallback<T = any> = (payload: T) => void;
 class MockIPC {
   private listeners = new Map<string, Set<EventCallback>>();
   private mockTickInterval: any = null;
-  private currentMode = 'vietnameseTutor';
+  private currentMode = 'vietnamese';
 
   public listen<T>(event: string, callback: EventCallback<T>): () => void {
     if (!this.listeners.has(event)) {
@@ -102,12 +102,17 @@ class MockIPC {
 
       case 'get_app_state': {
         return {
+          state: 'idle',
           conversation_state: 'Idle',
           tutor_mode: this.currentMode,
           emotion: 'neutral',
           emotion_weight: 1.0,
           mic_active: false,
+          is_speaking: false,
           audio_playing: false,
+          current_subtitle: '',
+          sample_clock: 0,
+          current_time_ms: 0,
           history_length: 0,
         } as T;
       }
@@ -167,26 +172,15 @@ export class TauriBridge {
 
   public static async invoke<T = any>(cmd: string, args?: Record<string, any>): Promise<T> {
     if (this.isTauri()) {
-      try {
-        return await tauriInvoke<T>(cmd, args);
-      } catch (err: any) {
-        // Fallback to mock if Tauri host is not responding or in headless test
-        console.warn(`[TauriBridge] tauriInvoke failed for ${cmd}, falling back to mock:`, err);
-        return mockIPC.invoke<T>(cmd, args);
-      }
+      return await tauriInvoke<T>(cmd, args);
     }
     return mockIPC.invoke<T>(cmd, args);
   }
 
   public static async listen<T = any>(event: string, callback: EventCallback<T>): Promise<() => void> {
     if (this.isTauri()) {
-      try {
-        const unlisten: UnlistenFn = await tauriListen<T>(event, (ev) => callback(ev.payload));
-        return () => unlisten();
-      } catch (err) {
-        console.warn(`[TauriBridge] tauriListen failed for ${event}, falling back to mock:`, err);
-        return mockIPC.listen<T>(event, callback);
-      }
+      const unlisten: UnlistenFn = await tauriListen<T>(event, (ev) => callback(ev.payload));
+      return () => unlisten();
     }
     return mockIPC.listen<T>(event, callback);
   }

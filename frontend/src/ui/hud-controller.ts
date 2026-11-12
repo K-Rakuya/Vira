@@ -9,35 +9,55 @@ export interface TutorPreset {
 }
 
 export const TUTOR_PRESETS: Record<string, TutorPreset> = {
-  vietnameseTutor: {
-    id: 'vietnameseTutor',
+  vietnamese: {
+    id: 'vietnamese',
     name: 'Vietnamese Tutor',
     language: 'vi-VN',
     systemPrompt:
       'Bạn là Vira, gia sư tiếng Việt thông thái, dịu dàng và nhiệt huyết. Bạn hướng dẫn người học từ phát âm, dấu thanh, từ vựng đến ngữ pháp phong phú của tiếng Việt.',
   },
-  englishTutor: {
-    id: 'englishTutor',
+  english: {
+    id: 'english',
     name: 'English Tutor',
     language: 'en-US',
     systemPrompt:
       'You are Vira, an encouraging, patient English tutor. Help the user master natural conversation, vocabulary, and grammar with gentle corrections.',
   },
-  japaneseTutor: {
-    id: 'japaneseTutor',
+  japanese: {
+    id: 'japanese',
     name: 'Japanese Tutor',
     language: 'ja-JP',
     systemPrompt:
       'あなたはViraです。親切で丁寧な日本語の先生です。学習者の日本語の会話や文法を優しくサポートしてください。',
   },
-  general: {
-    id: 'general',
+  general_assistant: {
+    id: 'general_assistant',
     name: 'General Assistant',
     language: 'vi-VN',
     systemPrompt:
       'Bạn là Vira, trợ lý ảo 3D thông minh, chu đáo và thân thiện. Bạn luôn sẵn sàng giải đáp mọi thắc mắc của người dùng.',
   },
 };
+
+// Aliases for compatibility
+TUTOR_PRESETS.vietnameseTutor = TUTOR_PRESETS.vietnamese;
+TUTOR_PRESETS.englishTutor = TUTOR_PRESETS.english;
+TUTOR_PRESETS.japaneseTutor = TUTOR_PRESETS.japanese;
+TUTOR_PRESETS.general = TUTOR_PRESETS.general_assistant;
+
+export function normalizeTutorMode(modeKey: string): string {
+  const lower = String(modeKey || '').trim().toLowerCase().replace(/[- ]/g, '_');
+  if (lower === 'vietnamese' || lower === 'vietnamesetutor' || lower === 'vietnamese_tutor' || lower === 'vi' || lower === 'vn') {
+    return 'vietnamese';
+  }
+  if (lower === 'english' || lower === 'englishtutor' || lower === 'english_tutor' || lower === 'en') {
+    return 'english';
+  }
+  if (lower === 'japanese' || lower === 'japanesetutor' || lower === 'japanese_tutor' || lower === 'ja' || lower === 'jp') {
+    return 'japanese';
+  }
+  return 'general_assistant';
+}
 
 const STATUS_LABELS: Record<string, string> = {
   idle: 'Ready',
@@ -52,7 +72,7 @@ const HOLD_MS = 320;
 export class HudController {
   private vrmViewer: VRMViewer;
   private el: Record<string, any> = {};
-  private currentModeKey = 'vietnameseTutor';
+  private currentModeKey = 'vietnamese';
   private toastTimer: any = null;
   private openDrawerName: string | null = null;
   private micDownAt = 0;
@@ -162,9 +182,16 @@ export class HudController {
     const e = this.el;
 
     // Send Message on click or Enter (safeguarding Vietnamese Telex/VNI IME composition)
+    let isComposing = false;
+    e.chatInput.addEventListener('compositionstart', () => {
+      isComposing = true;
+    });
+    e.chatInput.addEventListener('compositionend', () => {
+      isComposing = false;
+    });
     e.btnSend.addEventListener('click', () => this.handleSendMessage());
     e.chatInput.addEventListener('keydown', (ev: KeyboardEvent) => {
-      if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
+      if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing && !isComposing && ev.keyCode !== 229) {
         ev.preventDefault();
         this.handleSendMessage();
       }
@@ -278,11 +305,13 @@ export class HudController {
       }
     });
 
-    btn.addEventListener('pointerup', () => {
+    const stopHold = () => {
       if (performance.now() - this.micDownAt >= HOLD_MS && this.isMicActive) {
         this.setMicActive(false);
       }
-    });
+    };
+    btn.addEventListener('pointerup', stopHold);
+    btn.addEventListener('pointercancel', stopHold);
   }
 
   private async setMicActive(active: boolean): Promise<void> {
@@ -345,19 +374,21 @@ export class HudController {
   }
 
   public async handleTutorModeChange(modeKey: string): Promise<void> {
-    this.setTutorModeUI(modeKey);
+    const norm = normalizeTutorMode(modeKey);
+    this.setTutorModeUI(norm);
     try {
-      await TauriBridge.invoke('set_tutor_mode', { mode: modeKey });
-      this.showToast(`Đã chuyển sang chế độ ${TUTOR_PRESETS[modeKey]?.name || modeKey}`);
+      await TauriBridge.invoke('set_tutor_mode', { mode: norm });
+      this.showToast(`Đã chuyển sang chế độ ${TUTOR_PRESETS[norm]?.name || norm}`);
     } catch (err: any) {
       this.showToast(`Không thể đổi chế độ: ${err.message || err}`);
     }
   }
 
   private setTutorModeUI(modeKey: string): void {
-    this.currentModeKey = modeKey;
-    const preset = TUTOR_PRESETS[modeKey] || TUTOR_PRESETS.general;
-    this.el.tutorSelect.value = modeKey;
+    const norm = normalizeTutorMode(modeKey);
+    this.currentModeKey = norm;
+    const preset = TUTOR_PRESETS[norm] || TUTOR_PRESETS.general_assistant;
+    this.el.tutorSelect.value = preset.id;
     this.el.brandModeLabel.textContent = preset.name;
     this.el.systemPrompt.value = preset.systemPrompt;
   }
@@ -396,6 +427,7 @@ export class HudController {
   private async handleSaveSettings(): Promise<void> {
     const e = this.el;
     const payload = {
+      llm_endpoint: e.baseUrl.value.trim() || undefined,
       llm_base_url: e.baseUrl.value.trim() || undefined,
       llm_model: e.model.value.trim() || undefined,
       llm_api_key: e.apiKey.value.trim() || undefined,
@@ -403,6 +435,7 @@ export class HudController {
       tutor_mode: this.currentModeKey,
       system_prompt: e.systemPrompt.value.trim() || undefined,
       tts_voice: e.voiceSelect.value || undefined,
+      tts_speed: Number(e.rate.value),
       speech_rate: Number(e.rate.value),
       rag_enabled: e.rag.checked,
     };

@@ -32,6 +32,15 @@ describe('GestureController', () => {
     expect(ctrl.resolve('hello')).toBe('wave');
     expect(ctrl.resolve('ok')).toBe('nod');
     expect(ctrl.resolve('clapping')).toBe('clap');
+    expect(ctrl.resolve('sigh')).toBe('relax');
+    expect(ctrl.resolve('confused')).toBe('think');
+    expect(ctrl.resolve('shrug')).toBe('explain');
+    expect(ctrl.resolve('salute')).toBe('wave');
+    expect(ctrl.resolve('tilt')).toBe('shy');
+    expect(ctrl.resolve('laugh')).toBe('praise');
+    expect(ctrl.resolve('idle')).toBe('relax');
+    expect(ctrl.resolve('dance')).toBe('praise');
+    expect(ctrl.resolve('wink')).toBe('wave');
     expect(ctrl.resolve('non-existent')).toBeNull();
   });
 

@@ -185,6 +185,15 @@ const ALIASES: Record<string, string> = {
   ok: 'nod',
   yes: 'nod',
   no: 'shake',
+  sigh: 'relax',
+  confused: 'think',
+  shrug: 'explain',
+  salute: 'wave',
+  tilt: 'shy',
+  laugh: 'praise',
+  idle: 'relax',
+  dance: 'praise',
+  wink: 'wave',
 };
 
 const HEAD_ONLY = new Set(['nod', 'shake', 'relax']);
