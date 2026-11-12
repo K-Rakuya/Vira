@@ -139,6 +139,11 @@ impl WhisperSttAdapter {
         &self.config.language
     }
 
+    /// Returns true if running with an active ONNX model file.
+    pub fn is_onnx_active(&self) -> bool {
+        matches!(self.backend, WhisperBackend::Onnx { .. })
+    }
+
     /// Enqueues a mock transcription for testing.
     pub fn push_mock_response(&self, text: impl Into<String>) {
         if let WhisperBackend::Virtual { ref mock_responses } = self.backend {
@@ -171,16 +176,16 @@ impl WhisperSttAdapter {
         None
     }
 
-    /// Calculates root-mean-square (RMS) energy of PCM audio samples.
+    /// Calculates root-mean-square (RMS) energy of PCM audio samples using double-precision accumulator.
     pub fn calculate_rms(samples: &[f32]) -> f32 {
         if samples.is_empty() {
             return 0.0;
         }
-        let sum_sq: f32 = samples
+        let sum_sq: f64 = samples
             .iter()
-            .map(|&s| if s.is_finite() { s * s } else { 0.0 })
+            .map(|&s| if s.is_finite() { (s as f64) * (s as f64) } else { 0.0 })
             .sum();
-        (sum_sq / samples.len() as f32).sqrt()
+        ((sum_sq / samples.len() as f64).sqrt()) as f32
     }
 }
 
@@ -197,7 +202,7 @@ impl SttPort for WhisperSttAdapter {
         }
 
         let mut total_samples = Vec::new();
-        let mut emitted_partial = false;
+        let mut last_partial_ms = 0u64;
 
         loop {
             tokio::select! {
@@ -215,7 +220,9 @@ impl SttPort for WhisperSttAdapter {
 
                             let duration_ms = (total_samples.len() as u64 * 1000) / self.config.sample_rate as u64;
 
-                            if rms >= self.config.vad_energy_threshold && !emitted_partial {
+                            if rms >= self.config.vad_energy_threshold
+                                && (duration_ms >= last_partial_ms + 250 || last_partial_ms == 0)
+                            {
                                 let partial_text = self.peek_mock_text().unwrap_or_else(|| "...".to_string());
                                 let partial_event = SttEvent::partial(partial_text)
                                     .with_confidence(0.85)
@@ -225,7 +232,7 @@ impl SttPort for WhisperSttAdapter {
                                 if event_sender.send(partial_event).await.is_err() {
                                     return Err(SttError::Channel("receiver dropped".to_string()));
                                 }
-                                emitted_partial = true;
+                                last_partial_ms = duration_ms;
                             }
                         }
                         None => {

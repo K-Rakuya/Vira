@@ -7,7 +7,8 @@ use tokio_util::sync::CancellationToken;
 use vira_domain::message::Message;
 use vira_infer::kokoro_tts::KokoroTtsAdapter;
 use vira_infer::openai_compat::{
-    MockLlmTransport, OpenAiCompatLlmAdapter, StreamingMode,
+    resolve_chat_url, MockLlmTransport, OpenAiCompatLlmAdapter, StreamingMode,
+    StreamingTagExtractor,
 };
 use vira_infer::whisper_stt::WhisperSttAdapter;
 use vira_ports::llm::{LlmError, LlmPort};
@@ -361,4 +362,148 @@ async fn test_whisper_stt_invalid_sample_rate() {
     let adapter = WhisperSttAdapter::new();
     let res = adapter.transcribe_slice(&[0.1, -0.1], 0).await;
     assert!(matches!(res, Err(SttError::InvalidAudio(_))));
+}
+
+#[tokio::test]
+async fn test_openai_compat_split_tag_across_token_chunks() {
+    // LLM tokens arriving with tag broken across multiple chunks
+    let deltas = vec![
+        "[emo",
+        "tion:ha",
+        "ppy] ",
+        "Xin ",
+        "chào bạn!",
+    ];
+
+    let adapter = OpenAiCompatLlmAdapter::mock(
+        "http://127.0.0.1:8080/v1".to_string(),
+        "default".to_string(),
+        &deltas,
+    )
+    .with_streaming_mode(StreamingMode::IncrementalToken);
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+
+    adapter
+        .stream_chat(&[Message::user("Hi")], tx, cancel)
+        .await
+        .expect("stream success");
+
+    let mut chunks = Vec::new();
+    while let Some(c) = rx.recv().await {
+        chunks.push(c);
+    }
+
+    // Must extract 'happy' emotion despite tag being split across chunks
+    let has_happy = chunks.iter().any(|c| c.emotion.as_deref() == Some("happy"));
+    assert!(has_happy, "split tag [emotion:happy] must be extracted");
+
+    // Must not leak broken tag bracket fragments into text deltas
+    for c in &chunks {
+        assert!(!c.delta.contains("[emo"), "delta must not leak '[emo'");
+        assert!(!c.delta.contains("tion:ha"), "delta must not leak 'tion:ha'");
+        assert!(!c.delta.contains("ppy]"), "delta must not leak 'ppy]'");
+    }
+
+    let combined_delta: String = chunks.iter().map(|c| c.delta.as_str()).collect();
+    assert!(combined_delta.contains("Xin chào bạn!"));
+}
+
+#[tokio::test]
+async fn test_openai_compat_split_tag_sentence_chunked() {
+    let deltas = vec![
+        "[ges",
+        "ture:wa",
+        "ve] Chào ",
+        "mừng bạn ",
+        "đến với Vira.",
+    ];
+
+    let adapter = OpenAiCompatLlmAdapter::mock(
+        "http://127.0.0.1:8080/v1".to_string(),
+        "default".to_string(),
+        &deltas,
+    )
+    .with_streaming_mode(StreamingMode::SentenceChunked);
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let cancel = CancellationToken::new();
+
+    adapter
+        .stream_chat(&[Message::user("Hello")], tx, cancel)
+        .await
+        .expect("stream success");
+
+    let mut chunks = Vec::new();
+    while let Some(c) = rx.recv().await {
+        chunks.push(c);
+    }
+
+    let has_wave = chunks.iter().any(|c| c.gesture.as_deref() == Some("wave"));
+    assert!(has_wave, "must extract wave gesture across split tokens");
+
+    let speakable: String = chunks.iter().map(|c| c.delta.as_str()).collect();
+    assert!(!speakable.contains("[ges"));
+    assert!(!speakable.contains("ture:wa"));
+    assert!(speakable.contains("Chào mừng bạn"));
+}
+
+#[test]
+fn test_resolve_chat_url_endpoints() {
+    assert_eq!(
+        resolve_chat_url("http://127.0.0.1:8080/v1"),
+        "http://127.0.0.1:8080/v1/chat/completions"
+    );
+    assert_eq!(
+        resolve_chat_url("http://127.0.0.1:8080/v1/"),
+        "http://127.0.0.1:8080/v1/chat/completions"
+    );
+    assert_eq!(
+        resolve_chat_url("http://localhost:11434"),
+        "http://localhost:11434/v1/chat/completions"
+    );
+    assert_eq!(
+        resolve_chat_url("https://api.openai.com/v1"),
+        "https://api.openai.com/v1/chat/completions"
+    );
+    assert_eq!(
+        resolve_chat_url("http://127.0.0.1:8080/v1/chat/completions"),
+        "http://127.0.0.1:8080/v1/chat/completions"
+    );
+}
+
+#[test]
+fn test_streaming_tag_extractor_standalone() {
+    let mut extractor = StreamingTagExtractor::new();
+    let c1 = extractor.feed("[emo");
+    assert!(c1.is_empty(), "incomplete tag should be buffered");
+
+    let c2 = extractor.feed("tion:happy] Xin chào!");
+    assert_eq!(c2.len(), 2);
+    assert_eq!(c2[0].emotion.as_deref(), Some("happy"));
+    assert_eq!(c2[1].delta, " Xin chào!");
+
+    let finish = extractor.finish();
+    assert!(finish.is_empty());
+}
+
+#[test]
+fn test_kokoro_voice_profiles_and_native_backend() {
+    let adapter = KokoroTtsAdapter::rust_native().with_voice("am_adam");
+    assert_eq!(KokoroTtsAdapter::voice_base_pitch("am_adam"), 120.0);
+    assert_eq!(KokoroTtsAdapter::voice_base_pitch("af_sarah"), 220.0);
+    assert_eq!(KokoroTtsAdapter::voice_base_pitch("vi_vn"), 195.0);
+    assert_eq!(KokoroTtsAdapter::voice_base_pitch("jf_alpha"), 240.0);
+    assert_eq!(adapter.voice(), "am_adam");
+}
+
+#[tokio::test]
+async fn test_whisper_rms_large_buffer_precision() {
+    let adapter = WhisperSttAdapter::new();
+    // 64,000 samples (4 seconds at 16kHz)
+    let samples = vec![0.5f32; 64000];
+    let rms = WhisperSttAdapter::calculate_rms(&samples);
+    assert!((rms - 0.5).abs() < 1e-4, "RMS of constant 0.5 must be 0.5");
+    assert!(!adapter.is_onnx_active());
 }

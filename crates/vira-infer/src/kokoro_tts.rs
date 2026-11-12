@@ -51,6 +51,8 @@ impl Default for KokoroConfig {
 pub enum KokoroBackend {
     /// Fast CPU synthesis and phonemic viseme generator (zero VRAM, CI safe).
     VirtualFallback,
+    /// Native CPU synthesis with natural harmonic overtones and formant mapping.
+    RustNative,
     /// ONNX Runtime model loaded from disk (with automatic fallback if file missing).
     Onnx {
         model_path: PathBuf,
@@ -87,6 +89,38 @@ impl KokoroTtsAdapter {
     /// Explicitly creates a virtual fallback adapter for CI / offline testing.
     pub fn virtual_fallback() -> Self {
         Self::new()
+    }
+
+    /// Creates an adapter using the native Rust CPU acoustic synthesis engine.
+    pub fn rust_native() -> Self {
+        Self {
+            config: KokoroConfig::default(),
+            backend: KokoroBackend::RustNative,
+        }
+    }
+
+    /// Calculates fundamental vocal pitch (f0) in Hz according to the voice profile.
+    pub fn voice_base_pitch(voice: &str) -> f64 {
+        let lower = voice.to_ascii_lowercase();
+        if lower.starts_with("am_")
+            || lower.starts_with("bm_")
+            || lower.contains("adam")
+            || lower.contains("male")
+        {
+            120.0
+        } else if lower.starts_with("af_")
+            || lower.starts_with("bf_")
+            || lower.contains("sarah")
+            || lower.contains("female")
+        {
+            220.0
+        } else if lower.starts_with("vi_") {
+            195.0
+        } else if lower.starts_with("jf_") {
+            240.0
+        } else {
+            180.0
+        }
     }
 
     /// Configures the adapter to use an ONNX model file if available.
@@ -207,7 +241,7 @@ impl KokoroTtsAdapter {
             return (Vec::new(), vec![TimedViseme::zero(0)]);
         }
 
-        let speed = self.config.speed.max(0.1);
+        let speed = (self.config.speed as f64).clamp(0.2, 3.0);
         let sample_rate = self.config.sample_rate;
 
         // Calculate phoneme durations along the timeline
@@ -221,9 +255,9 @@ impl KokoroTtsAdapter {
         for ch in trimmed.chars() {
             let (target, amp) = Self::char_to_viseme_target(ch);
             let char_duration_ms = match ch {
-                ' ' => 60,
-                ',' | ';' | ':' => 160,
-                '.' | '!' | '?' => 280,
+                ' ' => (60.0 / speed) as u64,
+                ',' | ';' | ':' => (160.0 / speed) as u64,
+                '.' | '!' | '?' => (260.0 / speed) as u64,
                 _ => (75.0 / speed) as u64,
             };
             spans.push(PhonemeSpan {
@@ -266,7 +300,7 @@ impl KokoroTtsAdapter {
 
         // Synthesize harmonic audio PCM waveform matching duration
         let mut samples = Vec::with_capacity(total_samples);
-        let f0 = 175.0 * (speed as f64).sqrt(); // Vocal pitch
+        let f0 = Self::voice_base_pitch(&self.config.voice);
         let dt = 1.0 / sample_rate as f64;
 
         span_idx = 0;

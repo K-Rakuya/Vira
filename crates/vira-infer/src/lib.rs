@@ -7,8 +7,8 @@ pub use kokoro_tts::{
     VISEME_TICK_INTERVAL_MS, VISEME_TICK_RATE_HZ,
 };
 pub use openai_compat::{
-    HttpTransport, MockLlmTransport, NativeHttpTransport, OpenAiCompatConfig,
-    OpenAiCompatLlmAdapter, StreamingMode,
+    resolve_chat_url, HttpTransport, MockLlmTransport, NativeHttpTransport, OpenAiCompatConfig,
+    OpenAiCompatLlmAdapter, ReqwestHttpTransport, StreamingMode, StreamingTagExtractor,
 };
 pub use whisper_stt::{
     WhisperBackend, WhisperConfig, WhisperSttAdapter, DEFAULT_VAD_THRESHOLD,

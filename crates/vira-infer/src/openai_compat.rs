@@ -2,6 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use eventsource_stream::Eventsource;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -11,6 +13,24 @@ use tokio_util::sync::CancellationToken;
 use vira_domain::message::{Message, Role};
 use vira_ports::llm::{LlmError, LlmPort, LlmStreamChunk};
 use vira_voice::stream_parser::{ParsedStreamEvent, StreamParser};
+
+/// Resolves an OpenAI-compatible base URL to its chat completions endpoint.
+///
+/// Handles standard variations:
+/// - `http://127.0.0.1:8080/v1` -> `http://127.0.0.1:8080/v1/chat/completions`
+/// - `http://localhost:11434` -> `http://localhost:11434/v1/chat/completions`
+/// - `https://api.openai.com/v1` -> `https://api.openai.com/v1/chat/completions`
+/// - `http://127.0.0.1:8080/v1/chat/completions` -> unchanged
+pub fn resolve_chat_url(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else if trimmed.ends_with("/v1") {
+        format!("{trimmed}/chat/completions")
+    } else {
+        format!("{trimmed}/v1/chat/completions")
+    }
+}
 
 /// Streaming mode for OpenAI compatible LLM generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -34,6 +54,134 @@ pub trait HttpTransport: Send + Sync {
         body: &str,
         cancel: CancellationToken,
     ) -> Result<Receiver<Result<String, LlmError>>, LlmError>;
+}
+
+/// Modern HTTP/HTTPS transport using `reqwest` and `eventsource-stream`.
+///
+/// Fully supports HTTPS/TLS, HTTP/1.1 chunked transfer encoding, and HTTP/2 SSE streaming.
+#[derive(Debug, Clone)]
+pub struct ReqwestHttpTransport {
+    client: reqwest::Client,
+    timeout: Duration,
+}
+
+impl Default for ReqwestHttpTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReqwestHttpTransport {
+    /// Creates a new reqwest-backed transport with 30s timeout.
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .tcp_nodelay(true)
+                .build()
+                .unwrap_or_default(),
+            timeout: Duration::from_secs(30),
+        }
+    }
+
+    /// Creates a transport with custom `reqwest::Client`.
+    pub fn with_client(client: reqwest::Client) -> Self {
+        Self {
+            client,
+            timeout: Duration::from_secs(30),
+        }
+    }
+
+    /// Sets custom network timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
+#[async_trait]
+impl HttpTransport for ReqwestHttpTransport {
+    async fn post_sse(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+        cancel: CancellationToken,
+    ) -> Result<Receiver<Result<String, LlmError>>, LlmError> {
+        if cancel.is_cancelled() {
+            return Err(LlmError::Cancelled);
+        }
+
+        let endpoint_url = resolve_chat_url(url);
+        let mut req_builder = self
+            .client
+            .post(&endpoint_url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .timeout(self.timeout)
+            .body(body.to_string());
+
+        for (k, v) in headers {
+            req_builder = req_builder.header(*k, *v);
+        }
+
+        let send_fut = req_builder.send();
+        let resp = tokio::select! {
+            _ = cancel.cancelled() => return Err(LlmError::Cancelled),
+            res = send_fut => {
+                match res {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if e.is_timeout() {
+                            return Err(LlmError::Timeout(e.to_string()));
+                        } else {
+                            return Err(LlmError::Network(e.to_string()));
+                        }
+                    }
+                }
+            }
+        };
+
+        let status = resp.status();
+        if !status.is_success() {
+            let status_code = status.as_u16();
+            let err_text = resp.text().await.unwrap_or_default();
+            return Err(LlmError::Inference(format!(
+                "HTTP {status_code}: {}",
+                err_text.trim()
+            )));
+        }
+
+        let (tx, rx) = mpsc::channel(64);
+        let mut sse_stream = resp.bytes_stream().eventsource();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        let _ = tx.send(Err(LlmError::Cancelled)).await;
+                        break;
+                    }
+                    item = sse_stream.next() => {
+                        match item {
+                            Some(Ok(event)) => {
+                                let data = event.data.trim().to_string();
+                                if !data.is_empty() && tx.send(Ok(data)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Some(Err(e)) => {
+                                let _ = tx.send(Err(LlmError::Network(e.to_string()))).await;
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
+    }
 }
 
 /// Native HTTP/1.1 client over Tokio TCP stream.
@@ -349,6 +497,119 @@ impl OpenAiCompatConfig {
     }
 }
 
+/// Stateful streaming tag extractor for `IncrementalToken` mode.
+///
+/// Buffers potential inline avatar tags (`[emotion:...]`, `[gesture:...]`, `[happy]`, etc.)
+/// across token boundaries so that partial brackets don't leak into speakable text delta.
+#[derive(Debug, Default)]
+pub struct StreamingTagExtractor {
+    pending: String,
+}
+
+impl StreamingTagExtractor {
+    /// Creates a new tag extractor.
+    pub fn new() -> Self {
+        Self {
+            pending: String::new(),
+        }
+    }
+
+    /// Feeds incoming delta text and yields parsed chunks.
+    pub fn feed(&mut self, text: &str) -> Vec<LlmStreamChunk> {
+        self.pending.push_str(text);
+        let mut chunks = Vec::new();
+
+        loop {
+            match self.pending.find('[') {
+                None => {
+                    if !self.pending.is_empty() {
+                        let delta = std::mem::take(&mut self.pending);
+                        chunks.push(LlmStreamChunk::new(delta));
+                    }
+                    break;
+                }
+                Some(open_idx) => {
+                    if open_idx > 0 {
+                        let before = self.pending[..open_idx].to_string();
+                        chunks.push(LlmStreamChunk::new(before));
+                        self.pending.drain(..open_idx);
+                    }
+
+                    match self.pending.find(']') {
+                        Some(close_idx) => {
+                            let inner = self.pending[1..close_idx].trim();
+                            if let Some(second_open) = inner.find('[') {
+                                let non_tag = self.pending[..1 + second_open].to_string();
+                                self.pending.drain(..1 + second_open);
+                                chunks.push(LlmStreamChunk::new(non_tag));
+                                continue;
+                            }
+
+                            if let Some((kind, val)) = inner.split_once(':') {
+                                let kind = kind.trim().to_ascii_lowercase();
+                                let val = val.trim();
+                                if kind == "emotion" && !val.is_empty() {
+                                    chunks.push(LlmStreamChunk::new("").with_emotion(val));
+                                    self.pending.drain(..=close_idx);
+                                    continue;
+                                } else if kind == "gesture" && !val.is_empty() {
+                                    chunks.push(LlmStreamChunk::new("").with_gesture(val));
+                                    self.pending.drain(..=close_idx);
+                                    continue;
+                                }
+                            } else if matches!(
+                                inner.to_ascii_lowercase().as_str(),
+                                "neutral" | "happy" | "sad" | "angry" | "surprised" | "relaxed"
+                            ) {
+                                chunks.push(
+                                    LlmStreamChunk::new("").with_emotion(inner.to_ascii_lowercase()),
+                                );
+                                self.pending.drain(..=close_idx);
+                                continue;
+                            } else if vira_voice::stream_parser::DEFAULT_GESTURES
+                                .contains(&inner.to_ascii_lowercase().as_str())
+                            {
+                                chunks.push(
+                                    LlmStreamChunk::new("").with_gesture(inner.to_ascii_lowercase()),
+                                );
+                                self.pending.drain(..=close_idx);
+                                continue;
+                            }
+
+                            let non_tag = self.pending[..=close_idx].to_string();
+                            self.pending.drain(..=close_idx);
+                            chunks.push(LlmStreamChunk::new(non_tag));
+                        }
+                        None => {
+                            let slice = &self.pending[1..];
+                            let has_invalid = slice.chars().any(|c| {
+                                matches!(c, '\n' | '\r' | '.' | '!' | '?' | ';' | '(' | ')' | '{' | '}')
+                            });
+                            if has_invalid || self.pending.len() > 64 {
+                                let not_tag = std::mem::take(&mut self.pending);
+                                chunks.push(LlmStreamChunk::new(not_tag));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        chunks
+    }
+
+    /// Concludes extraction, flushing any remaining pending bracket fragments.
+    pub fn finish(&mut self) -> Vec<LlmStreamChunk> {
+        if self.pending.is_empty() {
+            Vec::new()
+        } else {
+            let leftover = std::mem::take(&mut self.pending);
+            vec![LlmStreamChunk::new(leftover)]
+        }
+    }
+}
+
 /// Hexagonal adapter implementing `LlmPort` for OpenAI-compatible HTTP endpoints.
 ///
 /// Fully compatible with:
@@ -373,8 +634,14 @@ impl OpenAiCompatLlmAdapter {
         config.api_key = api_key;
         Self {
             config,
-            transport: Arc::new(NativeHttpTransport::new()),
+            transport: Arc::new(ReqwestHttpTransport::new()),
         }
+    }
+
+    /// Configures the adapter to use the native TCP-socket HTTP/1.1 client.
+    pub fn with_native_transport(mut self) -> Self {
+        self.transport = Arc::new(NativeHttpTransport::new());
+        self
     }
 
     /// Constructs an adapter configured with custom transport (e.g. for testing).
@@ -521,6 +788,7 @@ impl LlmPort for OpenAiCompatLlmAdapter {
             .await?;
 
         let mut stream_parser = StreamParser::new();
+        let mut tag_extractor = StreamingTagExtractor::new();
 
         loop {
             tokio::select! {
@@ -560,11 +828,13 @@ impl LlmPort for OpenAiCompatLlmAdapter {
                                             }
                                         }
                                         StreamingMode::IncrementalToken => {
-                                            let chunk = LlmStreamChunk::from_delta_extracting_tags(&delta_text);
-                                            if (!chunk.is_empty() || chunk.emotion.is_some() || chunk.gesture.is_some())
-                                                && sender.send(chunk).await.is_err()
-                                            {
-                                                return Err(LlmError::Channel("receiver dropped".to_string()));
+                                            let chunks = tag_extractor.feed(&delta_text);
+                                            for chunk in chunks {
+                                                if (!chunk.is_empty() || chunk.emotion.is_some() || chunk.gesture.is_some())
+                                                    && sender.send(chunk).await.is_err()
+                                                {
+                                                    return Err(LlmError::Channel("receiver dropped".to_string()));
+                                                }
                                             }
                                         }
                                     }
@@ -582,17 +852,27 @@ impl LlmPort for OpenAiCompatLlmAdapter {
             return Err(LlmError::Cancelled);
         }
 
-        // Flush remaining events in sentence chunker if applicable
-        if self.config.streaming_mode == StreamingMode::SentenceChunked {
-            let trailing = stream_parser.finish();
-            for event in trailing {
-                let chunk = match event {
-                    ParsedStreamEvent::Emotion(e) => LlmStreamChunk::new("").with_emotion(e),
-                    ParsedStreamEvent::Gesture(g) => LlmStreamChunk::new("").with_gesture(g),
-                    ParsedStreamEvent::SpeakableText(t) => LlmStreamChunk::new(t),
-                };
-                if sender.send(chunk).await.is_err() {
-                    return Err(LlmError::Channel("receiver dropped".to_string()));
+        // Flush remaining events in sentence chunker or tag extractor
+        match self.config.streaming_mode {
+            StreamingMode::SentenceChunked => {
+                let trailing = stream_parser.finish();
+                for event in trailing {
+                    let chunk = match event {
+                        ParsedStreamEvent::Emotion(e) => LlmStreamChunk::new("").with_emotion(e),
+                        ParsedStreamEvent::Gesture(g) => LlmStreamChunk::new("").with_gesture(g),
+                        ParsedStreamEvent::SpeakableText(t) => LlmStreamChunk::new(t),
+                    };
+                    if sender.send(chunk).await.is_err() {
+                        return Err(LlmError::Channel("receiver dropped".to_string()));
+                    }
+                }
+            }
+            StreamingMode::IncrementalToken => {
+                let trailing = tag_extractor.finish();
+                for chunk in trailing {
+                    if !chunk.is_empty() && sender.send(chunk).await.is_err() {
+                        return Err(LlmError::Channel("receiver dropped".to_string()));
+                    }
                 }
             }
         }
