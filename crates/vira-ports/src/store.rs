@@ -18,6 +18,42 @@ pub struct SessionSummary {
     pub updated_at: u64,
 }
 
+impl SessionSummary {
+    /// Creates a new session summary with current UTC timestamp and zero messages.
+    pub fn new(id: impl Into<String>) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Self {
+            id: id.into(),
+            title: None,
+            message_count: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Sets the session title.
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Sets the message count.
+    pub fn with_message_count(mut self, count: usize) -> Self {
+        self.message_count = count;
+        self
+    }
+
+    /// Sets creation and update timestamps in milliseconds UTC.
+    pub fn with_timestamps(mut self, created_at: u64, updated_at: u64) -> Self {
+        self.created_at = created_at;
+        self.updated_at = updated_at;
+        self
+    }
+}
+
 /// Learner and user profile preferences.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserProfile {
@@ -33,6 +69,37 @@ pub struct UserProfile {
     pub cefr_level: String,
     /// Arbitrary user preference key-value pairs (e.g. theme, audio gain, tutor mode).
     pub preferences: HashMap<String, String>,
+}
+
+impl UserProfile {
+    /// Creates a new user profile with empty preferences.
+    pub fn new(
+        user_id: impl Into<String>,
+        display_name: impl Into<String>,
+        native_language: impl Into<String>,
+        target_language: impl Into<String>,
+        cefr_level: impl Into<String>,
+    ) -> Self {
+        Self {
+            user_id: user_id.into(),
+            display_name: display_name.into(),
+            native_language: native_language.into(),
+            target_language: target_language.into(),
+            cefr_level: cefr_level.into(),
+            preferences: HashMap::new(),
+        }
+    }
+
+    /// Adds or updates a user preference setting.
+    pub fn with_preference(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.preferences.insert(key.into(), value.into());
+        self
+    }
+
+    /// Retrieves a preference value by key.
+    pub fn get_preference(&self, key: &str) -> Option<&str> {
+        self.preferences.get(key).map(|s| s.as_str())
+    }
 }
 
 /// Spaced repetition flashcard representation for vocabulary learning.
@@ -64,6 +131,64 @@ pub struct Flashcard {
     pub lapses: u32,
 }
 
+impl Flashcard {
+    /// Creates a new flashcard with initial state (state = 0 / New) due immediately.
+    pub fn new(id: impl Into<String>, front: impl Into<String>, back: impl Into<String>) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Self {
+            id: id.into(),
+            front: front.into(),
+            back: back.into(),
+            cefr_level: None,
+            state: 0,
+            step: None,
+            stability: 0.0,
+            difficulty: 0.0,
+            due: now,
+            last_review: None,
+            reps: 0,
+            lapses: 0,
+        }
+    }
+
+    /// Sets the CEFR difficulty level.
+    pub fn with_cefr_level(mut self, level: impl Into<String>) -> Self {
+        self.cefr_level = Some(level.into());
+        self
+    }
+
+    /// Sets FSRS parameters.
+    pub fn with_fsrs(
+        mut self,
+        stability: f32,
+        difficulty: f32,
+        state: u32,
+        reps: u32,
+        lapses: u32,
+    ) -> Self {
+        self.stability = stability;
+        self.difficulty = difficulty;
+        self.state = state;
+        self.reps = reps;
+        self.lapses = lapses;
+        self
+    }
+
+    /// Sets due timestamp in milliseconds.
+    pub fn with_due(mut self, due: u64) -> Self {
+        self.due = due;
+        self
+    }
+
+    /// Returns true if this flashcard is currently due for review at `current_time`.
+    pub fn is_due(&self, current_time: u64) -> bool {
+        self.due <= current_time
+    }
+}
+
 /// Errors occurring during storage and persistence operations.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StoreError {
@@ -87,14 +212,18 @@ pub trait StorePort: Send + Sync {
     /// Appends or updates a message in a conversation session.
     async fn save_message(&self, session_id: &str, message: &Message) -> Result<(), StoreError>;
 
-    /// Retrieves up to `limit` latest messages for a session.
-    async fn get_history(&self, session_id: &str, limit: usize) -> Result<Vec<Message>, StoreError>;
+    /// Retrieves up to `limit` latest messages for a session in chronological order.
+    async fn get_history(&self, session_id: &str, limit: usize)
+        -> Result<Vec<Message>, StoreError>;
 
     /// Deletes a session and its associated messages.
     async fn delete_session(&self, session_id: &str) -> Result<(), StoreError>;
 
     /// Lists summaries of all conversation sessions.
     async fn list_sessions(&self) -> Result<Vec<SessionSummary>, StoreError>;
+
+    /// Updates the display title for a conversation session.
+    async fn update_session_title(&self, session_id: &str, title: &str) -> Result<(), StoreError>;
 
     /// Fetches a user profile by ID.
     async fn get_user_profile(&self, user_id: &str) -> Result<Option<UserProfile>, StoreError>;
@@ -108,8 +237,18 @@ pub trait StorePort: Send + Sync {
     /// Retrieves a flashcard by ID.
     async fn get_flashcard(&self, id: &str) -> Result<Option<Flashcard>, StoreError>;
 
+    /// Deletes a flashcard by ID.
+    async fn delete_flashcard(&self, id: &str) -> Result<(), StoreError>;
+
+    /// Returns the total count of flashcards in storage.
+    async fn count_flashcards(&self) -> Result<usize, StoreError>;
+
     /// Retrieves flashcards whose due date is less than or equal to `current_time`.
-    async fn get_due_flashcards(&self, current_time: u64, limit: usize) -> Result<Vec<Flashcard>, StoreError>;
+    async fn get_due_flashcards(
+        &self,
+        current_time: u64,
+        limit: usize,
+    ) -> Result<Vec<Flashcard>, StoreError>;
 
     /// Lists flashcards with a limit.
     async fn list_flashcards(&self, limit: usize) -> Result<Vec<Flashcard>, StoreError>;
@@ -119,6 +258,9 @@ pub trait StorePort: Send + Sync {
 
     /// Sets or updates a persistent configuration setting.
     async fn set_setting(&self, key: &str, value: &str) -> Result<(), StoreError>;
+
+    /// Deletes a configuration setting by key.
+    async fn delete_setting(&self, key: &str) -> Result<(), StoreError>;
 }
 
 #[cfg(test)]
@@ -126,46 +268,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_store_models_serde() {
-        let summary = SessionSummary {
-            id: "sess_1".to_string(),
-            title: Some("English Practice".to_string()),
-            message_count: 5,
-            created_at: 1000,
-            updated_at: 1200,
-        };
+    fn test_store_models_constructors_and_serde() {
+        let summary = SessionSummary::new("sess_1")
+            .with_title("English Practice")
+            .with_message_count(5)
+            .with_timestamps(1000, 1200);
+
+        assert_eq!(summary.id, "sess_1");
+        assert_eq!(summary.title.as_deref(), Some("English Practice"));
+        assert_eq!(summary.message_count, 5);
+
         let sum_json = serde_json::to_string(&summary).expect("serialize summary");
         let sum_dec: SessionSummary = serde_json::from_str(&sum_json).expect("deserialize summary");
         assert_eq!(summary, sum_dec);
 
-        let mut prefs = HashMap::new();
-        prefs.insert("tutor_mode".to_string(), "strict".to_string());
-        let profile = UserProfile {
-            user_id: "u1".to_string(),
-            display_name: "Alice".to_string(),
-            native_language: "vi".to_string(),
-            target_language: "en".to_string(),
-            cefr_level: "B1".to_string(),
-            preferences: prefs,
-        };
+        let profile = UserProfile::new("u1", "Alice", "vi", "en", "B1")
+            .with_preference("tutor_mode", "strict")
+            .with_preference("theme", "cosmic");
+
+        assert_eq!(profile.user_id, "u1");
+        assert_eq!(profile.display_name, "Alice");
+        assert_eq!(profile.get_preference("tutor_mode"), Some("strict"));
+        assert_eq!(profile.get_preference("nonexistent"), None);
+
         let prof_json = serde_json::to_string(&profile).expect("serialize profile");
         let prof_dec: UserProfile = serde_json::from_str(&prof_json).expect("deserialize profile");
         assert_eq!(profile, prof_dec);
 
-        let card = Flashcard {
-            id: "c1".to_string(),
-            front: "ephemeral".to_string(),
-            back: "phù du, chóng tàn".to_string(),
-            cefr_level: Some("C2".to_string()),
-            state: 1,
-            step: Some(2),
-            stability: 1.8,
-            difficulty: 5.5,
-            due: 5000,
-            last_review: Some(4000),
-            reps: 2,
-            lapses: 1,
-        };
+        let card = Flashcard::new("c1", "ephemeral", "phù du, chóng tàn")
+            .with_cefr_level("C2")
+            .with_fsrs(1.8, 5.5, 1, 2, 1)
+            .with_due(5000);
+
+        assert_eq!(card.front, "ephemeral");
+        assert_eq!(card.back, "phù du, chóng tàn");
+        assert_eq!(card.cefr_level.as_deref(), Some("C2"));
+        assert!(card.is_due(5000));
+        assert!(card.is_due(6000));
+        assert!(!card.is_due(4000));
+
         let card_json = serde_json::to_string(&card).expect("serialize card");
         let card_dec: Flashcard = serde_json::from_str(&card_json).expect("deserialize card");
         assert_eq!(card, card_dec);
@@ -175,6 +316,8 @@ mod tests {
     fn test_store_error_display() {
         let err = StoreError::NotFound("card_99".to_string());
         assert_eq!(err.to_string(), "Entity not found: card_99");
+
+        let db_err = StoreError::Database("disk full".to_string());
+        assert_eq!(db_err.to_string(), "Database error: disk full");
     }
 }
-

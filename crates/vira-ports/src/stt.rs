@@ -10,15 +10,30 @@ pub struct SttEvent {
     pub text: String,
     /// Whether this transcription is a finalized sentence/turn or interim hypothesis.
     pub is_final: bool,
-    /// Confidence score in [0.0, 1.0], if available.
+    /// Confidence score strictly clamped to [0.0, 1.0], if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f32>,
     /// Detected language code (e.g. "vi", "en"), if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     /// Duration of audio processed in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
 }
 
 impl SttEvent {
+    /// Clamps confidence value safely to [0.0, 1.0], converting NaN to 0.0.
+    #[inline]
+    pub fn clamp_confidence(val: f32) -> f32 {
+        if val.is_nan() || val < 0.0 {
+            0.0
+        } else if val > 1.0 {
+            1.0
+        } else {
+            val
+        }
+    }
+
     /// Creates a finalized speech recognition event.
     pub fn final_result(text: impl Into<String>) -> Self {
         Self {
@@ -41,9 +56,9 @@ impl SttEvent {
         }
     }
 
-    /// Sets confidence score.
+    /// Sets confidence score, strictly clamped to [0.0, 1.0].
     pub fn with_confidence(mut self, confidence: f32) -> Self {
-        self.confidence = Some(confidence);
+        self.confidence = Some(Self::clamp_confidence(confidence));
         self
     }
 
@@ -53,7 +68,7 @@ impl SttEvent {
         self
     }
 
-    /// Sets processed duration.
+    /// Sets processed duration in milliseconds.
     pub fn with_duration_ms(mut self, duration_ms: u64) -> Self {
         self.duration_ms = Some(duration_ms);
         self
@@ -96,6 +111,11 @@ pub trait SttPort: Send + Sync {
         samples: &[f32],
         sample_rate: u32,
     ) -> Result<SttEvent, SttError>;
+
+    /// Expected input sample rate in Hz (defaults to 16000 Hz for Whisper/neural models).
+    fn sample_rate(&self) -> u32 {
+        16000
+    }
 }
 
 #[cfg(test)]
@@ -124,6 +144,18 @@ mod tests {
     }
 
     #[test]
+    fn test_stt_confidence_clamping() {
+        let over = SttEvent::final_result("test").with_confidence(1.5);
+        assert_eq!(over.confidence, Some(1.0));
+
+        let under = SttEvent::final_result("test").with_confidence(-0.5);
+        assert_eq!(under.confidence, Some(0.0));
+
+        let nan = SttEvent::final_result("test").with_confidence(f32::NAN);
+        assert_eq!(nan.confidence, Some(0.0));
+    }
+
+    #[test]
     fn test_stt_error_display() {
         let err = SttError::InvalidAudio("unsupported sample rate 8000".to_string());
         assert_eq!(
@@ -132,4 +164,3 @@ mod tests {
         );
     }
 }
-
