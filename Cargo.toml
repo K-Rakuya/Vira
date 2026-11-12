@@ -22,3 +22,4 @@ vira-domain = { path = "crates/vira-domain" }
 vira-ports = { path = "crates/vira-ports" }
 vira-voice = { path = "crates/vira-voice" }
 vira-infer = { path = "crates/vira-infer" }
+vira-tauri = { path = "crates/vira-tauri" }
