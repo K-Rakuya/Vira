@@ -13,6 +13,7 @@ use vira_domain::viseme::VisemeWeights;
 use vira_infer::kokoro_tts::KokoroTtsAdapter;
 use vira_infer::openai_compat::OpenAiCompatLlmAdapter;
 use vira_infer::whisper_stt::WhisperSttAdapter;
+use vira_ports::audio::AudioPlaybackPort;
 use vira_voice::capture::{CaptureConfig, CaptureEngine};
 use vira_voice::playback::{PlaybackConfig, PlaybackEngine};
 
@@ -31,6 +32,19 @@ pub fn spawn_viseme_tick_loop(
             interval.tick().await;
 
             let is_playing = state.audio_playback.is_playing();
+            let is_gen = state.is_generating();
+            let current_conv_state = state.get_conversation_state();
+
+            // Detect speech completion: audio buffer drained, no active LLM/TTS generation,
+            // and state is still in Speaking.
+            if current_conv_state == vira_domain::state::ConversationState::Speaking && !is_playing && !is_gen {
+                state.force_state(vira_domain::state::ConversationState::Idle);
+                state.emit_subtitle("", vira_domain::state::ConversationState::Idle);
+                *state.active_visemes.write().unwrap() = Vec::new();
+                state.emit_viseme_tick(VisemeWeights::zero(), false);
+                continue;
+            }
+
             let now_ms = state.clock.current_time_ms();
 
             let weights = if is_playing {
@@ -58,6 +72,7 @@ pub fn run() {
                 virtual_pb
             });
             let clock = playback.clock().clone();
+            let pb_sample_rate = playback.sample_rate();
 
             // Native audio capture with virtual fallback
             let capture = CaptureEngine::new_native(CaptureConfig::default()).unwrap_or_else(|_| {
@@ -65,13 +80,13 @@ pub fn run() {
                 virtual_cap
             });
 
-            // Default AI inference adapters
+            // Default AI inference adapters with synchronized sample rate
             let llm = Arc::new(OpenAiCompatLlmAdapter::new(
                 "http://127.0.0.1:8080/v1".to_string(),
                 "default".to_string(),
                 None,
             ));
-            let tts = Arc::new(KokoroTtsAdapter::new());
+            let tts = Arc::new(KokoroTtsAdapter::new().with_sample_rate(pb_sample_rate));
             let stt = Arc::new(WhisperSttAdapter::new());
 
             let app_state = AppState::new(
@@ -80,7 +95,7 @@ pub fn run() {
                 stt,
                 Arc::new(playback),
                 Arc::new(capture),
-                clock.clone(),
+                clock,
                 emitter,
             );
 
@@ -96,6 +111,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             crate::commands::send_message,
             crate::commands::trigger_gesture,
+            crate::commands::play_gesture,
             crate::commands::set_emotion,
             crate::commands::set_tutor_mode,
             crate::commands::toggle_mic,

@@ -130,6 +130,8 @@ pub struct AppState {
     pub emitter: Arc<dyn AppEventEmitter>,
     pub active_visemes: Arc<RwLock<Vec<TimedViseme>>>,
     pub settings: Arc<RwLock<AppSettingsPayload>>,
+    pub is_generating: Arc<AtomicBool>,
+    pub turn_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -161,6 +163,8 @@ impl AppState {
             emitter,
             active_visemes: Arc::new(RwLock::new(Vec::new())),
             settings: Arc::new(RwLock::new(AppSettingsPayload::default())),
+            is_generating: Arc::new(AtomicBool::new(false)),
+            turn_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -173,6 +177,7 @@ impl AppState {
     pub fn new_headless_with_emitter(emitter: Arc<dyn AppEventEmitter>) -> Self {
         let (playback, _) = PlaybackEngine::new_virtual(48000, 96000);
         let clock = playback.clock().clone();
+        let pb_sample_rate = playback.sample_rate();
         let (capture, _) = CaptureEngine::new_virtual(16000, 512);
 
         let transport = Arc::new(MockLlmTransport::from_deltas(&[
@@ -186,7 +191,7 @@ impl AppState {
             )
             .with_transport(transport),
         );
-        let tts = Arc::new(KokoroTtsAdapter::virtual_fallback());
+        let tts = Arc::new(KokoroTtsAdapter::virtual_fallback().with_sample_rate(pb_sample_rate));
         let stt = Arc::new(WhisperSttAdapter::virtual_fallback());
 
         Self::new(
@@ -195,9 +200,19 @@ impl AppState {
             stt,
             Arc::new(playback),
             Arc::new(capture),
-            clock.clone(),
+            clock,
             emitter,
         )
+    }
+
+    /// Returns true if an active LLM generation or TTS synthesis pipeline is in progress.
+    pub fn is_generating(&self) -> bool {
+        self.is_generating.load(Ordering::Acquire)
+    }
+
+    /// Sets the active generation flag.
+    pub fn set_generating(&self, val: bool) {
+        self.is_generating.store(val, Ordering::Release);
     }
 
     /// Read the current conversation state.
@@ -237,12 +252,14 @@ impl AppState {
         );
     }
 
-    /// Cancels active LLM generation, flushes audio output buffers, and resets lip-sync timeline.
+    /// Cancels active LLM generation, flushes audio output buffers, and resets lip-sync timeline and clock.
     pub fn cancel_active_speech(&self) {
         if let Some(token) = self.active_cancellation.lock().unwrap().take() {
             token.cancel();
         }
         let _ = self.audio_playback.flush();
+        let _ = self.audio_playback.reset_sample_clock();
+        self.clock.reset();
         *self.active_visemes.write().unwrap() = Vec::new();
     }
 

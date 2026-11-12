@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use vira_domain::message::Message;
-use vira_domain::state::ConversationState;
+use vira_domain::state::{CharacterEmotion, ConversationState};
+use vira_ports::tts::TimedViseme;
 use vira_voice::stream_parser::{ParsedStreamEvent, StreamParser};
 
 use crate::events::{EmotionPayload, GesturePayload, EVENT_EMOTION, EVENT_GESTURE};
@@ -22,6 +23,94 @@ pub struct SendMessageResponse {
     pub status: String,
 }
 
+/// Performs linear interpolation resampling between audio sample rates.
+pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == to_rate || samples.is_empty() || from_rate == 0 || to_rate == 0 {
+        return samples.to_vec();
+    }
+    let ratio = to_rate as f64 / from_rate as f64;
+    let out_len = (samples.len() as f64 * ratio).round() as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src_idx = i as f64 / ratio;
+        let idx0 = src_idx.floor() as usize;
+        let frac = (src_idx - idx0 as f64) as f32;
+        let s0 = samples.get(idx0).copied().unwrap_or(0.0);
+        let s1 = samples.get(idx0 + 1).copied().unwrap_or(s0);
+        out.push(s0 + frac * (s1 - s0));
+    }
+    out
+}
+
+/// Helper to process, synthesize, and enqueue a single speakable sentence.
+async fn process_speakable_sentence(
+    clean: &str,
+    state: &AppState,
+    cancel: &CancellationToken,
+    full_assistant_text: &mut String,
+    cumulative_duration_ms: &mut u64,
+    chunks_synthesized: &mut usize,
+) -> bool {
+    if cancel.is_cancelled() {
+        return false;
+    }
+
+    if !full_assistant_text.is_empty() {
+        full_assistant_text.push(' ');
+    }
+    full_assistant_text.push_str(clean);
+
+    let tts_out = match state.tts.synthesize(clean).await {
+        Ok(out) => out,
+        Err(_) => return true,
+    };
+
+    if cancel.is_cancelled() {
+        return false;
+    }
+
+    if !tts_out.samples.is_empty() {
+        let pb_rate = state.audio_playback.sample_rate();
+        let samples = if tts_out.sample_rate != pb_rate && tts_out.sample_rate > 0 && pb_rate > 0 {
+            resample_linear(&tts_out.samples, tts_out.sample_rate, pb_rate)
+        } else {
+            tts_out.samples
+        };
+
+        if cancel.is_cancelled() {
+            return false;
+        }
+
+        let offset = *cumulative_duration_ms;
+        let offset_visemes: Vec<TimedViseme> = tts_out
+            .visemes
+            .into_iter()
+            .map(|v| TimedViseme::new(v.timestamp_ms + offset, v.weights))
+            .collect();
+
+        let chunk_dur_from_samples = if pb_rate > 0 {
+            (samples.len() as u64 * 1000) / pb_rate as u64
+        } else {
+            0
+        };
+        let chunk_dur_from_visemes = offset_visemes
+            .last()
+            .map(|v| v.timestamp_ms.saturating_sub(offset))
+            .unwrap_or(0);
+        let chunk_dur = chunk_dur_from_samples.max(chunk_dur_from_visemes);
+
+        state.force_state(ConversationState::Speaking);
+        state.emit_subtitle(clean, ConversationState::Speaking);
+
+        let _ = state.audio_playback.enqueue_samples(&samples);
+        state.active_visemes.write().unwrap().extend(offset_visemes);
+        *cumulative_duration_ms += chunk_dur;
+        *chunks_synthesized += 1;
+    }
+
+    true
+}
+
 /// Executes a complete conversational turn:
 /// LLM stream -> tag extraction (emotion/gesture) -> sentence chunker -> TTS synthesis -> audio playback.
 pub async fn execute_conversation_turn(
@@ -33,12 +122,16 @@ pub async fn execute_conversation_turn(
         return Err("Message text cannot be empty".to_string());
     }
 
-    // 1. Cancel previous speech turn (if any) and reset audio/visemes
+    // Acquire turn lock to serialize turn execution and prevent interleaved synthesis
+    let _turn_guard = state.turn_lock.lock().await;
+
+    // 1. Cancel previous speech turn (if any), flush audio, and reset clock
     state.cancel_active_speech();
 
     // 2. Set new cancellation token
     let cancel = CancellationToken::new();
     *state.active_cancellation.lock().unwrap() = Some(cancel.clone());
+    state.set_generating(true);
 
     // 3. Move state to Thinking
     state.force_state(ConversationState::Thinking);
@@ -59,18 +152,19 @@ pub async fn execute_conversation_turn(
         history_snapshot.insert(0, Message::system(tutor_mode.system_prompt()));
     }
 
-    // 6. Launch LLM stream
+    // 6. Launch LLM stream and capture join handle to catch errors
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let llm = state.llm.clone();
     let cancel_llm = cancel.clone();
-    tokio::spawn(async move {
-        let _ = llm.stream_chat(&history_snapshot, tx, cancel_llm).await;
+    let llm_handle = tokio::spawn(async move {
+        llm.stream_chat(&history_snapshot, tx, cancel_llm).await
     });
 
     // 7. Stream parser accumulates text and extracts inline emotion/gesture tags
     let mut parser = StreamParser::new();
     let mut full_assistant_text = String::new();
     let mut chunks_synthesized = 0usize;
+    let mut cumulative_duration_ms = 0u64;
 
     while let Some(chunk) = rx.recv().await {
         if cancel.is_cancelled() {
@@ -129,21 +223,17 @@ pub async fn execute_conversation_turn(
                         if clean.is_empty() {
                             continue;
                         }
-
-                        if !full_assistant_text.is_empty() {
-                            full_assistant_text.push(' ');
-                        }
-                        full_assistant_text.push_str(clean);
-
-                        state.force_state(ConversationState::Speaking);
-                        state.emit_subtitle(clean, ConversationState::Speaking);
-
-                        if let Ok(tts_out) = state.tts.synthesize(clean).await {
-                            if !tts_out.samples.is_empty() {
-                                let _ = state.audio_playback.enqueue_samples(&tts_out.samples);
-                                state.active_visemes.write().unwrap().extend(tts_out.visemes);
-                                chunks_synthesized += 1;
-                            }
+                        if !process_speakable_sentence(
+                            clean,
+                            state,
+                            &cancel,
+                            &mut full_assistant_text,
+                            &mut cumulative_duration_ms,
+                            &mut chunks_synthesized,
+                        )
+                        .await
+                        {
+                            break;
                         }
                     }
                 }
@@ -178,27 +268,31 @@ pub async fn execute_conversation_turn(
                 }
                 ParsedStreamEvent::SpeakableText(sentence) => {
                     let clean = sentence.trim();
-                    if !clean.is_empty() {
-                        if !full_assistant_text.is_empty() {
-                            full_assistant_text.push(' ');
-                        }
-                        full_assistant_text.push_str(clean);
-
-                        state.force_state(ConversationState::Speaking);
-                        state.emit_subtitle(clean, ConversationState::Speaking);
-
-                        if let Ok(tts_out) = state.tts.synthesize(clean).await {
-                            if !tts_out.samples.is_empty() {
-                                let _ = state.audio_playback.enqueue_samples(&tts_out.samples);
-                                state.active_visemes.write().unwrap().extend(tts_out.visemes);
-                                chunks_synthesized += 1;
-                            }
-                        }
+                    if clean.is_empty() {
+                        continue;
+                    }
+                    if !process_speakable_sentence(
+                        clean,
+                        state,
+                        &cancel,
+                        &mut full_assistant_text,
+                        &mut cumulative_duration_ms,
+                        &mut chunks_synthesized,
+                    )
+                    .await
+                    {
+                        break;
                     }
                 }
             }
         }
     }
+
+    // Inspect LLM task completion
+    let llm_res = llm_handle.await;
+
+    // Generation is done
+    state.set_generating(false);
 
     // Check cancellation
     if cancel.is_cancelled() {
@@ -208,13 +302,34 @@ pub async fn execute_conversation_turn(
         });
     }
 
+    // If no text was produced, check if LLM stream failed with an error
+    if chunks_synthesized == 0 && full_assistant_text.is_empty() {
+        state.force_state(ConversationState::Idle);
+        state.emit_subtitle("", ConversationState::Idle);
+
+        match llm_res {
+            Ok(Err(llm_err)) => {
+                return Err(format!("LLM inference failed: {llm_err}"));
+            }
+            Err(join_err) => {
+                return Err(format!("LLM task panicked: {join_err}"));
+            }
+            _ => {
+                return Ok(SendMessageResponse {
+                    message_id,
+                    status: "empty".to_string(),
+                });
+            }
+        }
+    }
+
     // Record completed assistant turn to conversation history
     if !full_assistant_text.is_empty() {
         let assistant_msg = Message::assistant(full_assistant_text);
         state.history.write().await.push(assistant_msg);
     }
 
-    if chunks_synthesized == 0 && !cancel.is_cancelled() {
+    if chunks_synthesized == 0 {
         state.force_state(ConversationState::Idle);
         state.emit_subtitle("", ConversationState::Idle);
     }
@@ -272,6 +387,16 @@ pub async fn trigger_gesture(
     handle_trigger_gesture(name, duration, state.inner()).await
 }
 
+/// Tauri command wrapper for `play_gesture` (alias for `trigger_gesture`).
+#[tauri::command]
+pub async fn play_gesture(
+    name: String,
+    duration: f32,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    handle_trigger_gesture(name, duration, state.inner()).await
+}
+
 /// Handler for `set_emotion`.
 pub async fn handle_set_emotion(
     name: String,
@@ -282,10 +407,14 @@ pub async fn handle_set_emotion(
     if trimmed.is_empty() {
         return Err("Emotion name cannot be empty".to_string());
     }
+    let canonical_name = match trimmed.parse::<CharacterEmotion>() {
+        Ok(domain_emotion) => domain_emotion.as_str().to_string(),
+        Err(_) => trimmed.to_string(),
+    };
     let weight = weight.clamp(0.0, 1.0);
-    *state.emotion.write().unwrap() = (trimmed.to_string(), weight);
+    *state.emotion.write().unwrap() = (canonical_name.clone(), weight);
     let payload = EmotionPayload {
-        name: trimmed.to_string(),
+        name: canonical_name,
         weight,
     };
     state
@@ -328,6 +457,12 @@ pub async fn handle_toggle_mic(
     state: &AppState,
 ) -> Result<bool, String> {
     if active {
+        state
+            .audio_capture
+            .start_capture()
+            .map_err(|e| e.to_string())?;
+        state.mic_active.store(true, Ordering::Release);
+
         let can_barge_in = state.get_conversation_state().can_barge_in();
         if can_barge_in {
             state.cancel_active_speech();
@@ -336,11 +471,6 @@ pub async fn handle_toggle_mic(
         } else {
             state.force_state(ConversationState::Listening);
         }
-        state
-            .audio_capture
-            .start_capture()
-            .map_err(|e| e.to_string())?;
-        state.mic_active.store(true, Ordering::Release);
     } else {
         state
             .audio_capture
