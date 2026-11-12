@@ -8,8 +8,9 @@ pub mod message;
 pub mod state;
 pub mod viseme;
 
-pub use message::{Message, Role};
+pub use message::{Message, Role, RoleParseError};
 pub use state::{
-    CharacterEmotion, ConversationState, StateTransitionError, StateTransitionEvent,
+    CharacterEmotion, ConversationState, EmotionParseError, StateParseError, StateTransitionError,
+    StateTransitionEvent,
 };
 pub use viseme::VisemeWeights;
