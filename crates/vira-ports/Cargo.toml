@@ -1,0 +1,16 @@
+[package]
+name = "vira-ports"
+version.workspace = true
+edition.workspace = true
+description = "Hexagonal port traits and contracts for Vira AI companion"
+
+[dependencies]
+vira-domain = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

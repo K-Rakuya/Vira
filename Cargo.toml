@@ -18,3 +18,5 @@ thiserror = "2.0"
 tokio = { version = "1.40", features = ["full"] }
 tokio-util = "0.7"
 async-trait = "0.1"
+vira-domain = { path = "crates/vira-domain" }
+vira-ports = { path = "crates/vira-ports" }
