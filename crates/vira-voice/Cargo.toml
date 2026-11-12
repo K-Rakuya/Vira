@@ -1,0 +1,18 @@
+[package]
+name = "vira-voice"
+version.workspace = true
+edition.workspace = true
+description = "Realtime Audio Engine & Master Sample Clock for Vira AI companion"
+
+[dependencies]
+vira-domain = { workspace = true }
+vira-ports = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+rtrb = "0.3"
+cpal = "0.15"
+
+[dev-dependencies]
+serde_json = { workspace = true }

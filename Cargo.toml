@@ -20,3 +20,4 @@ tokio-util = "0.7"
 async-trait = "0.1"
 vira-domain = { path = "crates/vira-domain" }
 vira-ports = { path = "crates/vira-ports" }
+vira-voice = { path = "crates/vira-voice" }
