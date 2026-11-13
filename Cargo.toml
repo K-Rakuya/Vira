@@ -26,3 +26,4 @@ vira-tauri = { path = "crates/vira-tauri" }
 vira-rag = { path = "crates/vira-rag" }
 vira-learn = { path = "crates/vira-learn" }
 vira-store = { path = "crates/vira-store" }
+vira-agent = { path = "crates/vira-agent" }

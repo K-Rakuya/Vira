@@ -1,0 +1,20 @@
+[package]
+name = "vira-agent"
+version.workspace = true
+edition.workspace = true
+description = "Model Context Protocol (MCP) Tool Calling and Subagent Execution for Vira AI Companion"
+
+[dependencies]
+vira-domain = { workspace = true }
+vira-ports = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+futures-util = "0.3"
+
+[dev-dependencies]
+tempfile = "3.17"

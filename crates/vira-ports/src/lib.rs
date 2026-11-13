@@ -6,12 +6,15 @@
 
 #![deny(clippy::all)]
 
+pub mod agent;
 pub mod audio;
 pub mod llm;
 pub mod rag;
 pub mod store;
 pub mod stt;
 pub mod tts;
+
+pub use agent::{AgentError, AgentPort, ToolCallRequest, ToolCallResult, ToolDefinition};
 
 pub use audio::{AudioCapturePort, AudioError, AudioPlaybackPort};
 pub use llm::{
