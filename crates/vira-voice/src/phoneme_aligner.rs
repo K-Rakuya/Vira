@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use crate::gop::split_phoneme_base_and_tag;
 
 /// Supported languages for G2P phonetic transcription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -31,6 +32,10 @@ pub enum AlignmentError {
     InsufficientFrames { frames: usize, phonemes: usize },
     #[error("Vocabulary does not contain phoneme: {0}")]
     PhonemeNotFoundInVocab(String),
+    #[error("Frame vector dimension mismatch: expected at least {expected}, got {got}")]
+    FrameDimensionMismatch { expected: usize, got: usize },
+    #[error("CTC monotonic alignment failed: acoustic frames could not reach end phoneme")]
+    AlignmentFailed,
 }
 
 /// Result of aligning a target phoneme against acoustic frames.
@@ -115,15 +120,38 @@ impl CtcAligner {
             }
         }
 
+        // Validate frame dimensions against target phoneme indices
+        let max_target_idx = target_indices.iter().copied().max().unwrap_or(0);
+        let min_required_dim = vocab.len().max(max_target_idx + 1);
+        for frame in frame_log_posteriors {
+            if frame.len() < min_required_dim {
+                return Err(AlignmentError::FrameDimensionMismatch {
+                    expected: min_required_dim,
+                    got: frame.len(),
+                });
+            }
+        }
+
+        const NEG_INF: f32 = -1e9;
+
+        let get_sanitized_score = |t: usize, idx: usize| -> f32 {
+            match frame_log_posteriors[t].get(idx).copied() {
+                Some(val) if val.is_nan() => -100.0,
+                Some(val) if val <= -1e8 => NEG_INF,
+                Some(val) if val > 0.0 => 0.0,
+                Some(val) => val,
+                None => NEG_INF,
+            }
+        };
+
         // Viterbi forward table: dp[t][k] is max cumulative log-posterior for aligning frames 0..=t to phonemes 0..=k
         // backpointer[t][k] stores true if transition came from k-1 (advance), false if from k (stay)
-        const NEG_INF: f32 = -1e9;
         let mut dp = vec![vec![NEG_INF; num_phonemes]; num_frames];
         let mut backpointer = vec![vec![false; num_phonemes]; num_frames];
 
         // Frame 0 initialization: can only be at phoneme 0
         let p0_idx = target_indices[0];
-        dp[0][0] = frame_log_posteriors[0].get(p0_idx).copied().unwrap_or(NEG_INF);
+        dp[0][0] = get_sanitized_score(0, p0_idx);
 
         // Fill dynamic programming matrix
         for t in 1..num_frames {
@@ -144,15 +172,16 @@ impl CtcAligner {
 
                 if best_prev > NEG_INF / 2.0 {
                     let phoneme_vocab_idx = target_indices[k];
-                    let frame_score = frame_log_posteriors[t]
-                        .get(phoneme_vocab_idx)
-                        .copied()
-                        .unwrap_or(NEG_INF);
+                    let frame_score = get_sanitized_score(t, phoneme_vocab_idx);
 
                     dp[t][k] = best_prev + frame_score;
                     backpointer[t][k] = advanced;
                 }
             }
+        }
+
+        if dp[num_frames - 1][num_phonemes - 1] <= NEG_INF / 2.0 {
+            return Err(AlignmentError::AlignmentFailed);
         }
 
         // Backtrack optimal alignment path from frame num_frames - 1 at phoneme num_phonemes - 1
@@ -178,7 +207,7 @@ impl CtcAligner {
 
             while t < num_frames && frame_to_phoneme[t] == k {
                 let p_idx = target_indices[k];
-                let lp = frame_log_posteriors[t].get(p_idx).copied().unwrap_or(-10.0);
+                let lp = get_sanitized_score(t, p_idx);
                 posteriors.push(lp);
                 end_frame = t;
                 t += 1;
@@ -187,10 +216,7 @@ impl CtcAligner {
             // Fallback safety if empty
             if posteriors.is_empty() {
                 let p_idx = target_indices[k];
-                let lp = frame_log_posteriors[start_frame.min(num_frames - 1)]
-                    .get(p_idx)
-                    .copied()
-                    .unwrap_or(-10.0);
+                let lp = get_sanitized_score(start_frame.min(num_frames - 1), p_idx);
                 posteriors.push(lp);
             }
 
@@ -266,18 +292,32 @@ impl DtwAligner {
             return 0.0;
         }
 
-        let is_vowel = |p: &str| -> bool {
-            let u = p.trim_end_matches(|c: char| c.is_ascii_digit()).to_uppercase();
+        let (b1, t1) = split_phoneme_base_and_tag(p1);
+        let (b2, t2) = split_phoneme_base_and_tag(p2);
+
+        // If the base phoneme is identical (e.g. "AA" vs "AA1", or "AA_T2" vs "AA_T5")
+        if b1.eq_ignore_ascii_case(b2) {
+            let is_stress_or_none = |t: Option<&str>| {
+                t.is_none_or(|tag| tag.chars().all(|c| c.is_ascii_digit()))
+            };
+            if is_stress_or_none(t1) && is_stress_or_none(t2) {
+                return 0.0; // Same phoneme, lexical stress difference does not penalize
+            }
+            // Tone mismatch in tonal languages (e.g. Vietnamese T2 vs T5) is a minor tone flaw
+            return 0.2;
+        }
+
+        let is_vowel = |base: &str| -> bool {
             matches!(
-                u.as_str(),
+                base.to_ascii_uppercase().as_str(),
                 "AA" | "AE" | "AH" | "AO" | "AW" | "AY" | "EH" | "ER" | "EY" | "IH" | "IY"
                     | "OW" | "OY" | "UH" | "UW" | "A" | "AW_OPEN" | "AA_HAT" | "E" | "EE"
                     | "I" | "O" | "OW_HORN" | "U" | "UW_HORN" | "IE" | "UO" | "UOW"
             )
         };
 
-        let v1 = is_vowel(p1);
-        let v2 = is_vowel(p2);
+        let v1 = is_vowel(b1);
+        let v2 = is_vowel(b2);
 
         if v1 && v2 {
             // Both are vowels: partial confusion penalty
@@ -534,14 +574,27 @@ impl G2pConverter {
             other => other,
         };
 
-        let words: Vec<&str> = text
-            .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+        let is_sep = |c: char| {
+            c.is_whitespace()
+                || (c.is_ascii_punctuation() && c != '\'')
+                || matches!(
+                    c,
+                    '“' | '”' | '«' | '»' | '—' | '–' | '…' | '¿' | '¡' | '·' | '•'
+                )
+        };
+
+        let words: Vec<String> = text
+            .split(is_sep)
+            .map(|w| {
+                w.trim_matches(|c: char| !c.is_alphanumeric())
+                    .replace('’', "'")
+            })
             .filter(|w| !w.is_empty())
             .collect();
 
         let mut phonemes = Vec::new();
 
-        for word in words {
+        for word in &words {
             match lang {
                 PhonemeLanguage::English => {
                     phonemes.extend(self.english_word_to_phonemes(word));
@@ -575,6 +628,20 @@ impl G2pConverter {
         let mut i = 0;
 
         while i < len {
+            // Check initial silent consonants
+            if i == 0 && i + 2 <= len {
+                let slice: String = chars[0..2].iter().collect();
+                if slice == "kn" {
+                    phonemes.push("N".to_string());
+                    i += 2;
+                    continue;
+                } else if slice == "wr" {
+                    phonemes.push("R".to_string());
+                    i += 2;
+                    continue;
+                }
+            }
+
             // Check 4-character suffixes
             if i + 4 <= len {
                 let slice: String = chars[i..i + 4].iter().collect();
@@ -599,6 +666,18 @@ impl G2pConverter {
                 if slice == "ing" && i > 0 {
                     phonemes.push("IH".to_string());
                     phonemes.push("NG".to_string());
+                    i += 3;
+                    continue;
+                } else if slice == "igh" {
+                    phonemes.push("AY".to_string());
+                    i += 3;
+                    continue;
+                } else if slice == "tch" {
+                    phonemes.push("CH".to_string());
+                    i += 3;
+                    continue;
+                } else if slice == "dge" {
+                    phonemes.push("JH".to_string());
                     i += 3;
                     continue;
                 }
@@ -659,7 +738,7 @@ impl G2pConverter {
                         i += 2;
                         continue;
                     }
-                    "ai" | "ay" => {
+                    "ai" | "ay" | "ey" => {
                         phonemes.push("EY".to_string());
                         i += 2;
                         continue;
@@ -674,8 +753,24 @@ impl G2pConverter {
                         i += 2;
                         continue;
                     }
+                    "oa" => {
+                        phonemes.push("OW".to_string());
+                        i += 2;
+                        continue;
+                    }
+                    "au" | "aw" => {
+                        phonemes.push("AO".to_string());
+                        i += 2;
+                        continue;
+                    }
                     _ => {}
                 }
+            }
+
+            // Check trailing silent 'e' in multi-letter words (e.g., make, smile, code)
+            if i == len - 1 && chars[i] == 'e' && len > 2 {
+                i += 1;
+                continue;
             }
 
             // Single letters
@@ -770,10 +865,6 @@ impl G2pConverter {
                     initial = Some("TR");
                     i += 2;
                 }
-                "gi" => {
-                    initial = Some("Z");
-                    i += 2;
-                }
                 "gh" => {
                     initial = Some("G");
                     i += 2;
@@ -783,6 +874,28 @@ impl G2pConverter {
                     i += 2;
                 }
                 _ => {}
+            }
+        }
+        // Handle "gi":
+        // - "gì", "gí", "gỉ", "gĩ", "gị": tone is on i, initial is Z, consume 'g', leave 'ì' for vowel
+        // - "giếng", "giết", "giềng": followed by ê/ế/..., initial is Z, consume 'g', leave iê for diphthong
+        // - "gi" exact 2-letter word: initial is Z, consume 'g', leave 'i' for vowel
+        // - "gió", "giá", "giúp": initial is Z, consume both "gi"
+        if initial.is_none() && i + 1 < len && chars[i] == 'g' {
+            let next = chars[i + 1];
+            if matches!(next, 'ì' | 'í' | 'ỉ' | 'ĩ' | 'ị') {
+                initial = Some("Z");
+                i += 1;
+            } else if next == 'i' {
+                if (i + 2 < len && matches!(chars[i + 2], 'ê' | 'ế' | 'ề' | 'ể' | 'ễ' | 'ệ'))
+                    || i + 2 == len
+                {
+                    initial = Some("Z");
+                    i += 1;
+                } else {
+                    initial = Some("Z");
+                    i += 2;
+                }
             }
         }
         if initial.is_none() && i < len {
@@ -971,6 +1084,82 @@ impl G2pConverter {
             ("this", &["DH", "IH", "S"]),
             ("that", &["DH", "AE", "T"]),
             ("there", &["DH", "EH", "R"]),
+            ("they", &["DH", "EY"]),
+            ("them", &["DH", "EH", "M"]),
+            ("their", &["DH", "EH", "R"]),
+            ("theirs", &["DH", "EH", "R", "Z"]),
+            ("he", &["HH", "IY"]),
+            ("him", &["HH", "IH", "M"]),
+            ("his", &["HH", "IH", "Z"]),
+            ("she", &["SH", "IY"]),
+            ("her", &["HH", "ER"]),
+            ("hers", &["HH", "ER", "Z"]),
+            ("it", &["IH", "T"]),
+            ("its", &["IH", "T", "S"]),
+            ("we", &["W", "IY"]),
+            ("us", &["AH", "S"]),
+            ("our", &["AW", "ER"]),
+            ("ours", &["AW", "ER", "Z"]),
+            ("me", &["M", "IY"]),
+            ("my", &["M", "AY"]),
+            ("mine", &["M", "AY", "N"]),
+            ("your", &["Y", "AO", "R"]),
+            ("yours", &["Y", "AO", "R", "Z"]),
+            ("to", &["T", "UW"]),
+            ("of", &["AH", "V"]),
+            ("in", &["IH", "N"]),
+            ("for", &["F", "AO", "R"]),
+            ("on", &["AA", "N"]),
+            ("with", &["W", "IH", "DH"]),
+            ("at", &["AE", "T"]),
+            ("by", &["B", "AY"]),
+            ("from", &["F", "R", "AH", "M"]),
+            ("up", &["AH", "P"]),
+            ("about", &["AH", "B", "AW", "T"]),
+            ("into", &["IH", "N", "T", "UW"]),
+            ("over", &["OW", "V", "ER"]),
+            ("after", &["AE", "F", "T", "ER"]),
+            ("can", &["K", "AE", "N"]),
+            ("could", &["K", "UH", "D"]),
+            ("will", &["W", "IH", "L"]),
+            ("would", &["W", "UH", "D"]),
+            ("shall", &["SH", "AE", "L"]),
+            ("should", &["SH", "UH", "D"]),
+            ("may", &["M", "EY"]),
+            ("might", &["M", "AY", "T"]),
+            ("must", &["M", "AH", "S", "T"]),
+            ("and", &["AE", "N", "D"]),
+            ("but", &["B", "AH", "T"]),
+            ("or", &["AO", "R"]),
+            ("so", &["S", "OW"]),
+            ("if", &["IH", "F"]),
+            ("because", &["B", "IH", "K", "AO", "Z"]),
+            ("as", &["AE", "Z"]),
+            ("until", &["AH", "N", "T", "IH", "L"]),
+            ("while", &["W", "AY", "L"]),
+            ("not", &["N", "AA", "T"]),
+            ("one", &["W", "AH", "N"]),
+            ("two", &["T", "UW"]),
+            ("three", &["TH", "R", "IY"]),
+            ("four", &["F", "AO", "R"]),
+            ("five", &["F", "AY", "V"]),
+            ("six", &["S", "IH", "K", "S"]),
+            ("seven", &["S", "EH", "V", "AH", "N"]),
+            ("eight", &["EY", "T"]),
+            ("nine", &["N", "AY", "N"]),
+            ("ten", &["T", "EH", "N"]),
+            ("don't", &["D", "OW", "N", "T"]),
+            ("can't", &["K", "AE", "N", "T"]),
+            ("won't", &["W", "OW", "N", "T"]),
+            ("it's", &["IH", "T", "S"]),
+            ("i'm", &["AY", "M"]),
+            ("you're", &["Y", "UH", "R"]),
+            ("we're", &["W", "IY", "R"]),
+            ("they're", &["DH", "EH", "R"]),
+            ("isn't", &["IH", "Z", "AH", "N", "T"]),
+            ("aren't", &["AA", "R", "N", "T"]),
+            ("wasn't", &["W", "AA", "Z", "AH", "N", "T"]),
+            ("weren't", &["W", "ER", "N", "T"]),
         ];
 
         for (word, phones) in entries {
@@ -992,7 +1181,7 @@ fn match_vietnamese_vowel(chars: &[char]) -> (&'static str, Option<&'static str>
     if chars.len() >= 2 {
         let two: String = chars[..2].iter().collect();
         match two.as_str() {
-            "iê" | "yê" | "ia" => return ("IE", None, 2),
+            "iê" | "yê" | "ia" | "ya" => return ("IE", None, 2),
             "iế" | "yế" | "ía" => return ("IE", Some("T5"), 2),
             "iề" | "yề" | "ìa" => return ("IE", Some("T2"), 2),
             "iể" | "yể" | "ỉa" => return ("IE", Some("T3"), 2),
@@ -1010,7 +1199,7 @@ fn match_vietnamese_vowel(chars: &[char]) -> (&'static str, Option<&'static str>
             "ướ" | "ứa" => return ("UOW", Some("T5"), 2),
             "ườ" | "ừa" => return ("UOW", Some("T2"), 2),
             "ưở" | "ửa" => return ("UOW", Some("T3"), 2),
-            "ưỡng" | "ữa" => return ("UOW", Some("T4"), 2),
+            "ưỡ" | "ữa" => return ("UOW", Some("T4"), 2),
             "ượ" | "ựa" => return ("UOW", Some("T6"), 2),
             _ => {}
         }

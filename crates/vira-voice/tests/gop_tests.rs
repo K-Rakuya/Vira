@@ -138,6 +138,16 @@ fn test_viseme_hints_for_avatar_vrm() {
     // Dental fricative (TH)
     let v_th = phoneme_to_viseme("TH");
     assert!(v_th.ih > 0.2 && v_th.aa > 0.1);
+
+    // Vietnamese vowel with tone
+    let v_vn = phoneme_to_viseme("AA_T2");
+    assert!(v_vn.aa > 0.8, "AA_T2 should activate aa blendshape but got {}", v_vn.aa);
+
+    let v_ie = phoneme_to_viseme("IE_T6");
+    assert!(v_ie.ee > 0.8, "IE_T6 should activate ee blendshape but got {}", v_ie.ee);
+
+    let v_ow = phoneme_to_viseme("OW_HORN_T4");
+    assert!(v_ow.oh > 0.8, "OW_HORN_T4 should activate oh blendshape but got {}", v_ow.oh);
 }
 
 #[test]
@@ -160,6 +170,16 @@ fn test_phoneme_score_and_assessment_aggregation() {
     assert_eq!(assessment.mispronounced_count, 1);
     assert_eq!(assessment.mispronounced_phonemes().len(), 1);
     assert_eq!(assessment.mispronounced_phonemes()[0].phoneme, "NG");
+
+    // Zero-duration deleted phoneme must NOT be erased from overall score
+    let zero_dur_p1 = PhonemeScore::new("AA", 100.0, 0, 100);
+    let zero_dur_p2 = PhonemeScore::new("B", 0.0, 100, 100); // 0ms duration, score 0
+    let zero_assess = evaluator.evaluate_assessment(vec![zero_dur_p1, zero_dur_p2]);
+    assert!(
+        zero_assess.overall_score < 100.0,
+        "Zero duration phoneme should reduce overall score, got {}",
+        zero_assess.overall_score
+    );
 
     // Viseme hints for avatar feedback
     let mis_hints = assessment.viseme_hints_for_mispronounced();
@@ -184,6 +204,15 @@ fn test_g2p_english_lexicon_and_rules() {
     let hello = g2p.text_to_phonemes("hello", PhonemeLanguage::English);
     assert_eq!(hello, vec!["HH", "AH", "L", "OW"]);
 
+    let hello_quotes = g2p.text_to_phonemes("“hello”", PhonemeLanguage::English);
+    assert_eq!(hello_quotes, vec!["HH", "AH", "L", "OW"], "Quotes broke dictionary lookup: got {:?}", hello_quotes);
+
+    let they = g2p.text_to_phonemes("they", PhonemeLanguage::English);
+    assert_eq!(they, vec!["DH", "EY"]);
+
+    let dont = g2p.text_to_phonemes("don't", PhonemeLanguage::English);
+    assert_eq!(dont, vec!["D", "OW", "N", "T"]);
+
     let world = g2p.text_to_phonemes("world", PhonemeLanguage::English);
     assert_eq!(world, vec!["W", "ER", "L", "D"]);
 
@@ -195,6 +224,13 @@ fn test_g2p_english_lexicon_and_rules() {
     assert!(rules_word.contains(&"SH".to_string()));
     assert!(rules_word.contains(&"AH".to_string()));
     assert!(rules_word.contains(&"N".to_string()));
+
+    // Phonics rules: silent k in knee, silent w in write
+    let knee = g2p.text_to_phonemes("knee", PhonemeLanguage::English);
+    assert_eq!(knee, vec!["N", "IY"]);
+
+    let write_word = g2p.text_to_phonemes("write", PhonemeLanguage::English);
+    assert_eq!(write_word[0], "R");
 
     // Custom word addition
     let mut custom_g2p = G2pConverter::new();
@@ -218,6 +254,20 @@ fn test_g2p_vietnamese_syllables_and_diacritics() {
     assert!(phones.contains(&"V".to_string())); // Việt has v -> V
     assert!(phones.contains(&"IE_T6".to_string())); // Việt has iê + nặng (T6)
     assert!(phones.contains(&"D".to_string())); // đồng / điệu has đ -> D
+
+    // Diphthong ưỡng bug check
+    let duong = g2p.text_to_phonemes("dưỡng", PhonemeLanguage::Vietnamese);
+    assert_eq!(duong, vec!["Z", "UOW_T4", "NG"]);
+
+    // gi with tone on i check
+    let gi = g2p.text_to_phonemes("gì", PhonemeLanguage::Vietnamese);
+    assert_eq!(gi, vec!["Z", "IY_T2"]);
+
+    let gieng = g2p.text_to_phonemes("giếng", PhonemeLanguage::Vietnamese);
+    assert_eq!(gieng, vec!["Z", "IE_T5", "NG"]);
+
+    let gio = g2p.text_to_phonemes("gió", PhonemeLanguage::Vietnamese);
+    assert_eq!(gio, vec!["Z", "AW_OPEN_T5"]);
 
     // Language auto-detection
     assert_eq!(
@@ -256,6 +306,10 @@ fn test_ctc_monotonic_frame_alignment_and_errors() {
         &vocab,
     );
     assert!(matches!(err_vocab, Err(AlignmentError::PhonemeNotFoundInVocab(_))));
+
+    // Dimension mismatch error
+    let err_dim = aligner.align_log_posteriors(&target, &[vec![-0.1], vec![-0.1]], &vocab);
+    assert!(matches!(err_dim, Err(AlignmentError::FrameDimensionMismatch { .. })));
 
     // Valid 5-frame alignment
     let frames = vec![
@@ -298,6 +352,14 @@ fn test_dtw_sequence_alignment() {
     assert_eq!(res_exact.substitutions_count, 0);
     assert_eq!(res_exact.insertions_count, 0);
     assert_eq!(res_exact.deletions_count, 0);
+
+    // ARPAbet stress variation: AA vs AA1 is not penalized as substitution
+    let dist_stress = DtwAligner::phoneme_distance("AA", "AA1");
+    assert_eq!(dist_stress, 0.0);
+
+    // Vietnamese tone difference (AA_T2 vs AA_T5) is a minor flaw (0.2), not a full substitution (1.0)
+    let dist_tone = DtwAligner::phoneme_distance("AA_T2", "AA_T5");
+    assert!((dist_tone - 0.2).abs() < 1e-4);
 
     // 2. Vowel substitution ("EH" replaced with "AE")
     let rec_sub = vec!["HH".to_string(), "AE".to_string(), "L".to_string(), "OW".to_string()];

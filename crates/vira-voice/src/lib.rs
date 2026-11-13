@@ -13,8 +13,9 @@ pub use capture::{CaptureConfig, CaptureEngine, VirtualAudioFeed};
 pub use chunker::{ChunkerConfig, SentenceChunker};
 pub use clock::MasterAudioClock;
 pub use gop::{
-    phoneme_to_viseme, phoneme_to_vrm_preset, AccuracyLevel, GopConfig, GopEvaluator,
-    PhonemeResult, PhonemeScore, PronunciationAssessment, PronunciationScore,
+    phoneme_to_viseme, phoneme_to_vrm_preset, split_phoneme_base_and_tag, AccuracyLevel,
+    GopConfig, GopEvaluator, PhonemeResult, PhonemeScore, PronunciationAssessment,
+    PronunciationScore,
 };
 pub use phoneme_aligner::{
     AlignmentError, AlignmentMatch, CtcAligner, DtwAligner, DtwResult, G2pConverter, MatchStatus,

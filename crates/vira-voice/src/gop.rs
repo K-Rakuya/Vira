@@ -21,6 +21,36 @@ pub enum AccuracyLevel {
     Mispronounced,
 }
 
+/// Splits a phoneme string into its base phonetic token and optional tone/stress tag.
+/// Examples:
+/// - "AA_T2" -> ("AA", Some("T2"))
+/// - "OW_HORN_T5" -> ("OW_HORN", Some("T5"))
+/// - "AA1" -> ("AA", Some("1"))
+/// - "IY0" -> ("IY", Some("0"))
+/// - "TH" -> ("TH", None)
+pub fn split_phoneme_base_and_tag(phoneme: &str) -> (&str, Option<&str>) {
+    let trimmed = phoneme.trim();
+    // Check for Vietnamese tone tag _T1.._T6
+    if let Some(pos) = trimmed.rfind("_T") {
+        let tag = &trimmed[pos + 1..];
+        let base = &trimmed[..pos];
+        if !base.is_empty() && tag.len() >= 2 && tag.chars().skip(1).all(|c| c.is_ascii_digit()) {
+            return (base, Some(tag));
+        }
+    }
+
+    // Check for ARPAbet lexical stress digits (0, 1, 2) at end: e.g. AA1, IY0, AW2
+    let digits_count = trimmed.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+    if digits_count > 0 && digits_count < trimmed.len() {
+        let split_idx = trimmed.len() - digits_count;
+        let base = &trimmed[..split_idx];
+        let tag = &trimmed[split_idx..];
+        return (base, Some(tag));
+    }
+
+    (trimmed, None)
+}
+
 impl AccuracyLevel {
     /// Determines the accuracy level based on numeric score and configured thresholds.
     pub fn from_score(score: f32, correct_thresh: f32, minor_thresh: f32) -> Self {
@@ -181,17 +211,22 @@ impl PronunciationAssessment {
             .filter(|p| p.is_mispronounced())
             .count();
 
-        // Calculate weighted score by duration if available, else arithmetic mean
-        let total_duration: u32 = phoneme_scores.iter().map(|p| p.duration_ms()).sum();
-        let overall_score = if total_duration > 0 {
-            let weighted_sum: f32 = phoneme_scores
-                .iter()
-                .map(|p| p.score * (p.duration_ms() as f32))
-                .sum();
-            (weighted_sum / (total_duration as f32)).clamp(0.0, 100.0)
+        // Calculate weighted score by duration, using a minimum effective duration of 1ms
+        // per phoneme so zero-duration phonemes are never erased from the overall score.
+        let total_duration: u32 = phoneme_scores.iter().map(|p| p.duration_ms().max(1)).sum();
+        let weighted_sum: f32 = phoneme_scores
+            .iter()
+            .map(|p| {
+                let score = if p.score.is_nan() { 0.0 } else { p.score };
+                score * (p.duration_ms().max(1) as f32)
+            })
+            .sum();
+
+        let raw_score = weighted_sum / (total_duration as f32);
+        let overall_score = if raw_score.is_nan() {
+            0.0
         } else {
-            let sum: f32 = phoneme_scores.iter().map(|p| p.score).sum();
-            (sum / (total_phonemes as f32)).clamp(0.0, 100.0)
+            raw_score.clamp(0.0, 100.0)
         };
 
         let accuracy = AccuracyLevel::from_score(overall_score, correct_thresh, minor_thresh);
@@ -256,6 +291,32 @@ pub struct GopConfig {
     pub frame_duration_ms: u32,
 }
 
+impl GopConfig {
+    /// Returns a validated and sanitized copy with legal mathematical bounds.
+    pub fn sanitized(&self) -> Self {
+        let mut cfg = self.clone();
+        if cfg.temperature.is_nan() || cfg.temperature <= 1e-4 {
+            cfg.temperature = 1.0;
+        }
+        if cfg.min_score.is_nan() {
+            cfg.min_score = 0.0;
+        }
+        if cfg.max_score.is_nan() {
+            cfg.max_score = 100.0;
+        }
+        if cfg.min_score > cfg.max_score {
+            std::mem::swap(&mut cfg.min_score, &mut cfg.max_score);
+        }
+        if cfg.minor_flaw_threshold > cfg.correct_threshold {
+            std::mem::swap(&mut cfg.minor_flaw_threshold, &mut cfg.correct_threshold);
+        }
+        if cfg.frame_duration_ms == 0 {
+            cfg.frame_duration_ms = 20;
+        }
+        cfg
+    }
+}
+
 impl Default for GopConfig {
     fn default() -> Self {
         Self {
@@ -281,13 +342,16 @@ pub struct GopEvaluator {
 impl GopEvaluator {
     /// Creates a new `GopEvaluator` with custom configuration.
     pub fn new(config: GopConfig) -> Self {
-        Self { config }
+        Self {
+            config: config.sanitized(),
+        }
     }
 
     /// Sets custom classification thresholds.
     pub fn with_thresholds(mut self, correct: f32, minor: f32) -> Self {
         self.config.correct_threshold = correct;
         self.config.minor_flaw_threshold = minor;
+        self.config = self.config.sanitized();
         self
     }
 
@@ -301,21 +365,16 @@ impl GopEvaluator {
     /// - When $L = -0.50$, score is $\approx 60.65$ (MinorFlaw).
     /// - When $L \le -1.0$, score is $\le 36.79$ (Mispronounced).
     pub fn evaluate_score(&self, log_posterior: f32) -> f32 {
+        let cfg = self.config.sanitized();
         if log_posterior.is_nan() || log_posterior <= -20.0 {
-            return self.config.min_score;
+            return cfg.min_score;
         }
         if log_posterior >= 0.0 {
-            return self.config.max_score;
+            return cfg.max_score;
         }
 
-        let temp = if self.config.temperature <= 1e-4 {
-            1.0
-        } else {
-            self.config.temperature
-        };
-
-        let prob = (log_posterior / temp).exp();
-        (prob * 100.0).clamp(self.config.min_score, self.config.max_score)
+        let prob = (log_posterior / cfg.temperature).exp();
+        (prob * 100.0).clamp(cfg.min_score, cfg.max_score)
     }
 
     /// Calculates normalized score [0.0, 100.0] from a Log-Likelihood Ratio (LLR):
@@ -324,24 +383,16 @@ impl GopEvaluator {
     /// Uses standard logistic sigmoid transformation:
     /// $\text{Score} = 100.0 / (1.0 + \exp(-\text{LLR} / T))$.
     pub fn evaluate_llr_score(&self, llr: f32) -> f32 {
-        if llr.is_nan() {
-            return self.config.min_score;
+        let cfg = self.config.sanitized();
+        if llr.is_nan() || llr <= -10.0 {
+            return cfg.min_score;
         }
         if llr >= 10.0 {
-            return self.config.max_score;
-        }
-        if llr <= -10.0 {
-            return self.config.min_score;
+            return cfg.max_score;
         }
 
-        let temp = if self.config.temperature <= 1e-4 {
-            1.0
-        } else {
-            self.config.temperature
-        };
-
-        let sigmoid = 1.0 / (1.0 + (-llr / temp).exp());
-        (sigmoid * 100.0).clamp(self.config.min_score, self.config.max_score)
+        let sigmoid = 1.0 / (1.0 + (-llr / cfg.temperature).exp());
+        (sigmoid * 100.0).clamp(cfg.min_score, cfg.max_score)
     }
 
     /// Evaluates a target phoneme from a slice of acoustic frame log-posteriors.
@@ -352,11 +403,17 @@ impl GopEvaluator {
         start_ms: u32,
         end_ms: u32,
     ) -> PhonemeScore {
-        let mean_lp = if frame_log_posteriors.is_empty() {
+        let valid_frames: Vec<f32> = frame_log_posteriors
+            .iter()
+            .copied()
+            .filter(|lp| !lp.is_nan())
+            .collect();
+
+        let mean_lp = if valid_frames.is_empty() {
             -10.0
         } else {
-            let sum: f32 = frame_log_posteriors.iter().sum();
-            sum / (frame_log_posteriors.len() as f32)
+            let sum: f32 = valid_frames.iter().sum();
+            sum / (valid_frames.len() as f32)
         };
 
         let score = self.evaluate_score(mean_lp);
@@ -410,11 +467,10 @@ impl GopEvaluator {
 /// Maps any phoneme string (ARPAbet, IPA, or Vietnamese orthography) to 3D avatar VRM
 /// blendshape weights `(aa, ih, ou, ee, oh)` clamped strictly to `[0.0, 1.0]`.
 pub fn phoneme_to_viseme(phoneme: &str) -> VisemeWeights {
-    let clean = phoneme.trim().to_uppercase();
-    // Strip trailing tone/stress digits if present (e.g. "AH0", "IY1", "AW2", "T1")
-    let base = clean.trim_end_matches(|c: char| c.is_ascii_digit() || c == '_');
+    let (base_raw, _) = split_phoneme_base_and_tag(phoneme);
+    let base = base_raw.trim().to_uppercase();
 
-    match base {
+    match base.as_str() {
         // Open vowels (VRM 'aa')
         "AA" | "AH" | "AE" | "AW" | "AY" | "/A/" | "/Æ/" | "/Ɑ/" | "/Ʌ/" | "/AƱ/" | "/AꞮ/"
         | "A" | "AW_OPEN" | "AA_HAT" => {
