@@ -52,6 +52,28 @@ impl LanceDbTable {
         Ok(count)
     }
 
+    /// Deletes a single vector record by its chunk identifier.
+    pub fn delete_by_chunk_id(&self, chunk_id: &str) -> Result<bool, VectorStoreError> {
+        let mut store = self.store.write().map_err(|_| {
+            VectorStoreError::Embedding("Lock poisoned while deleting from table".to_string())
+        })?;
+        let deleted = store.delete_by_chunk_id(chunk_id);
+        if deleted {
+            store.save_to_disk()?;
+        }
+        Ok(deleted)
+    }
+
+    /// Clears all vector records from this table.
+    pub fn clear(&self) -> Result<(), VectorStoreError> {
+        let mut store = self.store.write().map_err(|_| {
+            VectorStoreError::Embedding("Lock poisoned while clearing table".to_string())
+        })?;
+        store.clear();
+        store.save_to_disk()?;
+        Ok(())
+    }
+
     /// Returns the number of vector rows in this table.
     pub fn count(&self) -> usize {
         self.store.read().map(|s| s.count()).unwrap_or(0)
@@ -82,6 +104,52 @@ impl LanceDbVectorStore {
             base_dir: Some(base_dir),
             tables: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Lists all currently known or loaded tables.
+    pub fn list_tables(&self) -> Result<Vec<String>, VectorStoreError> {
+        let tables = self.tables.read().map_err(|_| {
+            VectorStoreError::Embedding("Lock poisoned while listing tables".to_string())
+        })?;
+        let mut names: Vec<String> = tables.keys().cloned().collect();
+
+        // Also discover any persisted .json tables in base_dir
+        if let Some(ref base) = self.base_dir {
+            if let Ok(entries) = std::fs::read_dir(base) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            if !names.contains(&stem.to_string()) {
+                                names.push(stem.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        names.sort();
+        Ok(names)
+    }
+
+    /// Drops a named table and removes its backing storage.
+    pub fn drop_table(&self, name: &str) -> Result<bool, VectorStoreError> {
+        let mut tables = self.tables.write().map_err(|_| {
+            VectorStoreError::Embedding("Lock poisoned while dropping table".to_string())
+        })?;
+
+        let removed = tables.remove(name).is_some();
+
+        if let Some(ref base) = self.base_dir {
+            let table_file = base.join(format!("{name}.json"));
+            if table_file.exists() {
+                let _ = std::fs::remove_file(table_file);
+                return Ok(true);
+            }
+        }
+
+        Ok(removed)
     }
 
     /// Opens or creates a named vector table.

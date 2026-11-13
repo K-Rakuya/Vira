@@ -24,6 +24,7 @@ pub use vector_store::{
     cosine_similarity, EmbeddingAdapter, FastEmbedCompat, LocalVectorStore, VectorHit,
     VectorRecord, VectorStoreError,
 };
+pub use vira_ports::{KnowledgeChunk, RagPort, RagPortError};
 
 /// Unified error type for the Hybrid RAG engine.
 #[derive(thiserror::Error, Debug)]
@@ -143,7 +144,17 @@ impl HybridRagEngine {
 
         let chunker = TextChunker::new(config.max_chunk_size, config.overlap);
         let bm25 = TantivyBm25Index::create_in_dir(bm25_dir)?;
-        let vector_store = Arc::new(RwLock::new(LocalVectorStore::new_with_persistence(vector_file)?));
+        let vstore_initial = LocalVectorStore::new_with_persistence(vector_file)?;
+
+        // Restore titles from persistent vector records
+        let mut titles_map = HashMap::new();
+        for rec in vstore_initial.records() {
+            if let Some(t) = rec.metadata.get("title") {
+                titles_map.insert(rec.doc_id.clone(), t.clone());
+            }
+        }
+
+        let vector_store = Arc::new(RwLock::new(vstore_initial));
         let embedding_adapter: Arc<dyn EmbeddingAdapter> = Arc::new(FastEmbedCompat::new(
             &config.model_name,
             config.embedding_dimension,
@@ -155,7 +166,7 @@ impl HybridRagEngine {
             bm25,
             vector_store,
             embedding_adapter,
-            titles: Arc::new(RwLock::new(HashMap::new())),
+            titles: Arc::new(RwLock::new(titles_map)),
             base_dir: Some(dir.to_path_buf()),
         })
     }
@@ -297,7 +308,7 @@ impl HybridRagEngine {
                 continue;
             };
 
-            let citation = format!("{title} ({doc_id})");
+            let citation = format!("[{title}] ({doc_id})");
 
             results.push(RagSearchResult {
                 chunk_id: chunk_id.clone(),
@@ -356,5 +367,62 @@ impl HybridRagEngine {
             .read()
             .map(|s| s.count())
             .unwrap_or(0)
+    }
+}
+
+#[async_trait::async_trait]
+impl vira_ports::RagPort for HybridRagEngine {
+    async fn ingest(
+        &self,
+        doc_id: &str,
+        title: &str,
+        text: &str,
+        metadata: Option<HashMap<String, String>>,
+    ) -> Result<usize, vira_ports::RagPortError> {
+        let chunks = self
+            .ingest_document(doc_id, title, text, metadata)
+            .await
+            .map_err(|e| vira_ports::RagPortError::Index(e.to_string()))?;
+        Ok(chunks.len())
+    }
+
+    async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<vira_ports::KnowledgeChunk>, vira_ports::RagPortError> {
+        let hits = self
+            .search(query, limit)
+            .await
+            .map_err(|e| vira_ports::RagPortError::Query(e.to_string()))?;
+
+        Ok(hits
+            .into_iter()
+            .map(|h| vira_ports::KnowledgeChunk {
+                chunk_id: h.chunk_id,
+                doc_id: h.document_id,
+                title: h.title,
+                text: h.text,
+                score: h.score,
+                citation: h.citation,
+                metadata: h.metadata,
+            })
+            .collect())
+    }
+
+    async fn delete_document(&self, doc_id: &str) -> Result<(), vira_ports::RagPortError> {
+        self.delete_document(doc_id)
+            .await
+            .map_err(|e| vira_ports::RagPortError::Storage(e.to_string()))
+    }
+
+    async fn clear(&self) -> Result<(), vira_ports::RagPortError> {
+        self.clear()
+            .await
+            .map_err(|e| vira_ports::RagPortError::Storage(e.to_string()))
+    }
+
+    fn count(&self) -> usize {
+        self.count_chunks()
     }
 }

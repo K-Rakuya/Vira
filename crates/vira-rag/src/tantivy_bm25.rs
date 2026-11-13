@@ -171,7 +171,7 @@ impl TantivyBm25Index {
     /// Searches for documents matching `query_str` with up to `limit` hits.
     pub fn search(&self, query_str: &str, limit: usize) -> Result<Vec<Bm25Hit>, TantivyError> {
         let trimmed = query_str.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
 
@@ -181,13 +181,55 @@ impl TantivyBm25Index {
             vec![self.fields.title, self.fields.content],
         );
 
-        // Sanitize or parse query; fall back to escaped query if syntax characters cause issues
+        // Sanitize syntax characters for fallback: +, -, &&, ||, !, (, ), {, }, [, ], ^, ", ~, *, ?, :, \, /
+        let sanitize_query = |raw: &str| -> String {
+            raw.chars()
+                .map(|c| {
+                    if matches!(
+                        c,
+                        ':' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '"' | '~' | '*'
+                            | '?' | '\\' | '/' | '+' | '-' | '&' | '|' | '!'
+                    ) {
+                        ' '
+                    } else {
+                        c
+                    }
+                })
+                .collect()
+        };
+
         let query = match query_parser.parse_query(trimmed) {
             Ok(q) => q,
             Err(_) => {
-                let sanitized = trimmed
-                    .replace([':', '(', ')', '[', ']', '{', '}', '^', '"', '~', '*', '?', '\\', '/'], " ");
-                query_parser.parse_query(&sanitized)?
+                let sanitized = sanitize_query(trimmed);
+                let trimmed_sanitized = sanitized.trim();
+                if trimmed_sanitized.is_empty() {
+                    return Ok(Vec::new());
+                }
+                match query_parser.parse_query(trimmed_sanitized) {
+                    Ok(q) => q,
+                    Err(_) => {
+                        // If query parser still fails, build term fallback queries
+                        let terms: Vec<&str> = trimmed_sanitized.split_whitespace().collect();
+                        if terms.is_empty() {
+                            return Ok(Vec::new());
+                        }
+                        let mut subqueries: Vec<(tantivy::query::Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
+                        for word in terms {
+                            let t_title = Term::from_field_text(self.fields.title, word);
+                            let t_content = Term::from_field_text(self.fields.content, word);
+                            subqueries.push((
+                                tantivy::query::Occur::Should,
+                                Box::new(tantivy::query::TermQuery::new(t_title, tantivy::schema::IndexRecordOption::Basic)),
+                            ));
+                            subqueries.push((
+                                tantivy::query::Occur::Should,
+                                Box::new(tantivy::query::TermQuery::new(t_content, tantivy::schema::IndexRecordOption::Basic)),
+                            ));
+                        }
+                        Box::new(tantivy::query::BooleanQuery::new(subqueries))
+                    }
+                }
             }
         };
 

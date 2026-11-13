@@ -58,6 +58,72 @@ fn test_chunker_abbreviation_and_decimal_protection() {
 }
 
 #[test]
+fn test_chunker_cats_and_multidot_abbreviations() {
+    let chunker = TextChunker::new(200, 20);
+    // "cats." ends with "ts", should NOT be treated as abbreviation
+    let text1 = "I love cats. They are cute.";
+    let s1 = chunker.split_into_sentences(text1);
+    assert_eq!(s1.len(), 2, "Word 'cats' ending in 'ts' should not prevent sentence split");
+
+    // "v.v." multi-dot abbreviation
+    let text2 = "Học Toán, Lý, Hóa, v.v. tại trường phổ thông. Kỳ thi rất khó.";
+    let s2 = chunker.split_into_sentences(text2);
+    assert_eq!(s2.len(), 2, "v.v. abbreviation should not cause split after first v.");
+
+    // "e.g." multi-dot abbreviation
+    let text3 = "Common fruits, e.g. apples and oranges, are healthy. Eat them daily.";
+    let s3 = chunker.split_into_sentences(text3);
+    assert_eq!(s3.len(), 2, "e.g. abbreviation should not cause split after first e.");
+}
+
+#[test]
+fn test_long_sentence_chunk_offsets() {
+    let chunker = TextChunker::new(40, 10);
+    let text = "One two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen.";
+    let chunks = chunker.chunk(text);
+    assert!(chunks.len() >= 2);
+    // Each chunk should have distinct and monotonically increasing offsets
+    for i in 1..chunks.len() {
+        assert!(
+            chunks[i].start_char >= chunks[i - 1].start_char,
+            "Chunk start_char must advance, got chunk[{}].start_char={}, chunk[{}].start_char={}",
+            i - 1, chunks[i - 1].start_char, i, chunks[i].start_char
+        );
+        assert_ne!(
+            chunks[i].start_char, chunks[i - 1].start_char,
+            "Subsequent chunks must not share identical start_char"
+        );
+    }
+}
+
+#[test]
+fn test_cjk_sentence_delimiters() {
+    let chunker = TextChunker::new(200, 20);
+    let text = "これは日本語です。それは本です！どれですか？";
+    let sentences = chunker.split_into_sentences(text);
+    assert_eq!(sentences.len(), 3, "CJK full stop and exclamation/question marks should split sentences");
+}
+
+#[test]
+fn test_tantivy_query_parser_special_characters() {
+    let index = TantivyBm25Index::create_in_ram().expect("ram index");
+    index
+        .add_chunk("c1", "d1", "C++ Programming", "C++ is a compiled systems language.", None)
+        .expect("add");
+    index.commit().expect("commit");
+
+    // Should not panic or return QueryParser error on C++, ???, or boolean ops
+    let res1 = index.search("C++", 5);
+    assert!(res1.is_ok(), "Searching 'C++' must not fail with query parser error");
+
+    let res2 = index.search("???", 5);
+    assert!(res2.is_ok(), "Searching '???' must not fail with query parser error");
+
+    let res3 = index.search("+ - && || !", 5);
+    assert!(res3.is_ok(), "Searching operators must not fail with query parser error");
+}
+
+#[test]
 fn test_cosine_similarity_edge_cases() {
     let a = vec![1.0, 0.0, 0.0];
     let b = vec![1.0, 0.0, 0.0];
@@ -140,7 +206,7 @@ async fn test_bm25_and_vector_hybrid_retrieval() {
 
     assert!(!results.is_empty());
     assert_eq!(results[0].document_id, "doc_grammar_01");
-    assert!(results[0].citation.contains("Ngữ pháp tiếng Anh cơ bản"));
+    assert_eq!(results[0].citation, "[Ngữ pháp tiếng Anh cơ bản] (doc_grammar_01)");
     assert!(results[0].score > 0.0);
 }
 
@@ -175,6 +241,8 @@ async fn test_persistent_hybrid_rag_lifecycle_and_delete() {
         let hits = engine.search("fluency coherence criteria", 3).await.expect("search");
         assert!(!hits.is_empty());
         assert_eq!(hits[0].document_id, "doc_ielts_01");
+        assert_eq!(hits[0].title, "IELTS Speaking Tips");
+        assert_eq!(hits[0].citation, "[IELTS Speaking Tips] (doc_ielts_01)");
         assert!(hits[0].text.contains("Fluency"));
 
         // Delete document
@@ -184,6 +252,70 @@ async fn test_persistent_hybrid_rag_lifecycle_and_delete() {
         let hits_after_del = engine.search("fluency", 3).await.expect("search after delete");
         assert!(hits_after_del.is_empty());
     }
+}
+
+#[tokio::test]
+async fn test_rag_port_contract() {
+    use vira_ports::RagPort;
+
+    let engine = HybridRagEngine::new_in_memory(HybridRagConfig::default()).expect("engine");
+    let port: &dyn RagPort = &engine;
+
+    let count = port
+        .ingest(
+            "doc_port_1",
+            "Vocabulary Builder",
+            "Serendipity means finding something good without looking for it.",
+            None,
+        )
+        .await
+        .expect("ingest via port");
+
+    assert!(count >= 1);
+    assert_eq!(port.count(), count);
+
+    let hits = port.search("serendipity looking", 2).await.expect("port search");
+    assert!(!hits.is_empty());
+    assert_eq!(hits[0].doc_id, "doc_port_1");
+    assert_eq!(hits[0].title, "Vocabulary Builder");
+    assert_eq!(hits[0].citation, "[Vocabulary Builder] (doc_port_1)");
+
+    port.delete_document("doc_port_1").await.expect("port delete");
+    assert_eq!(port.count(), 0);
+}
+
+#[test]
+fn test_lancedb_vector_store_advanced_crud() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = LanceDbVectorStore::connect(dir.path()).expect("connect");
+
+    let table1 = store.open_table("table_a").expect("open a");
+    table1
+        .add(vec![
+            VectorRecord::new("chunk_1", "doc_1", "Text 1", vec![1.0, 0.0]),
+            VectorRecord::new("chunk_2", "doc_2", "Text 2", vec![0.0, 1.0]),
+        ])
+        .expect("add");
+
+    assert_eq!(table1.count(), 2);
+    assert!(table1.delete_by_chunk_id("chunk_1").expect("del chunk"));
+    assert_eq!(table1.count(), 1);
+
+    table1.clear().expect("clear");
+    assert_eq!(table1.count(), 0);
+
+    let table2 = store.open_table("table_b").expect("open b");
+    table2
+        .add(vec![VectorRecord::new("chunk_3", "doc_3", "Text 3", vec![0.5, 0.5])])
+        .expect("add");
+
+    let tables = store.list_tables().expect("list");
+    assert!(tables.contains(&"table_a".to_string()));
+    assert!(tables.contains(&"table_b".to_string()));
+
+    assert!(store.drop_table("table_a").expect("drop"));
+    let tables_after = store.list_tables().expect("list after");
+    assert!(!tables_after.contains(&"table_a".to_string()));
 }
 
 #[tokio::test]

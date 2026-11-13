@@ -8,6 +8,7 @@
 
 pub mod audio;
 pub mod llm;
+pub mod rag;
 pub mod store;
 pub mod stt;
 pub mod tts;
@@ -17,6 +18,7 @@ pub use llm::{
     extract_emotion_tag, extract_gesture_tag, extract_tag, strip_tags, LlmError, LlmPort,
     LlmStreamChunk,
 };
+pub use rag::{KnowledgeChunk, RagPort, RagPortError};
 pub use store::{Flashcard, SessionSummary, StoreError, StorePort, UserProfile};
 pub use stt::{SttError, SttEvent, SttPort};
 pub use tts::{TimedViseme, TtsAudioChunk, TtsError, TtsOutput, TtsPort, TtsStreamEvent};

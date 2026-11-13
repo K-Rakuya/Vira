@@ -191,75 +191,177 @@ impl TextChunker {
         });
     }
 
-    /// Splits text into sentences respecting Vietnamese and English punctuation, decimals, and abbreviations.
+    /// Splits text into sentences respecting Vietnamese, English, and CJK punctuation, decimals, and abbreviations.
     pub fn split_into_sentences<'a>(&self, text: &'a str) -> Vec<(usize, usize, &'a str)> {
         let mut results = Vec::new();
-        let mut start_idx = 0;
-        let chars: Vec<(usize, char)> = text.char_indices().collect();
-        let total = chars.len();
+        let chars_info: Vec<(usize, usize, char)> = text
+            .char_indices()
+            .enumerate()
+            .map(|(char_idx, (byte_idx, ch))| (char_idx, byte_idx, ch))
+            .collect();
+        let total = chars_info.len();
+
+        let mut start_char_idx = 0;
+        let mut start_byte_idx = 0;
 
         let mut i = 0;
         while i < total {
-            let (_, ch) = chars[i];
+            let (_, _byte_idx, ch) = chars_info[i];
 
-            // Potential sentence terminators: '.', '!', '?', or newline
-            if ch == '.' || ch == '!' || ch == '?' || ch == '\n' {
-                // Check if this is an abbreviation, decimal number, or ellipsis
+            // Potential sentence terminators: '.', '!', '?', newline, or CJK punctuation
+            let is_terminator = ch == '.'
+                || ch == '!'
+                || ch == '?'
+                || ch == '\n'
+                || ch == '。'
+                || ch == '！'
+                || ch == '？'
+                || ch == '…';
+
+            if is_terminator {
                 if ch == '.' {
-                    // Decimal number check (e.g. 3.14)
-                    let prev_is_digit = i > 0 && chars[i - 1].1.is_ascii_digit();
-                    let next_is_digit = i + 1 < total && chars[i + 1].1.is_ascii_digit();
+                    // 1. Decimal number check (e.g. 3.14 or 98.5%)
+                    let prev_is_digit = i > 0 && chars_info[i - 1].2.is_ascii_digit();
+                    let next_is_digit = i + 1 < total && chars_info[i + 1].2.is_ascii_digit();
                     if prev_is_digit && next_is_digit {
                         i += 1;
                         continue;
                     }
 
-                    // Repeated dot check (...)
-                    if i + 1 < total && chars[i + 1].1 == '.' {
-                        while i + 1 < total && chars[i + 1].1 == '.' {
+                    // 2. Repeated dot check (ellipsis like "...")
+                    if i + 1 < total && chars_info[i + 1].2 == '.' {
+                        while i + 1 < total && chars_info[i + 1].2 == '.' {
                             i += 1;
                         }
                     }
 
-                    // Abbreviation check (e.g., "Mr.", "Dr.", "e.g.", "v.v.")
-                    let lookback_start = i.saturating_sub(10);
-                    let prior_slice: String = chars[lookback_start..i].iter().map(|(_, c)| *c).collect();
-                    let is_abbrev = ["mr", "ms", "mrs", "dr", "prof", "tp", "ths", "ts", "etc", "vs", "eg", "ie", "vv"]
-                        .iter()
-                        .any(|&abbr| {
-                            let lower = prior_slice.to_lowercase();
-                            lower.ends_with(abbr)
-                        });
-                    if is_abbrev && i + 1 < total && chars[i + 1].1 == ' ' {
+                    // 3. Check for abbreviations (whole word / token match)
+                    if self.is_abbreviation_dot(&chars_info, i, total, text) {
                         i += 1;
                         continue;
                     }
                 }
 
                 // Sentence boundary confirmed
-                let end_pos = if i + 1 < total {
-                    chars[i + 1].0
+                let end_char_idx = i + 1;
+                let end_byte_idx = if i + 1 < total {
+                    chars_info[i + 1].1
                 } else {
                     text.len()
                 };
 
-                let slice = &text[start_idx..end_pos];
-                if !slice.trim().is_empty() {
-                    results.push((start_idx, end_pos, slice.trim()));
+                let raw_slice = &text[start_byte_idx..end_byte_idx];
+                let trimmed = raw_slice.trim();
+
+                if !trimmed.is_empty() {
+                    // Compute accurate character offsets for trimmed sentence
+                    let leading_ws_count = raw_slice
+                        .chars()
+                        .take_while(|c| c.is_whitespace())
+                        .count();
+                    let trimmed_char_count = trimmed.chars().count();
+
+                    let sentence_start_char = start_char_idx + leading_ws_count;
+                    let sentence_end_char = sentence_start_char + trimmed_char_count;
+
+                    results.push((sentence_start_char, sentence_end_char, trimmed));
                 }
-                start_idx = end_pos;
+
+                start_char_idx = end_char_idx;
+                start_byte_idx = end_byte_idx;
             }
+
             i += 1;
         }
 
-        if start_idx < text.len() {
-            let slice = &text[start_idx..];
-            if !slice.trim().is_empty() {
-                results.push((start_idx, text.len(), slice.trim()));
+        if start_byte_idx < text.len() {
+            let raw_slice = &text[start_byte_idx..];
+            let trimmed = raw_slice.trim();
+            if !trimmed.is_empty() {
+                let leading_ws_count = raw_slice
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .count();
+                let trimmed_char_count = trimmed.chars().count();
+                let sentence_start_char = start_char_idx + leading_ws_count;
+                let sentence_end_char = sentence_start_char + trimmed_char_count;
+
+                results.push((sentence_start_char, sentence_end_char, trimmed));
             }
         }
 
         results
+    }
+
+    /// Checks if a dot at index `dot_idx` is part of an abbreviation.
+    fn is_abbreviation_dot(
+        &self,
+        chars: &[(usize, usize, char)],
+        dot_idx: usize,
+        total: usize,
+        text: &str,
+    ) -> bool {
+        // Find token start (stop at whitespace or punctuation like '(' or quote)
+        let mut token_start = dot_idx;
+        while token_start > 0 {
+            let prev_ch = chars[token_start - 1].2;
+            if prev_ch.is_whitespace() || matches!(prev_ch, '(' | '[' | '{' | '"' | '\'' | '“' | '«') {
+                break;
+            }
+            token_start -= 1;
+        }
+
+        let word_chars: String = chars[token_start..dot_idx].iter().map(|(_, _, c)| *c).collect();
+        let word_lower = word_chars.to_lowercase();
+
+        // Multi-dot abbreviations check (e.g. "v.v.", "e.g.", "i.e.")
+        let next_ch = if dot_idx + 1 < total { Some(chars[dot_idx + 1].2) } else { None };
+
+        // Check if token starts with "v.v", "e.g", "i.e"
+        let full_token_byte_start = chars[token_start].1;
+        let token_slice = &text[full_token_byte_start..];
+        let token_lower = token_slice.to_lowercase();
+
+        for multidot in &["v.v.", "v.v", "e.g.", "e.g", "i.e.", "i.e"] {
+            if token_lower.starts_with(multidot) {
+                // If dot_idx is the first dot, never split
+                if word_lower == "v" || word_lower == "e" || word_lower == "i" {
+                    return true;
+                }
+                // If dot_idx is the second dot, check if followed by lowercase letter
+                if let Some(next) = next_ch {
+                    if next == ' ' {
+                        if let Some(after_space) = chars.get(dot_idx + 2) {
+                            if after_space.2.is_lowercase() || after_space.2 == ',' {
+                                return true;
+                            }
+                        }
+                    } else if next.is_alphabetic() || next == ',' {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Single-dot titles and abbreviations:
+        // English: mr, mrs, ms, dr, prof, sr, jr, vs, etc
+        // Vietnamese: ts, ths, tp, gs, thay, co
+        let known_abbrevs = [
+            "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "vs", "etc",
+            "ts", "ths", "tp", "gs",
+        ];
+
+        if known_abbrevs.contains(&word_lower.as_str()) {
+            // If it's a known abbreviation:
+            // Check if followed by space, or uppercase (e.g. "TP.HCM"), or digit
+            if let Some(next) = next_ch {
+                if next == ' ' || next.is_uppercase() || next.is_ascii_digit() || next == ',' {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     fn split_long_sentence(
@@ -267,43 +369,108 @@ impl TextChunker {
         document_id: &str,
         start_index: usize,
         sentence: &str,
-        offset_base: usize,
+        sentence_start_char: usize,
     ) -> Vec<DocumentChunk> {
         let mut chunks = Vec::new();
-        let words: Vec<&str> = sentence.split_whitespace().collect();
-        let mut current_words = Vec::new();
+
+        // Extract words with character offsets relative to sentence
+        let mut word_entries: Vec<(usize, usize, &str)> = Vec::new();
+        let chars_info: Vec<(usize, usize, char)> = sentence
+            .char_indices()
+            .enumerate()
+            .map(|(c_idx, (b_idx, ch))| (c_idx, b_idx, ch))
+            .collect();
+        let total_chars = chars_info.len();
+
+        let mut in_word = false;
+        let mut w_start_char = 0;
+        let mut w_start_byte = 0;
+
+        for (c_idx, b_idx, ch) in &chars_info {
+            if ch.is_whitespace() {
+                if in_word {
+                    let word_str = &sentence[w_start_byte..*b_idx];
+                    word_entries.push((w_start_char, *c_idx, word_str));
+                    in_word = false;
+                }
+            } else if !in_word {
+                in_word = true;
+                w_start_char = *c_idx;
+                w_start_byte = *b_idx;
+            }
+        }
+        if in_word {
+            let word_str = &sentence[w_start_byte..];
+            word_entries.push((w_start_char, total_chars, word_str));
+        }
+
+        if word_entries.is_empty() {
+            return chunks;
+        }
+
+        let mut current_words: Vec<(usize, usize, &str)> = Vec::new();
         let mut current_len = 0;
         let mut chunk_idx = start_index;
 
-        for word in words {
-            let wlen = word.chars().count();
+        for (w_start, w_end, word) in word_entries {
+            let wlen = w_end - w_start;
+
             if current_len + wlen + 1 > self.max_chunk_size && !current_words.is_empty() {
-                let text = current_words.join(" ");
+                let first_word = current_words.first().unwrap();
+                let last_word = current_words.last().unwrap();
+                let chunk_text = current_words
+                    .iter()
+                    .map(|(_, _, w)| *w)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
                 chunks.push(DocumentChunk {
                     id: format!("{document_id}_chunk_{chunk_idx}"),
                     document_id: document_id.to_string(),
                     index: chunk_idx,
-                    text,
-                    start_char: offset_base,
-                    end_char: offset_base + sentence.len(),
+                    text: chunk_text,
+                    start_char: sentence_start_char + first_word.0,
+                    end_char: sentence_start_char + last_word.1,
                 });
                 chunk_idx += 1;
-                current_words.clear();
-                current_len = 0;
+
+                // Carry over words within overlap
+                let mut overlap_words = Vec::new();
+                let mut overlap_len = 0;
+                for w in current_words.iter().rev() {
+                    let w_size = w.1 - w.0;
+                    if overlap_len + w_size < self.overlap {
+                        overlap_words.push(*w);
+                        overlap_len += w_size + 1;
+                    } else {
+                        break;
+                    }
+                }
+                overlap_words.reverse();
+                current_words = overlap_words;
+                current_len = overlap_len;
             }
-            current_words.push(word);
+
+            current_words.push((w_start, w_end, word));
             current_len += wlen + 1;
         }
 
         if !current_words.is_empty() {
-            let text = current_words.join(" ");
+            let first_word = current_words.first().unwrap();
+            let last_word = current_words.last().unwrap();
+            let chunk_text = current_words
+                .iter()
+                .map(|(_, _, w)| *w)
+                .collect::<Vec<_>>()
+                .join(" ");
+
             chunks.push(DocumentChunk {
                 id: format!("{document_id}_chunk_{chunk_idx}"),
                 document_id: document_id.to_string(),
                 index: chunk_idx,
-                text,
-                start_char: offset_base,
-                end_char: offset_base + sentence.len(),
+                text: chunk_text,
+                start_char: sentence_start_char + first_word.0,
+                end_char: sentence_start_char + last_word.1,
             });
         }
 
