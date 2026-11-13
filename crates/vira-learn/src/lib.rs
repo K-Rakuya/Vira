@@ -14,6 +14,7 @@ pub mod tutor_policies;
 
 pub use fsrs_scheduler::{
     CardRating, CardRecord, CardReviewState, FsrsScheduler, PreviewIntervals, RatingParseError,
+    StateParseError,
 };
 pub use service::{LearnError, SpacedRepetitionPort, SpacedRepetitionService};
 pub use tutor_policies::{

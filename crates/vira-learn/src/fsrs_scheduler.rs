@@ -9,7 +9,7 @@ use std::str::FromStr;
 use vira_ports::store::Flashcard;
 
 /// Card rating given by the learner during a review.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum CardRating {
     /// Complete memory lapse; failed to recall.
@@ -75,8 +75,67 @@ impl FromStr for CardRating {
     }
 }
 
+impl<'de> Deserialize<'de> for CardRating {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct CardRatingVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for CardRatingVisitor {
+            type Value = CardRating;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str(
+                    "a rating string (\"again\", \"hard\", \"good\", \"easy\") or integer (1..=4)",
+                )
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<CardRating, E>
+            where
+                E: serde::de::Error,
+            {
+                CardRating::from_u32(v as u32).map_err(|e| E::custom(e.0))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<CardRating, E>
+            where
+                E: serde::de::Error,
+            {
+                if v <= 0 {
+                    return Err(E::custom(format!("invalid rating value: {v}")));
+                }
+                CardRating::from_u32(v as u32).map_err(|e| E::custom(e.0))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<CardRating, E>
+            where
+                E: serde::de::Error,
+            {
+                v.parse::<CardRating>().map_err(|e| E::custom(e.0))
+            }
+        }
+
+        deserializer.deserialize_any(CardRatingVisitor)
+    }
+}
+
+impl Serialize for CardRating {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// Error returned when parsing an invalid review state.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[error("State parse error: {0}")]
+pub struct StateParseError(pub String);
+
 /// Review state of a card in the learning lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum CardReviewState {
     /// Brand new card not yet reviewed.
@@ -104,6 +163,90 @@ impl CardReviewState {
     /// Converts state to numeric code.
     pub fn as_u32(&self) -> u32 {
         *self as u32
+    }
+
+    /// Returns lowercase string representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CardReviewState::New => "new",
+            CardReviewState::Learning => "learning",
+            CardReviewState::Review => "review",
+            CardReviewState::Relearning => "relearning",
+        }
+    }
+}
+
+impl fmt::Display for CardReviewState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl FromStr for CardReviewState {
+    type Err = StateParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "0" | "new" => Ok(CardReviewState::New),
+            "1" | "learning" => Ok(CardReviewState::Learning),
+            "2" | "review" => Ok(CardReviewState::Review),
+            "3" | "relearning" => Ok(CardReviewState::Relearning),
+            other => Err(StateParseError(format!("invalid review state: {other}"))),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CardReviewState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StateVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for StateVisitor {
+            type Value = CardReviewState;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str(
+                    "a state string (\"new\", \"learning\", \"review\", \"relearning\") or integer (0..=3)",
+                )
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<CardReviewState, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(CardReviewState::from_u32(v as u32))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<CardReviewState, E>
+            where
+                E: serde::de::Error,
+            {
+                if v < 0 {
+                    return Err(E::custom(format!("invalid review state: {v}")));
+                }
+                Ok(CardReviewState::from_u32(v as u32))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<CardReviewState, E>
+            where
+                E: serde::de::Error,
+            {
+                v.parse::<CardReviewState>().map_err(|e| E::custom(e.0))
+            }
+        }
+
+        deserializer.deserialize_any(StateVisitor)
+    }
+}
+
+impl Serialize for CardReviewState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -197,6 +340,14 @@ impl CardRecord {
 
     /// Creates a `CardRecord` from a domain `Flashcard`.
     pub fn from_flashcard(card: &Flashcard) -> Self {
+        let scheduled_days = match card.last_review {
+            Some(last) if card.due > last => {
+                let diff_ms = card.due - last;
+                ((diff_ms as f64 + 43_200_000.0) / 86_400_000.0) as u32
+            }
+            _ => 0,
+        };
+
         Self {
             id: card.id.clone(),
             front: card.front.clone(),
@@ -209,7 +360,7 @@ impl CardRecord {
             state: CardReviewState::from_u32(card.state),
             due_timestamp: card.due,
             last_review: card.last_review,
-            scheduled_days: 0,
+            scheduled_days,
         }
     }
 }
@@ -333,9 +484,9 @@ impl FsrsScheduler {
         // Milliseconds in a day = 86_400_000
         let due_timestamp = if scheduled_days == 0 {
             // 10 minutes immediate relearning window
-            now_ms + 10 * 60 * 1000
+            now_ms.saturating_add(10 * 60 * 1000)
         } else {
-            now_ms + (scheduled_days as u64) * 86_400_000
+            now_ms.saturating_add((scheduled_days as u64).saturating_mul(86_400_000))
         };
 
         let (new_state, reps, lapses) = match rating {
@@ -376,6 +527,7 @@ impl FsrsScheduler {
     ) -> (fsrs::ItemState, fsrs::ItemState, fsrs::ItemState, fsrs::ItemState) {
         let (prev_state, elapsed_days) = if card.state == CardReviewState::New
             || card.last_review.is_none()
+            || !card.stability.is_finite()
             || card.stability <= 0.0
         {
             (None, 0.0f32)
@@ -383,11 +535,17 @@ impl FsrsScheduler {
             let last = card.last_review.unwrap_or(card.due_timestamp);
             let elapsed_ms = now_ms.saturating_sub(last);
             let elapsed = (elapsed_ms as f32) / (86_400_000.0);
+            let diff = if card.difficulty.is_finite() {
+                card.difficulty.clamp(1.0, 10.0)
+            } else {
+                5.0
+            };
+            let stab = card.stability.clamp(0.01, 36500.0);
             (
                 Some(fsrs::MemoryState {
-                    stability: card.stability,
-                    difficulty: card.difficulty.clamp(1.0, 10.0),
-                    stability_fast: card.stability,
+                    stability: stab,
+                    difficulty: diff,
+                    stability_fast: stab,
                 }),
                 elapsed.max(0.0),
             )

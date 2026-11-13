@@ -43,11 +43,26 @@ pub trait SpacedRepetitionPort: Send + Sync {
         rating: CardRating,
     ) -> Result<CardRecord, LearnError>;
 
+    /// Reviews an existing flashcard with a learner rating at an explicit timestamp.
+    async fn review_card_at(
+        &self,
+        card_id: &str,
+        rating: CardRating,
+        now_ms: u64,
+    ) -> Result<CardRecord, LearnError>;
+
     /// Retrieves an existing flashcard by ID.
     async fn get_card(&self, card_id: &str) -> Result<Option<CardRecord>, LearnError>;
 
     /// Lists cards that are due for review as of the current time.
     async fn get_due_cards(&self, limit: usize) -> Result<Vec<CardRecord>, LearnError>;
+
+    /// Lists cards that are due for review as of an explicit timestamp.
+    async fn get_due_cards_at(
+        &self,
+        now_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<CardRecord>, LearnError>;
 
     /// Lists all cards up to a limit.
     async fn list_cards(&self, limit: usize) -> Result<Vec<CardRecord>, LearnError>;
@@ -114,11 +129,24 @@ impl SpacedRepetitionPort for SpacedRepetitionService {
         card_id: &str,
         rating: CardRating,
     ) -> Result<CardRecord, LearnError> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.review_card_at(card_id, rating, now_ms).await
+    }
+
+    async fn review_card_at(
+        &self,
+        card_id: &str,
+        rating: CardRating,
+        now_ms: u64,
+    ) -> Result<CardRecord, LearnError> {
         let maybe_card = self.store.get_flashcard(card_id).await?;
         let flashcard = maybe_card.ok_or_else(|| LearnError::CardNotFound(card_id.to_string()))?;
 
         let record = CardRecord::from_flashcard(&flashcard);
-        let updated = self.scheduler.review(&record, rating);
+        let updated = self.scheduler.review_at(&record, rating, now_ms);
 
         let updated_flashcard = updated.to_flashcard();
         self.store.save_flashcard(&updated_flashcard).await?;
@@ -136,7 +164,14 @@ impl SpacedRepetitionPort for SpacedRepetitionService {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        self.get_due_cards_at(now_ms, limit).await
+    }
 
+    async fn get_due_cards_at(
+        &self,
+        now_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<CardRecord>, LearnError> {
         let due_flashcards = self.store.get_due_flashcards(now_ms, limit).await?;
         Ok(due_flashcards
             .iter()

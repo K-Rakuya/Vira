@@ -470,3 +470,187 @@ async fn test_fsrs_concurrent_reviews_stress() {
 
     assert_eq!(service.count_cards().await.unwrap(), 20);
 }
+
+// -----------------------------------------------------------------------------
+// Test 12: Reviewer Skepticism Tests
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_grammar_detector_false_positives_and_negatives() {
+    // 1. "bravery like" should NOT be flagged as "very like"
+    let issues = TutorPolicyManager::detect_grammar_issues("Such bravery like that is admirable.");
+    assert!(
+        !issues.iter().any(|i| i.faulty_phrase == "very like"),
+        "False positive: 'bravery like' was flagged as 'very like'!"
+    );
+
+    // 2. Correct question "Does he go to school?" should NOT be flagged as subject-verb error!
+    let issues = TutorPolicyManager::detect_grammar_issues("Does he go to school every day?");
+    assert!(
+        !issues.iter().any(|i| i.category.contains("Subject-Verb Agreement")),
+        "False positive: 'Does he go' was flagged as an error!"
+    );
+
+    // 3. "Yesterday, I see..." with comma should be detected
+    let issues = TutorPolicyManager::detect_grammar_issues("Yesterday, I see my friend at the park.");
+    assert!(
+        issues.iter().any(|i| i.category.contains("Past Tense")),
+        "False negative: 'Yesterday, I see' with comma was not detected!"
+    );
+
+    // 4. "It depends of the weather." should be detected
+    let issues = TutorPolicyManager::detect_grammar_issues("It depends of the weather tomorrow.");
+    assert!(
+        issues.iter().any(|i| i.category.contains("Preposition")),
+        "False negative: 'depends of' was not detected!"
+    );
+
+    // 5. "He is good in swimming." should be detected
+    let issues = TutorPolicyManager::detect_grammar_issues("He is good in swimming and chess.");
+    assert!(
+        issues.iter().any(|i| i.suggested_correction == "good at"),
+        "False negative: 'good in swimming' was not detected!"
+    );
+}
+
+#[test]
+fn test_system_prompt_enrichment_does_not_duplicate_or_accumulate_stale_recast() {
+    let manager = TutorPolicyManager::new(CefrLevel::B2);
+
+    // Turn 1: user with error
+    let history_turn_1 = vec![
+        Message::system("Base system instructions."),
+        Message::user("I very like learning languages."),
+    ];
+    let enriched_1 = manager.enrich_messages(&history_turn_1);
+    assert_eq!(enriched_1.len(), 2);
+    let sys_1 = &enriched_1[0].raw_content;
+    assert!(sys_1.contains("[PEDAGOGICAL RECAST DIRECTIVE]"));
+
+    // Turn 2: assistant replied, user sends a clean message without error
+    let mut history_turn_2 = enriched_1;
+    history_turn_2.push(Message::assistant("I really like that too! What languages do you know?"));
+    history_turn_2.push(Message::user("I speak Vietnamese and I am learning English."));
+
+    let enriched_2 = manager.enrich_messages(&history_turn_2);
+    let sys_2 = &enriched_2[0].raw_content;
+
+    // Must NOT contain duplicate pedagogical policy blocks
+    let count_pedagogical_blocks = sys_2.matches("[PEDAGOGICAL POLICY: CEFR LEVEL").count();
+    assert_eq!(
+        count_pedagogical_blocks, 1,
+        "System prompt accumulated duplicate pedagogical policy blocks: {}",
+        sys_2
+    );
+
+    // Turn 2 had NO error, so stale recast directive from Turn 1 MUST be cleared!
+    assert!(
+        !sys_2.contains("[PEDAGOGICAL RECAST DIRECTIVE]"),
+        "Stale recast directive from turn 1 was not removed on turn 2: {}",
+        sys_2
+    );
+}
+
+#[test]
+fn test_card_record_from_flashcard_preserves_scheduled_days() {
+    let scheduler = FsrsScheduler::new();
+    let card = scheduler.new_card("serendipity", "sự tình cờ may mắn");
+    let now = 1_700_000_000_000u64;
+    let reviewed = scheduler.review_at(&card, CardRating::Good, now);
+    assert!(reviewed.scheduled_days >= 1);
+
+    // Convert to Flashcard (as saved in DB)
+    let flashcard = reviewed.to_flashcard();
+
+    // Reconstruct CardRecord (as fetched from DB)
+    let restored = CardRecord::from_flashcard(&flashcard);
+    assert_eq!(
+        restored.scheduled_days, reviewed.scheduled_days,
+        "from_flashcard failed to recover scheduled_days!"
+    );
+}
+
+#[test]
+fn test_rating_and_state_serde_flexibility() {
+    // Rating deserialization from lowercase string, capitalized string, and integer
+    let r1: CardRating = serde_json::from_str("\"again\"").unwrap();
+    let r2: CardRating = serde_json::from_str("\"Good\"").unwrap();
+    let r3: CardRating = serde_json::from_str("3").unwrap();
+    let r4: CardRating = serde_json::from_str("4").unwrap();
+
+    assert_eq!(r1, CardRating::Again);
+    assert_eq!(r2, CardRating::Good);
+    assert_eq!(r3, CardRating::Good);
+    assert_eq!(r4, CardRating::Easy);
+
+    // Rating serialization outputs lowercase canonical representation
+    let json_rating = serde_json::to_string(&CardRating::Hard).unwrap();
+    assert_eq!(json_rating, "\"hard\"");
+
+    // ReviewState deserialization from string and integer
+    let s1: CardReviewState = serde_json::from_str("\"learning\"").unwrap();
+    let s2: CardReviewState = serde_json::from_str("2").unwrap();
+    assert_eq!(s1, CardReviewState::Learning);
+    assert_eq!(s2, CardReviewState::Review);
+    assert_eq!(s2.to_string(), "review");
+}
+
+#[test]
+fn test_fsrs_non_monotonic_and_nan_resilience() {
+    let scheduler = FsrsScheduler::new();
+    let mut card = scheduler.new_card("paradox", "nghịch lý");
+
+    // Corrupt memory state parameters (NaN, negative, infinite)
+    card.stability = f32::NAN;
+    card.difficulty = f32::NAN;
+    card.last_review = Some(2_000_000_000);
+
+    // Clock jumps backwards into the past (now < last_review)
+    let past_time = 1_000_000_000;
+    let reviewed = scheduler.review_at(&card, CardRating::Good, past_time);
+
+    // Must gracefully sanitize without panicking and return valid finite values
+    assert!(reviewed.stability.is_finite());
+    assert!(reviewed.difficulty.is_finite());
+    assert!(reviewed.stability > 0.0);
+    assert!(reviewed.difficulty >= 1.0 && reviewed.difficulty <= 10.0);
+    assert_eq!(reviewed.last_review, Some(past_time));
+}
+
+#[tokio::test]
+async fn test_service_explicit_timestamp_methods() {
+    let mock_store = Arc::new(MockStore::default());
+    let service = SpacedRepetitionService::new(mock_store);
+
+    let card = service
+        .create_card("cognition", "nhận thức", Some("B2".to_string()))
+        .await
+        .unwrap();
+
+    let t0 = 1_700_000_000_000u64;
+    let rev = service
+        .review_card_at(&card.id, CardRating::Good, t0)
+        .await
+        .unwrap();
+    assert_eq!(rev.last_review, Some(t0));
+
+    // At t0, card is not due because it is scheduled in the future
+    let due_at_t0 = service.get_due_cards_at(t0, 10).await.unwrap();
+    assert!(due_at_t0.is_empty());
+
+    // In the future after due_timestamp, it is due
+    let due_at_future = service
+        .get_due_cards_at(rev.due_timestamp + 1000, 10)
+        .await
+        .unwrap();
+    assert_eq!(due_at_future.len(), 1);
+    assert_eq!(due_at_future[0].id, card.id);
+}
+
+#[test]
+fn test_cefr_short_text_false_b1_suppression() {
+    // A 3-word utterance with "because" should not immediately jump to B1
+    let short_text = "I cry because sad.";
+    let level = CefrLevel::assess_text(short_text);
+    assert!(level <= CefrLevel::A2);
+}

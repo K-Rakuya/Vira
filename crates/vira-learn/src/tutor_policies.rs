@@ -177,11 +177,11 @@ impl CefrLevel {
             } else {
                 CefrLevel::C1
             }
-        } else if complexity_score >= 3 || (avg_word_len >= 4.8 && avg_sent_len >= 13.0) {
+        } else if (complexity_score >= 3 && avg_sent_len >= 8.0) || (avg_word_len >= 4.8 && avg_sent_len >= 13.0) {
             CefrLevel::B2
-        } else if complexity_score >= 1 || (avg_word_len >= 4.2 && avg_sent_len >= 9.0) {
+        } else if (complexity_score >= 1 && avg_sent_len >= 6.0) || (avg_word_len >= 4.2 && avg_sent_len >= 9.0) {
             CefrLevel::B1
-        } else if avg_word_len >= 3.6 && avg_sent_len >= 5.0 {
+        } else if avg_word_len >= 3.6 && avg_sent_len >= 4.5 {
             CefrLevel::A2
         } else {
             CefrLevel::A1
@@ -277,6 +277,48 @@ impl Default for TutorPolicyManager {
     }
 }
 
+/// Helper to verify word boundaries around matched substrings.
+fn has_word_boundary(text: &str, start: usize, end: usize) -> bool {
+    let before_ok = if start == 0 {
+        true
+    } else {
+        text[..start]
+            .chars()
+            .next_back()
+            .map(|c| !c.is_alphanumeric())
+            .unwrap_or(true)
+    };
+
+    let after_ok = if end >= text.len() {
+        true
+    } else {
+        text[end..]
+            .chars()
+            .next()
+            .map(|c| !c.is_alphanumeric())
+            .unwrap_or(true)
+    };
+
+    before_ok && after_ok
+}
+
+/// Helper to check if a phrase occurs with proper word boundaries on both ends.
+fn contains_word_phrase(text_lower: &str, phrase: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(rel_idx) = text_lower[search_from..].find(phrase) {
+        let abs_start = search_from + rel_idx;
+        let abs_end = abs_start + phrase.len();
+        if has_word_boundary(text_lower, abs_start, abs_end) {
+            return true;
+        }
+        search_from = abs_start + 1;
+        if search_from >= text_lower.len() {
+            break;
+        }
+    }
+    false
+}
+
 impl TutorPolicyManager {
     /// Creates a new tutor policy manager targeting a specific CEFR level.
     pub fn new(target_level: CefrLevel) -> Self {
@@ -348,8 +390,8 @@ impl TutorPolicyManager {
         let mut issues = Vec::new();
         let lower = text.to_lowercase();
 
-        // 1. Vietnamese-English L1 transfer: "I very like" -> "I really like / I like ... very much"
-        if lower.contains("very like") {
+        // 1. Vietnamese-English L1 transfer: "very like" -> "really like / like ... very much"
+        if contains_word_phrase(&lower, "very like") {
             issues.push(GrammarIssue {
                 category: "L1 Transfer (Word Order)".to_string(),
                 faulty_phrase: "very like".to_string(),
@@ -359,7 +401,7 @@ impl TutorPolicyManager {
         }
 
         // 2. Vietnamese-English transfer: "no have" -> "there is no / don't have"
-        if lower.contains("no have") {
+        if contains_word_phrase(&lower, "no have") {
             issues.push(GrammarIssue {
                 category: "L1 Transfer (Negation)".to_string(),
                 faulty_phrase: "no have".to_string(),
@@ -368,68 +410,133 @@ impl TutorPolicyManager {
             });
         }
 
-        // 3. Preposition error: "depend of" -> "depend on"
-        if lower.contains("depend of") {
+        // 3. Preposition error: "depend of" / "depends of" -> "depend on / depends on"
+        if contains_word_phrase(&lower, "depend of") {
             issues.push(GrammarIssue {
                 category: "Preposition Collocation".to_string(),
                 faulty_phrase: "depend of".to_string(),
                 suggested_correction: "depend on".to_string(),
-                explanation: "The verb 'depend' collocate with 'on', not 'of'.".to_string(),
+                explanation: "The verb 'depend' collocates with 'on', not 'of'.".to_string(),
+            });
+        } else if contains_word_phrase(&lower, "depends of")
+            || contains_word_phrase(&lower, "depended of")
+            || contains_word_phrase(&lower, "depending of")
+        {
+            issues.push(GrammarIssue {
+                category: "Preposition Collocation".to_string(),
+                faulty_phrase: "depends of".to_string(),
+                suggested_correction: "depends on".to_string(),
+                explanation: "The verb 'depend' collocates with 'on', not 'of'.".to_string(),
             });
         }
 
-        // 4. Preposition error: "good in" -> "good at"
-        if lower.contains("good in english") || lower.contains("good in math") || lower.contains("good in playing") {
-            issues.push(GrammarIssue {
-                category: "Preposition Collocation".to_string(),
-                faulty_phrase: "good in".to_string(),
-                suggested_correction: "good at".to_string(),
-                explanation: "Use 'good at' when referring to skills and abilities.".to_string(),
-            });
+        // 4. Preposition error: "good in [skill/subject/gerund]" -> "good at"
+        {
+            let mut search_from = 0;
+            while let Some(rel_idx) = lower[search_from..].find("good in") {
+                let start = search_from + rel_idx;
+                let end = start + "good in".len();
+                if has_word_boundary(&lower, start, end) {
+                    let remainder = lower[end..].trim_start();
+                    let next_word: String = remainder
+                        .chars()
+                        .take_while(|c| c.is_alphabetic())
+                        .collect();
+                    let non_error_exceptions = [
+                        "general", "itself", "terms", "person", "order", "case", "fact", "part",
+                        "the", "a", "my", "your", "our", "their", "his", "her", "mind", "front",
+                    ];
+                    if !next_word.is_empty() && !non_error_exceptions.contains(&next_word.as_str()) {
+                        issues.push(GrammarIssue {
+                            category: "Preposition Collocation".to_string(),
+                            faulty_phrase: format!("good in {next_word}"),
+                            suggested_correction: "good at".to_string(),
+                            explanation: "Use 'good at' when referring to skills, abilities, subjects, or activities.".to_string(),
+                        });
+                        break;
+                    }
+                }
+                search_from = end;
+                if search_from >= lower.len() {
+                    break;
+                }
+            }
         }
 
         // 5. Redundant preposition: "marry with" -> "marry"
-        if lower.contains("marry with") || lower.contains("married with") {
-            issues.push(GrammarIssue {
-                category: "Transitive Verb Usage".to_string(),
-                faulty_phrase: "marry with".to_string(),
-                suggested_correction: "marry / married to".to_string(),
-                explanation: "'Marry' is a transitive verb (e.g. 'marry him'); as an adjective use 'married to'.".to_string(),
-            });
+        for phrase in ["marry with", "marries with", "married with"] {
+            let mut search_from = 0;
+            while let Some(rel_idx) = lower[search_from..].find(phrase) {
+                let start = search_from + rel_idx;
+                let end = start + phrase.len();
+                if has_word_boundary(&lower, start, end) {
+                    let remainder = lower[end..].trim_start();
+                    let next_word: String = remainder
+                        .chars()
+                        .take_while(|c| c.is_alphabetic())
+                        .collect();
+                    if next_word != "children" && next_word != "kids" {
+                        issues.push(GrammarIssue {
+                            category: "Transitive Verb Usage".to_string(),
+                            faulty_phrase: phrase.to_string(),
+                            suggested_correction: "marry / married to".to_string(),
+                            explanation: "'Marry' is a transitive verb (e.g. 'marry him'); as an adjective use 'married to'.".to_string(),
+                        });
+                        break;
+                    }
+                }
+                search_from = end;
+                if search_from >= lower.len() {
+                    break;
+                }
+            }
         }
 
         // 6. Redundant preposition: "discuss about" -> "discuss"
-        if lower.contains("discuss about") {
-            issues.push(GrammarIssue {
-                category: "Transitive Verb Usage".to_string(),
-                faulty_phrase: "discuss about".to_string(),
-                suggested_correction: "discuss / talk about".to_string(),
-                explanation: "'Discuss' directly takes an object without 'about'.".to_string(),
-            });
+        for phrase in ["discuss about", "discusses about", "discussed about", "discussing about"] {
+            if contains_word_phrase(&lower, phrase) {
+                issues.push(GrammarIssue {
+                    category: "Transitive Verb Usage".to_string(),
+                    faulty_phrase: phrase.to_string(),
+                    suggested_correction: "discuss / talk about".to_string(),
+                    explanation: "'Discuss' directly takes an object without 'about'.".to_string(),
+                });
+                break;
+            }
         }
 
         // 7. Double comparative: "more better" -> "better"
-        if lower.contains("more better") {
-            issues.push(GrammarIssue {
-                category: "Comparative Form".to_string(),
-                faulty_phrase: "more better".to_string(),
-                suggested_correction: "better".to_string(),
-                explanation: "'Better' is already the comparative form of 'good'; do not add 'more'.".to_string(),
-            });
+        for phrase in ["more better", "more bigger", "more faster", "more easier", "more higher", "more smaller"] {
+            if contains_word_phrase(&lower, phrase) {
+                let base = phrase.strip_prefix("more ").unwrap_or(phrase);
+                issues.push(GrammarIssue {
+                    category: "Comparative Form".to_string(),
+                    faulty_phrase: phrase.to_string(),
+                    suggested_correction: base.to_string(),
+                    explanation: format!("'{base}' is already the comparative form of 'good'; do not add 'more'."),
+                });
+                break;
+            }
         }
 
         // 8. Stative verb error: "I am agree" -> "I agree"
-        if lower.contains("i am agree") || lower.contains("i'm agree") {
-            issues.push(GrammarIssue {
-                category: "Verb Structure".to_string(),
-                faulty_phrase: "I am agree".to_string(),
-                suggested_correction: "I agree".to_string(),
-                explanation: "'Agree' is already a verb; do not use the auxiliary 'am' with it.".to_string(),
-            });
+        for phrase in [
+            "i am agree", "i'm agree", "we are agree", "we're agree", "they are agree", "they're agree",
+            "he is agree", "he's agree", "she is agree", "she's agree",
+        ] {
+            if contains_word_phrase(&lower, phrase) {
+                issues.push(GrammarIssue {
+                    category: "Verb Structure".to_string(),
+                    faulty_phrase: phrase.to_string(),
+                    suggested_correction: "I agree".to_string(),
+                    explanation: "'Agree' is already a verb; do not use the auxiliary 'am/is/are' with it in Present Simple.".to_string(),
+                });
+                break;
+            }
         }
 
         // 9. Uncountable noun plural: "informations" / "advices"
-        if lower.contains("informations") {
+        if contains_word_phrase(&lower, "informations") {
             issues.push(GrammarIssue {
                 category: "Countability".to_string(),
                 faulty_phrase: "informations".to_string(),
@@ -437,7 +544,7 @@ impl TutorPolicyManager {
                 explanation: "'Information' is uncountable in English and has no plural 's'.".to_string(),
             });
         }
-        if lower.contains("advices") {
+        if contains_word_phrase(&lower, "advices") {
             issues.push(GrammarIssue {
                 category: "Countability".to_string(),
                 faulty_phrase: "advices".to_string(),
@@ -446,24 +553,103 @@ impl TutorPolicyManager {
             });
         }
 
-        // 10. Missing past tense with explicit past adverbials: "yesterday I go", "yesterday I see"
-        if lower.contains("yesterday i go") || lower.contains("yesterday i see") || lower.contains("yesterday i buy") {
-            issues.push(GrammarIssue {
-                category: "Past Tense Inconsistency".to_string(),
-                faulty_phrase: "yesterday I [present verb]".to_string(),
-                suggested_correction: "yesterday I went / saw / bought".to_string(),
-                explanation: "With past time markers such as 'yesterday', verbs must be in Past Simple form.".to_string(),
-            });
+        // 10. Missing past tense with explicit past adverbials: "yesterday I go", "yesterday I see", etc.
+        {
+            let time_markers = ["yesterday", "last night", "last week", "last year", "last month"];
+            let present_to_past = [
+                ("go", "went"),
+                ("see", "saw"),
+                ("buy", "bought"),
+                ("eat", "ate"),
+                ("meet", "met"),
+                ("have", "had"),
+                ("make", "made"),
+                ("come", "came"),
+                ("take", "took"),
+                ("get", "got"),
+                ("tell", "told"),
+                ("write", "wrote"),
+            ];
+
+            for marker in time_markers {
+                if let Some(idx) = lower.find(marker) {
+                    if has_word_boundary(&lower, idx, idx + marker.len()) {
+                        let after_marker = lower[idx + marker.len()..].trim_start();
+                        let cleaned_after = after_marker.trim_start_matches(|c: char| c == ',' || c == ';' || c.is_whitespace());
+                        let words: Vec<&str> = cleaned_after.split_whitespace().collect();
+                        if words.len() >= 2 {
+                            let subj = words[0];
+                            let verb = words[1].trim_matches(|c: char| !c.is_alphabetic());
+                            if matches!(subj, "i" | "we" | "he" | "she" | "they" | "you") {
+                                let display_subj = if subj == "i" { "I" } else { subj };
+                                for (pres, past) in present_to_past {
+                                    if verb == pres {
+                                        issues.push(GrammarIssue {
+                                            category: "Past Tense Inconsistency".to_string(),
+                                            faulty_phrase: format!("{marker} {display_subj} {pres}"),
+                                            suggested_correction: format!("{marker} {display_subj} {past}"),
+                                            explanation: format!("With past time markers such as '{marker}', verbs must be in Past Simple form ('{past}')."),
+                                        });
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // 11. Third person singular agreement: "he go", "she go", "he don't", "she don't"
-        if lower.contains("he go ") || lower.contains("she go ") || lower.contains("he don't") || lower.contains("she don't") {
+        if contains_word_phrase(&lower, "he don't")
+            || contains_word_phrase(&lower, "she don't")
+            || contains_word_phrase(&lower, "it don't")
+        {
             issues.push(GrammarIssue {
                 category: "Subject-Verb Agreement".to_string(),
-                faulty_phrase: "he/she go or he/she don't".to_string(),
-                suggested_correction: "he/she goes or he/she doesn't".to_string(),
-                explanation: "Third-person singular subjects (he/she/it) require the -s/-es inflection in Present Simple.".to_string(),
+                faulty_phrase: "he/she don't".to_string(),
+                suggested_correction: "he/she doesn't".to_string(),
+                explanation: "Third-person singular subjects (he/she/it) require 'doesn't' instead of 'don't' in Present Simple.".to_string(),
             });
+        }
+
+        for subj in ["he", "she"] {
+            let phrase = format!("{subj} go");
+            let mut search_from = 0;
+            while let Some(rel_idx) = lower[search_from..].find(&phrase) {
+                let start = search_from + rel_idx;
+                let end = start + phrase.len();
+                if has_word_boundary(&lower, start, end) {
+                    let prefix = lower[..start].trim_end();
+                    let last_word = prefix
+                        .split_whitespace()
+                        .next_back()
+                        .unwrap_or("")
+                        .trim_matches(|c: char| !c.is_alphabetic());
+
+                    let modal_aux_preceding = [
+                        "does", "doesn't", "did", "didn't", "can", "can't", "could", "couldn't",
+                        "will", "won't", "would", "wouldn't", "shall", "should", "shouldn't",
+                        "may", "might", "must", "to", "let", "makes", "made",
+                    ];
+
+                    let is_question_inversion = modal_aux_preceding.contains(&last_word);
+
+                    if !is_question_inversion {
+                        issues.push(GrammarIssue {
+                            category: "Subject-Verb Agreement".to_string(),
+                            faulty_phrase: format!("{subj} go"),
+                            suggested_correction: format!("{subj} goes"),
+                            explanation: "Third-person singular subjects (he/she/it) require the -s/-es inflection in Present Simple.".to_string(),
+                        });
+                        break;
+                    }
+                }
+                search_from = end;
+                if search_from >= lower.len() {
+                    break;
+                }
+            }
         }
 
         issues
@@ -562,7 +748,18 @@ impl TutorPolicyManager {
         for (i, msg) in history.iter().enumerate() {
             if i == 0 && msg.role == Role::System {
                 system_found = true;
-                let merged_content = format!("{}\n\n{}", msg.raw_content, combined_system_prompt);
+                // Strip any previously injected pedagogical policy & recast blocks
+                let base_raw = if let Some(idx) = msg.raw_content.find("[PEDAGOGICAL POLICY:") {
+                    msg.raw_content[..idx].trim_end()
+                } else {
+                    msg.raw_content.as_str()
+                };
+
+                let merged_content = if base_raw.is_empty() {
+                    combined_system_prompt.clone()
+                } else {
+                    format!("{}\n\n{}", base_raw, combined_system_prompt)
+                };
                 enriched.push(Message::system(merged_content));
             } else {
                 enriched.push(msg.clone());
@@ -614,8 +811,13 @@ impl TutorPolicyManager {
             0.0
         };
 
-        let avg_sentence_length = if !user_messages.is_empty() {
-            (total_words as f32) / (user_messages.len() as f32)
+        let sentence_count = combined_text
+            .chars()
+            .filter(|c| *c == '.' || *c == '!' || *c == '?' || *c == '\n')
+            .count()
+            .max(user_messages.len());
+        let avg_sentence_length = if sentence_count > 0 {
+            (total_words as f32) / (sentence_count as f32)
         } else {
             0.0
         };
