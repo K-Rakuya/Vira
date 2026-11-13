@@ -287,6 +287,14 @@ impl ToolRegistry {
             if let Some(props) = entry.definition.parameters.get("properties").and_then(|p| p.as_object()) {
                 if !props.is_empty() {
                     out.push_str("  Parameters:\n");
+                    let req_fields: Vec<&str> = entry
+                        .definition
+                        .parameters
+                        .get("required")
+                        .and_then(|r| r.as_array())
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                        .unwrap_or_default();
+
                     for (prop_name, prop_val) in props {
                         let prop_type = prop_val
                             .get("type")
@@ -296,7 +304,12 @@ impl ToolRegistry {
                             .get("description")
                             .and_then(|d| d.as_str())
                             .unwrap_or("");
-                        out.push_str(&format!("    - `{prop_name}` ({prop_type}): {prop_desc}\n"));
+                        let req_label = if req_fields.contains(&prop_name.as_str()) {
+                            "required"
+                        } else {
+                            "optional"
+                        };
+                        out.push_str(&format!("    - `{prop_name}` ({prop_type}, {req_label}): {prop_desc}\n"));
                     }
                 }
             }

@@ -11,6 +11,37 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use vira_ports::{AgentError, AgentPort, ToolCallRequest, ToolCallResult, ToolDefinition};
 
+fn json_type_name(val: &Value) -> &'static str {
+    match val {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(n) => {
+            if n.is_i64() || n.is_u64() {
+                "integer"
+            } else {
+                "number"
+            }
+        }
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn check_value_type(val: &Value, expected: &str) -> bool {
+    match expected {
+        "string" => val.is_string(),
+        "integer" => val.is_i64() || val.is_u64(),
+        "number" => val.is_number(),
+        "boolean" => val.is_boolean(),
+        "array" => val.is_array(),
+        "object" => val.is_object(),
+        "null" => val.is_null(),
+        "any" => true,
+        _ => true,
+    }
+}
+
 /// Executor coordinating tool call dispatch, argument validation, and timeouts.
 #[derive(Clone)]
 pub struct ToolCallExecutor {
@@ -43,32 +74,66 @@ impl ToolCallExecutor {
         &self.registry
     }
 
-    /// Validates request arguments against tool definition's JSON Schema required properties.
+    /// Validates request arguments against tool definition's JSON Schema required properties and types.
     fn validate_arguments(
         definition: &ToolDefinition,
         arguments: &Value,
     ) -> Result<(), String> {
-        if let Some(schema_type) = definition.parameters.get("type").and_then(|t| t.as_str()) {
-            if schema_type == "object" && !arguments.is_object() {
-                return Err(format!(
-                    "Arguments for tool '{}' must be a JSON object, got: {}",
-                    definition.name, arguments
-                ));
-            }
+        let schema_type = definition
+            .parameters
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("object");
+
+        if schema_type == "object" && !arguments.is_object() {
+            return Err(format!(
+                "Arguments for tool '{}' must be a JSON object, got: {}",
+                definition.name, arguments
+            ));
         }
 
+        let args_obj = arguments.as_object();
+
+        // Check required fields
         if let Some(req_array) = definition.parameters.get("required").and_then(|r| r.as_array()) {
             for req_val in req_array {
                 if let Some(field) = req_val.as_str() {
-                    let has_field = arguments
-                        .as_object()
-                        .map(|obj| obj.contains_key(field))
-                        .unwrap_or(false);
-                    if !has_field {
-                        return Err(format!(
-                            "Missing required argument '{}' for tool '{}'",
-                            field, definition.name
-                        ));
+                    let val_opt = args_obj.and_then(|obj| obj.get(field));
+                    match val_opt {
+                        None => {
+                            return Err(format!(
+                                "Missing required argument '{}' for tool '{}'",
+                                field, definition.name
+                            ));
+                        }
+                        Some(val) if val.is_null() => {
+                            return Err(format!(
+                                "Argument '{}' for tool '{}' cannot be null",
+                                field, definition.name
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Check property types
+        if let Some(props) = definition.parameters.get("properties").and_then(|p| p.as_object()) {
+            if let Some(args_map) = args_obj {
+                for (arg_key, arg_val) in args_map {
+                    if let Some(prop_schema) = props.get(arg_key) {
+                        if let Some(expected_type) = prop_schema.get("type").and_then(|t| t.as_str()) {
+                            if !check_value_type(arg_val, expected_type) {
+                                return Err(format!(
+                                    "Invalid type for argument '{}' in tool '{}': expected {}, got {}",
+                                    arg_key,
+                                    definition.name,
+                                    expected_type,
+                                    json_type_name(arg_val)
+                                ));
+                            }
+                        }
                     }
                 }
             }

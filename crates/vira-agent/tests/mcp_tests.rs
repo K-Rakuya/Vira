@@ -619,3 +619,150 @@ done
     // 4. Graceful close
     client.close().await.expect("closes stdio process");
 }
+
+#[test]
+fn test_math_evaluator_scientific_notation() {
+    assert_eq!(evaluate_math_expression("1e3").unwrap(), 1000.0);
+    assert_eq!(evaluate_math_expression("2.5e2").unwrap(), 250.0);
+    assert_eq!(evaluate_math_expression("1e-2").unwrap(), 0.01);
+    assert_eq!(evaluate_math_expression("1e3 + 2.5e2").unwrap(), 1250.0);
+}
+
+#[test]
+fn test_math_evaluator_recursion_limit() {
+    let deep_nested = format!("{}1{}", "(".repeat(500), ")".repeat(500));
+    let res = evaluate_math_expression(&deep_nested);
+    assert!(res.is_err(), "Deep nesting should be safely rejected with recursion limit error");
+    assert!(res.unwrap_err().contains("Recursion depth limit exceeded"));
+}
+
+#[test]
+fn test_math_unary_minus_power_precedence() {
+    // In standard mathematics, -2^2 = -(2^2) = -4. To get (-2)^2, parentheses are required.
+    assert_eq!(evaluate_math_expression("-2 ^ 2").unwrap(), -4.0);
+    assert_eq!(evaluate_math_expression("(-2) ^ 2").unwrap(), 4.0);
+}
+
+#[tokio::test]
+async fn test_executor_parameter_type_validation() {
+    let mut registry = ToolRegistry::new();
+    registry.register_sync_fn(
+        "typed_tool",
+        "A tool with typed parameters",
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "age": { "type": "integer" },
+                "active": { "type": "boolean" },
+                "tags": { "type": "array" }
+            },
+            "required": ["name", "age"]
+        }),
+        |args| Ok(json!({ "received": args })),
+    );
+
+    let executor = ToolCallExecutor::from_registry(registry);
+
+    // 1. Wrong type for string (integer passed)
+    let req1 = ToolCallRequest::new("t1", "typed_tool", json!({ "name": 12345, "age": 30 }));
+    let res1 = executor.execute(&req1).await;
+    assert!(res1.is_error, "Should fail when string field receives integer");
+    assert!(res1.content.contains("expected string, got integer"));
+
+    // 2. Wrong type for integer (string passed)
+    let req2 = ToolCallRequest::new("t2", "typed_tool", json!({ "name": "Alice", "age": "thirty" }));
+    let res2 = executor.execute(&req2).await;
+    assert!(res2.is_error, "Should fail when integer field receives string");
+    assert!(res2.content.contains("expected integer, got string"));
+
+    // 3. Null passed for required field
+    let req3 = ToolCallRequest::new("t3", "typed_tool", json!({ "name": null, "age": 30 }));
+    let res3 = executor.execute(&req3).await;
+    assert!(res3.is_error, "Should fail when required field is null");
+    assert!(res3.content.contains("cannot be null"));
+
+    // 4. Valid types
+    let req4 = ToolCallRequest::new("t4", "typed_tool", json!({ "name": "Alice", "age": 30, "active": true, "tags": ["a", "b"] }));
+    let res4 = executor.execute(&req4).await;
+    assert!(!res4.is_error);
+}
+
+#[test]
+fn test_mcp_content_non_text_and_empty_handling() {
+    use vira_agent::mcp_client::McpContent;
+
+    // 1. Empty content should return "(empty result)"
+    let empty_res = McpToolResult {
+        content: vec![],
+        is_error: false,
+    };
+    assert_eq!(empty_res.text_content(), "(empty result)");
+
+    // 2. Image content formatting
+    let image_res = McpToolResult {
+        content: vec![McpContent::Image {
+            data: "iVBORw0KGgoAAAANSUhEUgAA".to_string(),
+            mime_type: "image/png".to_string(),
+        }],
+        is_error: false,
+    };
+    assert!(image_res.text_content().contains("[Image: image/png"));
+
+    // 3. Resource content formatting
+    let res_res = McpToolResult {
+        content: vec![McpContent::Resource {
+            uri: "file:///config.json".to_string(),
+            mime_type: Some("application/json".to_string()),
+            text: Some("{\"port\": 8080}".to_string()),
+        }],
+        is_error: false,
+    };
+    assert!(res_res.text_content().contains("[Resource: file:///config.json]"));
+    assert!(res_res.text_content().contains("{\"port\": 8080}"));
+}
+
+#[test]
+fn test_prompt_formatting_required_and_optional_labels() {
+    let mut registry = ToolRegistry::new();
+    registry.register_sync_fn(
+        "query_data",
+        "Queries data with optional filters",
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Search term" },
+                "limit": { "type": "integer", "description": "Max results" }
+            },
+            "required": ["query"]
+        }),
+        |_args| Ok(json!({})),
+    );
+
+    let prompt = registry.format_prompt_tools();
+    assert!(prompt.contains("`query` (string, required): Search term"));
+    assert!(prompt.contains("`limit` (integer, optional): Max results"));
+}
+
+#[tokio::test]
+async fn test_stdio_subprocess_crash_recovery() {
+    // Subprocess that exits immediately with code 42
+    let client = McpClient::connect_stdio("failing-mcp", "sh", &["-c", "exit 42"])
+        .expect("spawns client");
+
+    // Client handshake should fail with process exit or connection error immediately,
+    // NOT hang for 15s timeout!
+    let start = std::time::Instant::now();
+    let err = client.handshake().await.unwrap_err();
+    let elapsed = start.elapsed();
+
+    assert!(elapsed < Duration::from_secs(2), "Handshake must fail fast without waiting 15s timeout, took {:?}", elapsed);
+    assert_eq!(err, McpError::ProcessExited(Some(42)));
+
+    // Now attempt a SECOND call on the dead client:
+    let start2 = std::time::Instant::now();
+    let err2 = client.handshake().await.unwrap_err();
+    let elapsed2 = start2.elapsed();
+    assert!(elapsed2 < Duration::from_secs(2), "Second call must fail immediately, not wait for timeout, took {:?}", elapsed2);
+    assert_eq!(err2, McpError::ProcessExited(Some(42)));
+}

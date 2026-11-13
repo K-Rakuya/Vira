@@ -109,6 +109,40 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                         break;
                     }
                 }
+
+                // Support scientific notation (e.g. 1e3, 2.5e-4, 1E+5)
+                if let Some(&('e' | 'E')) = chars.peek() {
+                    let mut lookahead = chars.clone();
+                    lookahead.next(); // skip 'e' or 'E'
+                    let mut has_exp = false;
+                    if let Some(&('+' | '-')) = lookahead.peek() {
+                        lookahead.next();
+                        if let Some(&d) = lookahead.peek() {
+                            if d.is_ascii_digit() {
+                                has_exp = true;
+                            }
+                        }
+                    } else if let Some(&d) = lookahead.peek() {
+                        if d.is_ascii_digit() {
+                            has_exp = true;
+                        }
+                    }
+
+                    if has_exp {
+                        num_str.push(chars.next().unwrap()); // push 'e' or 'E'
+                        if let Some(&('+' | '-')) = chars.peek() {
+                            num_str.push(chars.next().unwrap());
+                        }
+                        while let Some(&d) = chars.peek() {
+                            if d.is_ascii_digit() {
+                                num_str.push(chars.next().unwrap());
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 let val: f64 = num_str
                     .parse()
                     .map_err(|_| format!("Invalid number: '{num_str}'"))?;
@@ -136,11 +170,12 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    depth: usize,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self { tokens, pos: 0, depth: 0 }
     }
 
     fn is_at_end(&self) -> bool {
@@ -168,6 +203,16 @@ impl Parser {
     }
 
     fn parse_expression(&mut self) -> Result<f64, String> {
+        self.depth += 1;
+        if self.depth > 128 {
+            return Err("Recursion depth limit exceeded (max 128)".to_string());
+        }
+        let res = self.parse_expression_inner();
+        self.depth -= 1;
+        res
+    }
+
+    fn parse_expression_inner(&mut self) -> Result<f64, String> {
         let mut left = self.parse_term()?;
 
         while let Some(tok) = self.peek() {
@@ -190,18 +235,18 @@ impl Parser {
     }
 
     fn parse_term(&mut self) -> Result<f64, String> {
-        let mut left = self.parse_power()?;
+        let mut left = self.parse_unary()?;
 
         while let Some(tok) = self.peek() {
             match tok {
                 Token::Star => {
                     self.next_token();
-                    let right = self.parse_power()?;
+                    let right = self.parse_unary()?;
                     left *= right;
                 }
                 Token::Slash => {
                     self.next_token();
-                    let right = self.parse_power()?;
+                    let right = self.parse_unary()?;
                     if right.abs() < f64::EPSILON {
                         return Err("Division by zero".to_string());
                     }
@@ -209,7 +254,7 @@ impl Parser {
                 }
                 Token::Percent => {
                     self.next_token();
-                    let right = self.parse_power()?;
+                    let right = self.parse_unary()?;
                     if right.abs() < f64::EPSILON {
                         return Err("Modulo by zero".to_string());
                     }
@@ -222,30 +267,30 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_power(&mut self) -> Result<f64, String> {
-        let base = self.parse_factor()?;
-
-        if let Some(Token::Caret) = self.peek() {
-            self.next_token();
-            let exponent = self.parse_power()?; // right-associative
-            Ok(base.powf(exponent))
-        } else {
-            Ok(base)
-        }
-    }
-
-    fn parse_factor(&mut self) -> Result<f64, String> {
+    fn parse_unary(&mut self) -> Result<f64, String> {
         match self.peek() {
             Some(Token::Plus) => {
                 self.next_token();
-                self.parse_factor()
+                self.parse_unary()
             }
             Some(Token::Minus) => {
                 self.next_token();
-                let val = self.parse_factor()?;
+                let val = self.parse_unary()?;
                 Ok(-val)
             }
-            _ => self.parse_primary(),
+            _ => self.parse_power(),
+        }
+    }
+
+    fn parse_power(&mut self) -> Result<f64, String> {
+        let base = self.parse_primary()?;
+
+        if let Some(Token::Caret) = self.peek() {
+            self.next_token();
+            let exponent = self.parse_unary()?; // right-associative power with unary support
+            Ok(base.powf(exponent))
+        } else {
+            Ok(base)
         }
     }
 
@@ -353,6 +398,27 @@ impl Parser {
                                 return Err("ln argument must be positive".to_string());
                             }
                             Ok(args[0].ln())
+                        }
+                        "exp" => {
+                            if args.len() != 1 {
+                                return Err("exp() expects exactly 1 argument".to_string());
+                            }
+                            Ok(args[0].exp())
+                        }
+                        "log2" => {
+                            if args.len() != 1 {
+                                return Err("log2() expects exactly 1 argument".to_string());
+                            }
+                            if args[0] <= 0.0 {
+                                return Err("log2 argument must be positive".to_string());
+                            }
+                            Ok(args[0].log2())
+                        }
+                        "pow" => {
+                            if args.len() != 2 {
+                                return Err("pow() expects exactly 2 arguments: pow(base, exponent)".to_string());
+                            }
+                            Ok(args[0].powf(args[1]))
                         }
                         "min" => {
                             if args.is_empty() {

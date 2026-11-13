@@ -228,27 +228,35 @@ impl McpToolResult {
         }
     }
 
-    /// Aggregates all text content chunks into a single string.
+    /// Aggregates all text or structured content chunks into a readable string.
     pub fn text_content(&self) -> String {
-        let mut output = String::new();
+        let mut parts = Vec::new();
         for item in &self.content {
             match item {
                 McpContent::Text { text } => {
-                    if !output.is_empty() {
-                        output.push('\n');
+                    if !text.is_empty() {
+                        parts.push(text.clone());
                     }
-                    output.push_str(text);
                 }
-                McpContent::Resource { text: Some(text), .. } => {
-                    if !output.is_empty() {
-                        output.push('\n');
+                McpContent::Image { mime_type, data } => {
+                    parts.push(format!("[Image: {mime_type}, {} base64 chars]", data.len()));
+                }
+                McpContent::Resource { uri, mime_type, text } => {
+                    if let Some(t) = text {
+                        parts.push(format!("[Resource: {uri}]\n{t}"));
+                    } else if let Some(mime) = mime_type {
+                        parts.push(format!("[Resource: {uri} ({mime})]"));
+                    } else {
+                        parts.push(format!("[Resource: {uri}]"));
                     }
-                    output.push_str(text);
                 }
-                _ => {}
             }
         }
-        output
+        if parts.is_empty() {
+            "(empty result)".to_string()
+        } else {
+            parts.join("\n")
+        }
     }
 }
 
@@ -269,11 +277,16 @@ pub trait McpTransport: Send + Sync {
     async fn close(&self) -> Result<(), McpError>;
 }
 
+type PendingSender = oneshot::Sender<Result<JsonRpcResponse, McpError>>;
+
 /// Stdio-based MCP transport managing an external subprocess.
 pub struct StdioTransport {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     child: Arc<Mutex<Option<Child>>>,
-    pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
+    pending_requests: Arc<Mutex<HashMap<u64, PendingSender>>>,
+    is_alive: Arc<std::sync::atomic::AtomicBool>,
+    exit_code: Arc<Mutex<Option<Option<i32>>>>,
+    last_stderr: Arc<Mutex<String>>,
 }
 
 impl StdioTransport {
@@ -288,7 +301,7 @@ impl StdioTransport {
         cmd.args(args);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
 
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
@@ -311,12 +324,39 @@ impl StdioTransport {
             .stdout
             .take()
             .ok_or_else(|| McpError::Transport("Failed to capture child stdout".to_string()))?;
+        let stderr = child.stderr.take();
 
-        let pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>> =
+        let child_arc = Arc::new(Mutex::new(Some(child)));
+        let pending_requests: Arc<Mutex<HashMap<u64, PendingSender>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let is_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let exit_code = Arc::new(Mutex::new(None));
+        let last_stderr = Arc::new(Mutex::new(String::new()));
+
+        // Capture stderr in background for debugging/diagnostics
+        if let Some(err_pipe) = stderr {
+            let last_err_clone = Arc::clone(&last_stderr);
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(err_pipe).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    let mut guard = last_err_clone.lock().await;
+                    if guard.len() > 4096 {
+                        guard.clear();
+                    }
+                    if !guard.is_empty() {
+                        guard.push('\n');
+                    }
+                    guard.push_str(&line);
+                }
+            });
+        }
+
+        let pending = Arc::clone(&pending_requests);
+        let alive_flag = Arc::clone(&is_alive);
+        let ec_arc = Arc::clone(&exit_code);
+        let child_reader = Arc::clone(&child_arc);
 
         // Background reader task for parsing JSON-RPC line responses
-        let pending = Arc::clone(&pending_requests);
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
@@ -334,30 +374,84 @@ impl StdioTransport {
                         if let Some(req_id) = id {
                             let mut map = pending.lock().await;
                             if let Some(tx) = map.remove(&req_id) {
-                                let _ = tx.send(resp);
+                                let _ = tx.send(Ok(resp));
                             }
                         }
                     }
                 }
             }
 
-            // If stdout closed, fail all remaining pending requests
+            // Subprocess stdout pipe closed
+            alive_flag.store(false, Ordering::SeqCst);
+
+            // Reap child process to get exit code
+            let mut code = None;
+            {
+                let mut child_guard = child_reader.lock().await;
+                if let Some(ref mut child) = *child_guard {
+                    match child.try_wait() {
+                        Ok(Some(status)) => code = status.code(),
+                        Ok(None) => {
+                            if let Ok(Ok(status)) =
+                                tokio::time::timeout(Duration::from_millis(150), child.wait()).await
+                            {
+                                code = status.code();
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+
+            {
+                let mut ec_guard = ec_arc.lock().await;
+                *ec_guard = Some(code);
+            }
+
+            // Fail all remaining pending requests with ProcessExited
             let mut map = pending.lock().await;
             for (_, tx) in map.drain() {
-                let _ = tx.send(JsonRpcResponse::error(
-                    None,
-                    -32603,
-                    "Subprocess stdout closed unexpectedly",
-                    None,
-                ));
+                let _ = tx.send(Err(McpError::ProcessExited(code)));
             }
         });
 
         Ok(Self {
             stdin: Arc::new(Mutex::new(Some(stdin))),
-            child: Arc::new(Mutex::new(Some(child))),
+            child: child_arc,
             pending_requests,
+            is_alive,
+            exit_code,
+            last_stderr,
         })
+    }
+
+    /// Checks if the subprocess has exited and updates exit_code if so.
+    async fn check_child_exit(&self) -> Option<Option<i32>> {
+        let mut ec = self.exit_code.lock().await;
+        if ec.is_some() {
+            return *ec;
+        }
+
+        let mut child_guard = self.child.lock().await;
+        if let Some(ref mut child) = *child_guard {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    self.is_alive.store(false, Ordering::SeqCst);
+                    let code = status.code();
+                    *ec = Some(code);
+                    Some(code)
+                }
+                _ => None,
+            }
+        } else {
+            *ec = Some(None);
+            Some(None)
+        }
+    }
+
+    /// Returns captured stderr diagnostic output.
+    pub async fn last_stderr(&self) -> String {
+        self.last_stderr.lock().await.clone()
     }
 }
 
@@ -379,6 +473,12 @@ impl McpTransport for StdioTransport {
             }
         };
 
+        // Check if child has already exited before sending
+        if !self.is_alive.load(Ordering::SeqCst) || self.check_child_exit().await.is_some() {
+            let code = self.check_child_exit().await.flatten();
+            return Err(McpError::ProcessExited(code));
+        }
+
         let (tx, rx) = oneshot::channel();
         {
             let mut map = self.pending_requests.lock().await;
@@ -391,39 +491,79 @@ impl McpTransport for StdioTransport {
         {
             let mut stdin_guard = self.stdin.lock().await;
             if let Some(ref mut stdin) = *stdin_guard {
-                stdin
-                    .write_all(payload.as_bytes())
-                    .await
-                    .map_err(|e| McpError::Transport(format!("Failed to write to stdin: {e}")))?;
-                stdin
-                    .write_all(b"\n")
-                    .await
-                    .map_err(|e| McpError::Transport(format!("Failed to write newline: {e}")))?;
-                stdin
-                    .flush()
-                    .await
-                    .map_err(|e| McpError::Transport(format!("Failed to flush stdin: {e}")))?;
+                if let Err(e) = stdin.write_all(payload.as_bytes()).await {
+                    let mut map = self.pending_requests.lock().await;
+                    map.remove(&req_id);
+                    self.is_alive.store(false, Ordering::SeqCst);
+                    let code = self.check_child_exit().await.flatten();
+                    return if code.is_some() {
+                        Err(McpError::ProcessExited(code))
+                    } else {
+                        Err(McpError::Transport(format!("Failed to write to stdin: {e}")))
+                    };
+                }
+                if let Err(e) = stdin.write_all(b"\n").await {
+                    let mut map = self.pending_requests.lock().await;
+                    map.remove(&req_id);
+                    self.is_alive.store(false, Ordering::SeqCst);
+                    let code = self.check_child_exit().await.flatten();
+                    return if code.is_some() {
+                        Err(McpError::ProcessExited(code))
+                    } else {
+                        Err(McpError::Transport(format!("Failed to write newline: {e}")))
+                    };
+                }
+                if let Err(e) = stdin.flush().await {
+                    let mut map = self.pending_requests.lock().await;
+                    map.remove(&req_id);
+                    self.is_alive.store(false, Ordering::SeqCst);
+                    let code = self.check_child_exit().await.flatten();
+                    return if code.is_some() {
+                        Err(McpError::ProcessExited(code))
+                    } else {
+                        Err(McpError::Transport(format!("Failed to flush stdin: {e}")))
+                    };
+                }
             } else {
-                return Err(McpError::Transport("Subprocess stdin is closed".to_string()));
+                let mut map = self.pending_requests.lock().await;
+                map.remove(&req_id);
+                let code = self.check_child_exit().await.flatten();
+                return Err(McpError::ProcessExited(code));
             }
         }
 
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(response)) => Ok(response),
+            Ok(Ok(Ok(response))) => Ok(response),
+            Ok(Ok(Err(mcp_err))) => Err(mcp_err),
             Ok(Err(_)) => {
                 let mut map = self.pending_requests.lock().await;
                 map.remove(&req_id);
-                Err(McpError::Transport("Response channel dropped by subprocess reader".to_string()))
+                let code = self.check_child_exit().await.flatten();
+                if code.is_some() || !self.is_alive.load(Ordering::SeqCst) {
+                    Err(McpError::ProcessExited(code))
+                } else {
+                    Err(McpError::Transport("Response channel dropped by subprocess reader".to_string()))
+                }
             }
             Err(_) => {
                 let mut map = self.pending_requests.lock().await;
                 map.remove(&req_id);
-                Err(McpError::Timeout(format!("Request {req_id} timed out after {timeout:?}")))
+                let code = self.check_child_exit().await.flatten();
+                if code.is_some() || !self.is_alive.load(Ordering::SeqCst) {
+                    Err(McpError::ProcessExited(code))
+                } else {
+                    Err(McpError::Timeout(format!("Request {req_id} timed out after {timeout:?}")))
+                }
             }
         }
     }
 
     async fn send_notification(&self, notification: &JsonRpcRequest) -> Result<(), McpError> {
+        if !self.is_alive.load(Ordering::SeqCst) || self.check_child_exit().await.is_some() {
+            let code = self.check_child_exit().await.flatten();
+            return Err(McpError::ProcessExited(code));
+        }
+
         let payload = serde_json::to_string(notification)
             .map_err(|e| McpError::Serialization(e.to_string()))?;
 
@@ -443,11 +583,13 @@ impl McpTransport for StdioTransport {
                 .map_err(|e| McpError::Transport(format!("Failed to flush stdin: {e}")))?;
             Ok(())
         } else {
-            Err(McpError::Transport("Subprocess stdin is closed".to_string()))
+            let code = self.check_child_exit().await.flatten();
+            Err(McpError::ProcessExited(code))
         }
     }
 
     async fn close(&self) -> Result<(), McpError> {
+        self.is_alive.store(false, Ordering::SeqCst);
         {
             let mut stdin_guard = self.stdin.lock().await;
             *stdin_guard = None; // Closes stdin to signal EOF to child
@@ -455,6 +597,7 @@ impl McpTransport for StdioTransport {
         let mut child_guard = self.child.lock().await;
         if let Some(mut child) = child_guard.take() {
             let _ = child.kill().await;
+            let _ = child.wait().await;
         }
         Ok(())
     }
