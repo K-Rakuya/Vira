@@ -91,15 +91,22 @@ export class VRMViewer {
 
   private setupLighting(): void {
     if (!this.scene) return;
-    const key = new THREE.DirectionalLight(0xffffff, Math.PI);
-    key.position.set(0.5, 1.1, 1.6);
+    // Primary key directional light - positioned to illuminate character's face & upper body
+    const key = new THREE.DirectionalLight(0xffffff, 1.0);
+    key.position.set(0.35, 1.6, 1.6);
+    key.target.position.set(0, 1.2, 0);
+    this.scene.add(key.target);
     this.scene.add(key);
 
-    const rim = new THREE.DirectionalLight(0x9db0ff, 0.5);
-    rim.position.set(-1.6, 1.6, -1.8);
+    // Subtle cool cosmic rim light from upper-back left to accent anime hair contours
+    const rim = new THREE.DirectionalLight(0xa4b8ff, 0.45);
+    rim.position.set(-1.4, 1.7, -1.4);
+    rim.target.position.set(0, 1.2, 0);
+    this.scene.add(rim.target);
     this.scene.add(rim);
 
-    const amb = new THREE.AmbientLight(0xffffff, 0.3);
+    // Gentle ambient light to prevent pitch-black shadows while preserving MToon cel-shading contrast
+    const amb = new THREE.AmbientLight(0xffffff, 0.22);
     this.scene.add(amb);
   }
 
@@ -207,17 +214,17 @@ export class VRMViewer {
     }
 
     const fov = THREE.MathUtils.degToRad(this.camera.fov);
-    const span = 1.12;
-    const widthSpan = 0.8;
+    const span = 1.45; // Generous vertical framing to accommodate head, hat, and upper torso
+    const widthSpan = 0.95;
     const byHeight = span / 2 / Math.tan(fov / 2);
     const byWidth = widthSpan / 2 / (Math.tan(fov / 2) * this.camera.aspect);
-    this.fitDistance = Math.max(byHeight, byWidth, 0.8);
+    this.fitDistance = Math.max(byHeight, byWidth, 1.6);
 
-    const targetY = head.y - 0.17;
+    const targetY = head.y - 0.10; // Center framing at chin/neck level above bottom HUD
     this.controls.target.set(head.x, targetY, head.z);
-    this.camera.position.set(head.x, targetY + 0.04, head.z + this.fitDistance);
-    this.controls.minDistance = this.fitDistance * 0.55;
-    this.controls.maxDistance = this.fitDistance * 1.8;
+    this.camera.position.set(head.x, targetY + 0.02, head.z + this.fitDistance);
+    this.controls.minDistance = this.fitDistance * 0.45;
+    this.controls.maxDistance = this.fitDistance * 2.2;
     this.controls.update();
   }
 
