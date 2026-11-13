@@ -1,0 +1,24 @@
+[package]
+name = "vira-store"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Local persistence and SQLite storage engine for Vira AI Companion"
+
+[dependencies]
+vira-domain = { workspace = true }
+vira-ports = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+tracing = "0.1"
+
+[dev-dependencies]
+vira-learn = { workspace = true }
+tempfile = "3.10"
+tokio = { workspace = true }
