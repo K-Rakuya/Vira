@@ -24,3 +24,4 @@ vira-voice = { path = "crates/vira-voice" }
 vira-infer = { path = "crates/vira-infer" }
 vira-tauri = { path = "crates/vira-tauri" }
 vira-rag = { path = "crates/vira-rag" }
+vira-learn = { path = "crates/vira-learn" }
