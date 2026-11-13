@@ -1,0 +1,18 @@
+[package]
+name = "vira-rag"
+version.workspace = true
+edition.workspace = true
+description = "Embedded Knowledge Base and Hybrid RAG Engine for Vira"
+
+[dependencies]
+vira-domain = { workspace = true }
+vira-ports = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tantivy = "0.27"
+
+[dev-dependencies]
+tempfile = "3.10"

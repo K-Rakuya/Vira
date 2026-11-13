@@ -61,6 +61,17 @@ pub fn spawn_viseme_tick_loop(
 
 /// Initializes and launches the Tauri 2.0 application host.
 pub fn run() {
+    let _runtime = if tokio::runtime::Handle::try_current().is_err() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build Tokio runtime");
+        Some(rt)
+    } else {
+        None
+    };
+    let _guard = _runtime.as_ref().map(|rt| rt.enter());
+
     tauri::Builder::default()
         .setup(|app| {
             let handle = app.handle().clone();
