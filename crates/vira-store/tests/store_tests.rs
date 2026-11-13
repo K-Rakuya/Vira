@@ -393,3 +393,171 @@ async fn test_integration_with_spaced_repetition_service() {
     assert_eq!(direct_card.reps, 1);
     assert!(direct_card.stability > 0.0);
 }
+
+#[tokio::test]
+async fn test_session_timestamps_no_regression() {
+    let store = SqliteStore::open_in_memory().expect("open sqlite");
+
+    // Save a message at ts=2000
+    let msg1 = Message::new(Role::User, "Msg at 2000").with_timestamp(2000);
+    store.save_message("sess_regress", &msg1).await.expect("save 1");
+
+    let sessions = store.list_sessions().await.expect("list");
+    assert_eq!(sessions[0].created_at, 2000);
+    assert_eq!(sessions[0].updated_at, 2000);
+
+    // Now save an older message at ts=1000
+    let msg2 = Message::new(Role::User, "Msg at 1000").with_timestamp(1000);
+    store.save_message("sess_regress", &msg2).await.expect("save 2");
+
+    let sessions = store.list_sessions().await.expect("list");
+    // created_at should adjust to earliest message (1000)
+    // updated_at should NOT regress to 1000; it must remain 2000!
+    assert_eq!(sessions[0].created_at, 1000);
+    assert_eq!(sessions[0].updated_at, 2000);
+}
+
+#[tokio::test]
+async fn test_flashcard_nan_resilience() {
+    let store = SqliteStore::open_in_memory().expect("open sqlite");
+    let mut card = Flashcard::new("nan_card", "test", "test");
+    card.stability = f32::NAN;
+    card.difficulty = f32::INFINITY;
+    store.save_flashcard(&card).await.expect("save nan card");
+
+    let loaded = store
+        .get_flashcard("nan_card")
+        .await
+        .expect("get")
+        .expect("exists");
+    assert!(loaded.stability.is_finite());
+    assert!(loaded.difficulty.is_finite());
+}
+
+#[tokio::test]
+async fn test_flashcard_due_deterministic_tie_breaking() {
+    let store = SqliteStore::open_in_memory().expect("open sqlite");
+
+    // Insert 3 cards with the EXACT same due timestamp in non-alphabetical order
+    let c_z = Flashcard::new("card_z", "zebra", "ngựa vằn").with_due(5000);
+    let c_a = Flashcard::new("card_a", "apple", "quả táo").with_due(5000);
+    let c_m = Flashcard::new("card_m", "mango", "quả xoài").with_due(5000);
+
+    store.save_flashcard(&c_z).await.expect("save z");
+    store.save_flashcard(&c_a).await.expect("save a");
+    store.save_flashcard(&c_m).await.expect("save m");
+
+    let due = store.get_due_flashcards(5000, 10).await.expect("due");
+    assert_eq!(due.len(), 3);
+    // Should be deterministically sorted by (due ASC, id ASC): card_a, card_m, card_z
+    assert_eq!(due[0].id, "card_a");
+    assert_eq!(due[1].id, "card_m");
+    assert_eq!(due[2].id, "card_z");
+}
+
+#[tokio::test]
+async fn test_run_migrations_under_concurrency() {
+    let store = SqliteStore::open_in_memory().expect("open sqlite");
+
+    // Spawn a task that holds connection for a short duration while executing queries
+    let store_clone = store.clone();
+    let handle = tokio::spawn(async move {
+        for _ in 0..10 {
+            let msg = Message::new(Role::User, "ping");
+            store_clone.save_message("busy_sess", &msg).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    });
+
+    // Run migrations from another task concurrently - should wait and succeed, NOT fail with try_lock
+    for _ in 0..5 {
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        store.run_migrations().expect("migrations should not fail under contention");
+    }
+
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_user_profile_corrupted_json_returns_error() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("corrupt_profile.db");
+    let store = SqliteStore::open(&db_path).expect("open");
+
+    // Save a valid profile first
+    let profile = UserProfile::new("u_corrupt", "Corrupt User", "vi", "en", "B2");
+    store.save_user_profile(&profile).await.expect("save profile");
+
+    // Directly corrupt the preferences_json field in SQLite
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open raw");
+        conn.execute(
+            "UPDATE user_profiles SET preferences_json = '{invalid_json' WHERE user_id = 'u_corrupt'",
+            [],
+        )
+        .expect("corrupt json");
+    }
+
+    // Now get_user_profile should return StoreError::Serialization, NOT silently wipe it!
+    let res = store.get_user_profile("u_corrupt").await;
+    assert!(
+        matches!(res, Err(StoreError::Serialization(_))),
+        "Expected Serialization error, got: {:?}",
+        res
+    );
+}
+
+#[tokio::test]
+async fn test_list_sessions_deterministic_tie_breaking() {
+    let store = SqliteStore::open_in_memory().expect("open sqlite");
+
+    let m1 = Message::new(Role::User, "m1").with_timestamp(5000);
+    store.save_message("sess_z", &m1).await.expect("save z");
+    store.save_message("sess_a", &m1).await.expect("save a");
+    store.save_message("sess_m", &m1).await.expect("save m");
+
+    let sessions = store.list_sessions().await.expect("list");
+    assert_eq!(sessions.len(), 3);
+    // Ordered by (updated_at DESC, id DESC): sess_z, sess_m, sess_a
+    assert_eq!(sessions[0].id, "sess_z");
+    assert_eq!(sessions[1].id, "sess_m");
+    assert_eq!(sessions[2].id, "sess_a");
+}
+
+#[test]
+fn test_sync_save_and_retrieve_chat_history() {
+    let store = SqliteStore::open_in_memory().expect("open sqlite");
+    store.run_migrations().expect("migrations");
+
+    let msg = Message::new(Role::User, "Hello Vira Sync");
+    store
+        .save_message_sync("session_sync_1", &msg)
+        .expect("sync save");
+
+    let history = store
+        .get_history_sync("session_sync_1", 10)
+        .expect("sync get history");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].raw_content, "Hello Vira Sync");
+}
+
+#[tokio::test]
+async fn test_nested_directory_creation_on_open() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let deeply_nested = temp_dir
+        .path()
+        .join("sub1")
+        .join("sub2")
+        .join("deep_store.db");
+
+    let store = SqliteStore::open(&deeply_nested).expect("open deeply nested db");
+    let card = Flashcard::new("c_nested", "depth", "độ sâu");
+    store.save_flashcard(&card).await.expect("save flashcard");
+
+    let loaded = store
+        .get_flashcard("c_nested")
+        .await
+        .expect("query")
+        .expect("found");
+    assert_eq!(loaded.front, "depth");
+}
