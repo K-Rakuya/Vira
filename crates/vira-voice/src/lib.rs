@@ -19,7 +19,7 @@ pub use gop::{
 };
 pub use phoneme_aligner::{
     AlignmentError, AlignmentMatch, CtcAligner, DtwAligner, DtwResult, G2pConverter, MatchStatus,
-    PhonemeFrameAlignment, PhonemeLanguage,
+    PhonemeAligner, PhonemeFrameAlignment, PhonemeLanguage,
 };
 pub use playback::{PlaybackConfig, PlaybackEngine};
 pub use ring_buffer::{AudioConsumer, AudioProducer, AudioRingBuffer};

@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use vira_domain::viseme::VisemeWeights;
+use vira_ports::tts::TimedViseme;
 use crate::gop::split_phoneme_base_and_tag;
 
 /// Supported languages for G2P phonetic transcription.
@@ -1291,6 +1293,118 @@ fn match_vietnamese_vowel(chars: &[char]) -> (&'static str, Option<&'static str>
     (ph, tone, 1)
 }
 
+/// Phoneme-to-Viseme alignment engine for 60Hz 3D VRM lip-sync animation.
+#[derive(Debug, Clone, Default)]
+pub struct PhonemeAligner {
+    converter: G2pConverter,
+}
+
+impl PhonemeAligner {
+    /// Creates a new phoneme aligner with default lexicon and language rules.
+    pub fn new() -> Self {
+        Self {
+            converter: G2pConverter::new(),
+        }
+    }
+
+    /// Access inner G2P converter.
+    pub fn converter(&self) -> &G2pConverter {
+        &self.converter
+    }
+
+    /// Access mutable inner G2P converter.
+    pub fn converter_mut(&mut self) -> &mut G2pConverter {
+        &mut self.converter
+    }
+
+    /// Aligns a phoneme sequence across a given duration into a 60Hz timeline of `TimedViseme` frames.
+    pub fn align_phonemes_to_visemes(
+        &self,
+        phonemes: &[String],
+        duration_ms: u64,
+    ) -> Vec<TimedViseme> {
+        if phonemes.is_empty() || duration_ms == 0 {
+            return vec![TimedViseme::zero(0)];
+        }
+
+        // Assign relative duration weights to phonemes:
+        // Vowels are longer (~1.6x) than consonants (1.0x).
+        let weights: Vec<f32> = phonemes
+            .iter()
+            .map(|ph| {
+                let v = crate::gop::phoneme_to_viseme(ph);
+                if v.is_silent() {
+                    0.8
+                } else if v.aa > 0.3 || v.ee > 0.3 || v.ih > 0.3 || v.oh > 0.3 || v.ou > 0.3 {
+                    1.6
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+
+        let total_weight: f32 = weights.iter().sum();
+        let total_weight = if total_weight > 0.0 { total_weight } else { 1.0 };
+
+        // Calculate phoneme span durations
+        let mut spans = Vec::with_capacity(phonemes.len());
+        let mut allocated_ms = 0u64;
+        for (i, ph) in phonemes.iter().enumerate() {
+            let ph_ms = ((weights[i] / total_weight) * duration_ms as f32).round() as u64;
+            let ph_ms = ph_ms.max(10);
+            allocated_ms += ph_ms;
+            let target = crate::gop::phoneme_to_viseme(ph);
+            spans.push((target, ph_ms));
+        }
+
+        // Scale spans to match duration_ms exactly
+        let scale = duration_ms as f64 / allocated_ms.max(1) as f64;
+        let spans: Vec<(VisemeWeights, u64)> = spans
+            .into_iter()
+            .map(|(w, ms)| (w, ((ms as f64 * scale).round() as u64).max(10)))
+            .collect();
+
+        let mut visemes = Vec::new();
+        let mut current_weights = VisemeWeights::zero();
+        let frame_step_ms = 16u64; // ~60 Hz (16.66ms)
+        let mut span_idx = 0;
+        let mut span_elapsed_ms = 0u64;
+        let mut t = 0u64;
+
+        while t <= duration_ms {
+            while span_idx < spans.len() && span_elapsed_ms + spans[span_idx].1 < t {
+                span_elapsed_ms += spans[span_idx].1;
+                span_idx += 1;
+            }
+
+            let target = if span_idx < spans.len() {
+                spans[span_idx].0
+            } else {
+                VisemeWeights::zero()
+            };
+
+            // Smooth interpolation towards target mouth shape
+            current_weights = current_weights.lerp(&target, 0.45);
+            visemes.push(TimedViseme::new(t, current_weights.clamped()));
+
+            t += frame_step_ms;
+        }
+
+        visemes
+    }
+
+    /// Converts raw text to a 60Hz `TimedViseme` timeline matching the specified audio duration.
+    pub fn align_text_to_visemes(
+        &self,
+        text: &str,
+        duration_ms: u64,
+        language: PhonemeLanguage,
+    ) -> Vec<TimedViseme> {
+        let phonemes = self.converter.text_to_phonemes(text, language);
+        self.align_phonemes_to_visemes(&phonemes, duration_ms)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1362,5 +1476,22 @@ mod tests {
         assert_eq!(alignments[1].phoneme, "OW");
         assert_eq!(alignments[1].end_frame, 3);
         assert!(alignments[0].mean_log_posterior >= -0.2);
+    }
+
+    #[test]
+    fn test_phoneme_aligner_to_visemes_clamped_and_60hz() {
+        let aligner = PhonemeAligner::new();
+        let visemes = aligner.align_text_to_visemes("Xin chào Vira!", 500, PhonemeLanguage::Vietnamese);
+
+        assert!(!visemes.is_empty());
+        // For 500ms at ~16ms steps, should have around 30-35 frames
+        assert!(visemes.len() >= 25);
+        for v in &visemes {
+            assert!(v.weights.aa >= 0.0 && v.weights.aa <= 1.0);
+            assert!(v.weights.ih >= 0.0 && v.weights.ih <= 1.0);
+            assert!(v.weights.ou >= 0.0 && v.weights.ou <= 1.0);
+            assert!(v.weights.ee >= 0.0 && v.weights.ee <= 1.0);
+            assert!(v.weights.oh >= 0.0 && v.weights.oh <= 1.0);
+        }
     }
 }

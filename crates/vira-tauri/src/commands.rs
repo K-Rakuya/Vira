@@ -825,7 +825,7 @@ pub async fn handle_toggle_mic(
                         if chunk.is_empty() {
                             continue;
                         }
-                        let rms = vira_infer::whisper_stt::WhisperSttAdapter::calculate_rms(&chunk);
+                        let rms = vira_infer::SherpaSttAdapter::calculate_rms(&chunk);
                         state_clone.append_recorded_audio(&chunk);
                         state_clone.emit_audio_state(rms, false);
                     }
@@ -922,22 +922,30 @@ pub async fn handle_save_settings(
         || settings.tts_speed.is_some()
     {
         let pb_rate = state.audio_playback.sample_rate();
-        let mut tts = vira_infer::kokoro_tts::KokoroTtsAdapter::new().with_sample_rate(pb_rate);
-        if let Some(ref voice) = settings.tts_voice {
-            tts = tts.with_voice(voice);
-        }
-        if let Some(speed) = settings.tts_speed {
-            tts = tts.with_speed(speed);
-        }
         if let Some(ref ep) = settings.tts_endpoint {
+            let mut tts = vira_infer::kokoro_tts::KokoroTtsAdapter::new().with_sample_rate(pb_rate);
+            if let Some(ref voice) = settings.tts_voice {
+                tts = tts.with_voice(voice);
+            }
+            if let Some(speed) = settings.tts_speed {
+                tts = tts.with_speed(speed);
+            }
             tts = tts.with_endpoint(ep);
+            state.set_dynamic_tts(std::sync::Arc::new(tts));
+        } else {
+            let mut tts = vira_infer::SherpaTtsAdapter::new().with_sample_rate(pb_rate);
+            if let Some(ref voice) = settings.tts_voice {
+                tts = tts.with_voice(voice);
+            }
+            if let Some(speed) = settings.tts_speed {
+                tts = tts.with_speed(speed);
+            }
+            state.set_dynamic_tts(std::sync::Arc::new(tts));
         }
-        state.set_dynamic_tts(std::sync::Arc::new(tts));
     }
 
     // Dynamic reconfiguration of active STT endpoint & language
     if settings.stt_endpoint.is_some() || settings.stt_model.is_some() {
-        let mut stt = vira_infer::whisper_stt::WhisperSttAdapter::new();
         let tutor_mode = *state.tutor_mode.read().unwrap();
         let lang = match tutor_mode {
             TutorMode::English => "en",
@@ -945,11 +953,14 @@ pub async fn handle_save_settings(
             TutorMode::Vietnamese => "vi",
             TutorMode::GeneralAssistant => "vi",
         };
-        stt = stt.with_language(lang);
         if let Some(ref ep) = settings.stt_endpoint {
-            stt = stt.with_endpoint(ep);
+            let mut stt = vira_infer::whisper_stt::WhisperSttAdapter::new();
+            stt = stt.with_language(lang).with_endpoint(ep);
+            state.set_dynamic_stt(std::sync::Arc::new(stt));
+        } else {
+            let stt = vira_infer::SherpaSttAdapter::new().with_language(lang);
+            state.set_dynamic_stt(std::sync::Arc::new(stt));
         }
-        state.set_dynamic_stt(std::sync::Arc::new(stt));
     }
 
     // Persist to local SQLite store

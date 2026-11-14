@@ -213,6 +213,42 @@ async fn test_toggle_mic_and_barge_in_handling() {
 }
 
 #[tokio::test]
+async fn test_toggle_mic_transcription_triggers_conversation_turn() {
+    use vira_infer::SherpaSttAdapter;
+
+    let emitter = Arc::new(MockEventEmitter::new());
+    let state = AppState::new_headless_with_emitter(emitter.clone());
+
+    // Configure STT with a mock response
+    let stt = SherpaSttAdapter::virtual_fallback()
+        .with_mock_responses(vec!["Chào Vira".to_string()]);
+    state.set_dynamic_stt(Arc::new(stt));
+
+    // 1. Toggle mic ON
+    let res_on = handle_toggle_mic(true, &state).await.expect("toggle mic on");
+    assert!(res_on);
+    assert_eq!(state.get_conversation_state(), ConversationState::Listening);
+
+    // Simulate recorded audio samples (> 100ms at 16kHz, e.g. 3200 samples = 200ms)
+    let fake_audio = vec![0.1f32; 3200];
+    state.append_recorded_audio(&fake_audio);
+
+    // 2. Toggle mic OFF -> triggers background transcription and conversation turn
+    let res_off = handle_toggle_mic(false, &state).await.expect("toggle mic off");
+    assert!(!res_off);
+
+    // Wait for the background turn to complete
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+    // Verify conversation history received user message from STT transcription
+    let history = state.history.read().await;
+    assert!(
+        history.iter().any(|m| m.is_user() && m.raw_content == "Chào Vira"),
+        "STT transcription must trigger a conversation turn with user message 'Chào Vira'"
+    );
+}
+
+#[tokio::test]
 async fn test_save_settings_and_get_app_state() {
     let state = AppState::new_headless();
 

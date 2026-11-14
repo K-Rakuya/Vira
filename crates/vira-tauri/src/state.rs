@@ -8,9 +8,8 @@ use vira_agent::{ToolCallExecutor, ToolRegistry};
 use vira_domain::message::Message;
 use vira_domain::state::{ConversationState, StateTransitionError, StateTransitionEvent};
 use vira_domain::viseme::VisemeWeights;
-use vira_infer::kokoro_tts::KokoroTtsAdapter;
 use vira_infer::openai_compat::{MockLlmTransport, OpenAiCompatLlmAdapter};
-use vira_infer::whisper_stt::WhisperSttAdapter;
+use vira_infer::{SherpaSttAdapter, SherpaTtsAdapter};
 use vira_learn::service::SpacedRepetitionService;
 use vira_ports::audio::{AudioCapturePort, AudioPlaybackPort};
 use vira_ports::llm::LlmPort;
@@ -225,8 +224,8 @@ impl AppState {
             )
             .with_transport(transport),
         );
-        let tts = Arc::new(KokoroTtsAdapter::virtual_fallback().with_sample_rate(pb_sample_rate));
-        let stt = Arc::new(WhisperSttAdapter::virtual_fallback());
+        let tts = Arc::new(SherpaTtsAdapter::virtual_fallback().with_sample_rate(pb_sample_rate));
+        let stt = Arc::new(SherpaSttAdapter::virtual_fallback());
         let rag = Arc::new(
             HybridRagEngine::new_in_memory(HybridRagConfig::default())
                 .expect("in-memory RAG engine"),

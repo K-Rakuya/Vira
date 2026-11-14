@@ -18,3 +18,7 @@ dist/
 Thumbs.db
 .vscode/
 .idea/
+
+# Local Model Assets & Weights
+models/
+

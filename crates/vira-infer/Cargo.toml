@@ -18,6 +18,8 @@ bytes = "1.12"
 reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 eventsource-stream = "0.2"
 futures-util = "0.3"
+sherpa-onnx = "2.0.1"
 
 [dev-dependencies]
+tempfile = "3.17"
 

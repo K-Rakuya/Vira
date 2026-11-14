@@ -14,6 +14,7 @@ use vira_domain::viseme::VisemeWeights;
 use vira_infer::kokoro_tts::KokoroTtsAdapter;
 use vira_infer::openai_compat::OpenAiCompatLlmAdapter;
 use vira_infer::whisper_stt::WhisperSttAdapter;
+use vira_infer::{SherpaSttAdapter, SherpaTtsAdapter};
 use vira_learn::service::SpacedRepetitionService;
 use vira_ports::audio::AudioPlaybackPort;
 use vira_ports::store::StorePort;
@@ -153,8 +154,8 @@ pub fn run() {
                 "default".to_string(),
                 None,
             ));
-            let tts = Arc::new(KokoroTtsAdapter::new().with_sample_rate(pb_sample_rate));
-            let stt = Arc::new(WhisperSttAdapter::new());
+            let tts = Arc::new(SherpaTtsAdapter::new().with_sample_rate(pb_sample_rate));
+            let stt = Arc::new(SherpaSttAdapter::new());
 
             let app_state = AppState::new(
                 llm,
@@ -201,17 +202,26 @@ pub fn run() {
                             || saved_settings.tts_voice.is_some()
                             || saved_settings.tts_speed.is_some()
                         {
-                            let mut tts = KokoroTtsAdapter::new().with_sample_rate(pb_sample_rate);
-                            if let Some(ref voice) = saved_settings.tts_voice {
-                                tts = tts.with_voice(voice);
-                            }
-                            if let Some(speed) = saved_settings.tts_speed {
-                                tts = tts.with_speed(speed);
-                            }
                             if let Some(ref ep) = saved_settings.tts_endpoint {
+                                let mut tts = KokoroTtsAdapter::new().with_sample_rate(pb_sample_rate);
+                                if let Some(ref voice) = saved_settings.tts_voice {
+                                    tts = tts.with_voice(voice);
+                                }
+                                if let Some(speed) = saved_settings.tts_speed {
+                                    tts = tts.with_speed(speed);
+                                }
                                 tts = tts.with_endpoint(ep);
+                                state_for_init.set_dynamic_tts(Arc::new(tts));
+                            } else {
+                                let mut tts = SherpaTtsAdapter::new().with_sample_rate(pb_sample_rate);
+                                if let Some(ref voice) = saved_settings.tts_voice {
+                                    tts = tts.with_voice(voice);
+                                }
+                                if let Some(speed) = saved_settings.tts_speed {
+                                    tts = tts.with_speed(speed);
+                                }
+                                state_for_init.set_dynamic_tts(Arc::new(tts));
                             }
-                            state_for_init.set_dynamic_tts(Arc::new(tts));
                         }
 
                         if saved_settings.stt_endpoint.is_some() {
