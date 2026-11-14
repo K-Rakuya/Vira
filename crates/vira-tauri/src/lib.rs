@@ -13,7 +13,6 @@ use std::sync::Arc;
 use tauri::Manager;
 use tokio_util::sync::CancellationToken;
 use vira_agent::{ToolCallExecutor, ToolRegistry};
-use vira_domain::viseme::VisemeWeights;
 use vira_infer::kokoro_tts::KokoroTtsAdapter;
 use vira_infer::openai_compat::OpenAiCompatLlmAdapter;
 use vira_infer::whisper_stt::WhisperSttAdapter;
@@ -29,59 +28,7 @@ use vira_voice::playback::{PlaybackConfig, PlaybackEngine};
 use crate::events::TauriEventEmitter;
 use crate::state::{AppSettingsPayload, AppState};
 
-/// Spawns a dedicated 60Hz (~16.6ms) background loop that synchronizes Viseme blendshape
-/// weights against the `MasterAudioClock` playhead and pushes them to the avatar stage.
-pub fn spawn_viseme_tick_loop(
-    state: AppState,
-    cancel: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(16));
-        let mut was_active = false;
-        while !cancel.is_cancelled() {
-            interval.tick().await;
-
-            let is_playing = state.audio_playback.is_playing();
-            let is_gen = state.is_generating();
-            let current_conv_state = state.get_conversation_state();
-
-            // Detect speech completion: audio buffer drained, no active LLM/TTS generation,
-            // and state is still in Speaking.
-            if current_conv_state == vira_domain::state::ConversationState::Speaking && !is_playing && !is_gen {
-                let _ = state.transition_state(vira_domain::state::ConversationState::Idle);
-                state.emit_subtitle("", vira_domain::state::ConversationState::Idle);
-                *state.active_visemes.write().unwrap() = Vec::new();
-                state.emit_viseme_tick(VisemeWeights::zero(), false);
-                was_active = false;
-                continue;
-            }
-
-            let is_active = is_playing || is_gen || current_conv_state == vira_domain::state::ConversationState::Speaking;
-
-            if !is_active {
-                if was_active {
-                    // Emit one zero viseme tick to reset the avatar mouth when entering idle
-                    state.emit_viseme_tick(VisemeWeights::zero(), false);
-                    was_active = false;
-                }
-                // Adaptive Viseme Gating: pause sending IPC ticks until audio playback or generation resumes
-                continue;
-            }
-
-            was_active = true;
-            let now_ms = state.clock.current_time_ms();
-
-            let weights = if is_playing {
-                let visemes = state.active_visemes.read().unwrap();
-                state.clock.sample_viseme_at_ms(&visemes, now_ms)
-            } else {
-                VisemeWeights::zero()
-            };
-
-            state.emit_viseme_tick(weights, is_playing);
-        }
-    })
-}
+pub use commands::spawn_viseme_tick_loop;
 
 /// Initializes and launches the Tauri 2.0 application host.
 pub fn run() {
@@ -103,7 +50,7 @@ pub fn run() {
 
             // Native playback engine with virtual fallback for headless/container environments
             let playback = PlaybackEngine::new_native(PlaybackConfig::default()).unwrap_or_else(|_| {
-                let (virtual_pb, _) = PlaybackEngine::new_virtual(48000, 96000);
+                let (virtual_pb, _) = PlaybackEngine::new_virtual(48000, 720000);
                 virtual_pb
             });
             let clock = playback.clock().clone();

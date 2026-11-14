@@ -847,6 +847,10 @@ struct OpenAiChunkChoice {
 struct OpenAiChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
+    #[serde(default)]
+    pub reasoning: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -927,6 +931,16 @@ impl LlmPort for OpenAiCompatLlmAdapter {
                             };
 
                             for choice in parsed.choices {
+                                let reasoning = choice.delta.reasoning_content.or(choice.delta.reasoning);
+                                if let Some(thought_text) = reasoning {
+                                    if !thought_text.is_empty() {
+                                        let chunk = LlmStreamChunk::new("").with_thought(thought_text);
+                                        if sender.send(chunk).await.is_err() {
+                                            return Err(LlmError::Channel("receiver dropped".to_string()));
+                                        }
+                                    }
+                                }
+
                                 if let Some(delta_text) = choice.delta.content {
                                     if delta_text.is_empty() {
                                         continue;

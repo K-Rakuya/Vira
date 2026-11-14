@@ -121,6 +121,82 @@ describe('HudController tutor presets and normalization', () => {
     expect(spokenText).toBe('Fallback speech synthesis');
   });
 
+  it('manages speech synthesis using sequential FIFO queue with utterance.onend', () => {
+    const spokenList: string[] = [];
+    const queue: any[] = [];
+    let isSpeaking = false;
+
+    (globalThis as any).window = globalThis.window || {};
+    (globalThis as any).SpeechSynthesisUtterance = class {
+      text: string;
+      lang = '';
+      rate = 1;
+      onend: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor(t: string) {
+        this.text = t;
+      }
+    };
+
+    (globalThis.window as any).speechSynthesis = {
+      cancel: () => {
+        queue.length = 0;
+        isSpeaking = false;
+      },
+      speak: (utter: any) => {
+        spokenList.push(utter.text);
+      },
+    };
+
+    const playNext = () => {
+      if (queue.length === 0) {
+        isSpeaking = false;
+        return;
+      }
+      const next = queue.shift();
+      if (next) {
+        isSpeaking = true;
+        window.speechSynthesis.speak(next);
+      }
+    };
+
+    const enqueue = (utter: any) => {
+      const handleNext = () => {
+        isSpeaking = false;
+        playNext();
+      };
+      utter.onend = handleNext;
+      utter.onerror = handleNext;
+      queue.push(utter);
+      if (!isSpeaking) {
+        playNext();
+      }
+    };
+
+    const utter1 = new (globalThis as any).SpeechSynthesisUtterance('Sentence 1');
+    const utter2 = new (globalThis as any).SpeechSynthesisUtterance('Sentence 2');
+
+    // Enqueue sentence 1
+    enqueue(utter1);
+    expect(spokenList).toEqual(['Sentence 1']);
+    expect(isSpeaking).toBe(true);
+    expect(queue.length).toBe(0);
+
+    // Enqueue sentence 2 while sentence 1 is speaking - should be queued, not immediately spoken or cancelled
+    enqueue(utter2);
+    expect(spokenList).toEqual(['Sentence 1']);
+    expect(queue.length).toBe(1);
+
+    // Sentence 1 ends
+    utter1.onend?.();
+    expect(spokenList).toEqual(['Sentence 1', 'Sentence 2']);
+    expect(queue.length).toBe(0);
+
+    // Sentence 2 ends
+    utter2.onend?.();
+    expect(isSpeaking).toBe(false);
+  });
+
   it('streams thought reasoning to thought scratchpad container', () => {
     const thoughtCard = { hidden: true, open: false };
     const thoughtBadge = { textContent: '' };

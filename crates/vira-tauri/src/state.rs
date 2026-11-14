@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -120,6 +121,15 @@ pub struct GetAppStateResponse {
     pub current_subtitle: String,
     pub sample_clock: u64,
     pub current_time_ms: u64,
+}
+
+/// Scheduled subtitle entry synchronized with MasterAudioClock sample playhead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledSubtitle {
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub text: String,
+    pub state: ConversationState,
 }
 
 /// Lock-free atomic conversation state wrapper using `AtomicU8` with CAS transitions.
@@ -261,6 +271,7 @@ pub struct AppState {
     pub turn_lock: Arc<tokio::sync::Mutex<()>>,
     pub recorded_audio: Arc<Mutex<Vec<f32>>>,
     pub mic_task_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    pub scheduled_subtitles: Arc<RwLock<VecDeque<ScheduledSubtitle>>>,
 }
 
 impl AppState {
@@ -308,6 +319,7 @@ impl AppState {
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
             recorded_audio: Arc::new(Mutex::new(Vec::new())),
             mic_task_cancel: Arc::new(Mutex::new(None)),
+            scheduled_subtitles: Arc::new(RwLock::new(VecDeque::new())),
         }
     }
 
@@ -318,7 +330,7 @@ impl AppState {
 
     /// Creates a headless `AppState` configured with a specific event emitter.
     pub fn new_headless_with_emitter(emitter: Arc<dyn AppEventEmitter>) -> Self {
-        let (playback, _) = PlaybackEngine::new_virtual(48000, 96000);
+        let (playback, _) = PlaybackEngine::new_virtual(48000, 720000);
         let clock = playback.clock().clone();
         let pb_sample_rate = playback.sample_rate();
         let (capture, _) = CaptureEngine::new_virtual(16000, 512);
@@ -487,6 +499,8 @@ impl AppState {
         let _ = self.audio_playback.reset_sample_clock();
         self.clock.reset();
         *self.active_visemes.write().unwrap() = Vec::new();
+        self.scheduled_subtitles.write().unwrap().clear();
+        self.emit_subtitle("", ConversationState::Idle);
     }
 
     /// Obtains the current conversational turn epoch.

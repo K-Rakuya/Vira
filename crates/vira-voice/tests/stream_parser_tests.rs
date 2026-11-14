@@ -485,3 +485,134 @@ fn test_stream_parser_think_tag_fragmentation_at_1_byte_boundaries() {
         ParsedStreamEvent::SpeakableText("Cùng bắt đầu nhé!".to_string())
     );
 }
+
+#[test]
+fn test_stream_parser_asterisk_actions_and_emotions() {
+    let mut parser = StreamParser::new();
+    let events = parser.feed("*cười tươi, vẫy tay chào* Xin chào bạn! *gật đầu* Chúc một ngày tốt lành.");
+    assert!(events.contains(&ParsedStreamEvent::Emotion("happy".to_string())));
+    assert!(events.contains(&ParsedStreamEvent::Gesture("wave".to_string())));
+    assert!(events.contains(&ParsedStreamEvent::SpeakableText("Xin chào bạn!".to_string())));
+    assert!(events.contains(&ParsedStreamEvent::Gesture("nod".to_string())));
+    assert!(events.contains(&ParsedStreamEvent::SpeakableText("Chúc một ngày tốt lành.".to_string())));
+
+    // Verify speakable text contains zero asterisks and zero action tags
+    for ev in &events {
+        if let ParsedStreamEvent::SpeakableText(ref text) = ev {
+            assert!(!text.contains('*'));
+            assert!(!text.contains("cười tươi"));
+            assert!(!text.contains("vẫy tay"));
+            assert!(!text.contains("gật đầu"));
+        }
+    }
+}
+
+#[test]
+fn test_stream_parser_parentheses_stage_directions() {
+    let mut parser = StreamParser::new();
+    let events = parser.feed("(nghiêng đầu) Bạn có khỏe không? (cười nhẹ) Tôi rất vui khi được hỗ trợ bạn.");
+    assert!(events.contains(&ParsedStreamEvent::Gesture("tilt".to_string())));
+    assert!(events.contains(&ParsedStreamEvent::SpeakableText("Bạn có khỏe không?".to_string())));
+    assert!(events.contains(&ParsedStreamEvent::Emotion("happy".to_string())));
+    assert!(events.contains(&ParsedStreamEvent::SpeakableText("Tôi rất vui khi được hỗ trợ bạn.".to_string())));
+
+    for ev in &events {
+        if let ParsedStreamEvent::SpeakableText(ref text) = ev {
+            assert!(!text.contains("nghiêng đầu"));
+            assert!(!text.contains("cười nhẹ"));
+        }
+    }
+}
+
+#[test]
+fn test_stream_parser_split_asterisk_and_paren_chunk_fragmentation() {
+    let mut parser = StreamParser::new();
+
+    // Split across chunks: "*vẫy", " tay*", " Xin ", "chào!"
+    let c1 = parser.feed("*vẫy");
+    assert!(c1.is_empty(), "Incomplete '*vẫy' must not be flushed prematurely");
+
+    let c2 = parser.feed(" tay* Xin ");
+    assert_eq!(c2, vec![ParsedStreamEvent::Gesture("wave".to_string())]);
+
+    let c3 = parser.feed("chào bạn! (nghiêng");
+    assert_eq!(c3, vec![ParsedStreamEvent::SpeakableText("Xin chào bạn!".to_string())]);
+
+    let c4 = parser.feed(" đầu) Hôm nay thế nào?");
+    assert_eq!(
+        c4,
+        vec![
+            ParsedStreamEvent::Gesture("tilt".to_string()),
+            ParsedStreamEvent::SpeakableText("Hôm nay thế nào?".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn test_stream_parser_clean_dialogue_zero_stage_directions() {
+    let test_stream = "<thought>Analyzing user question and mood</thought>\
+                       *cười tươi, vẫy tay chào* Xin chào bạn! \
+                       (nghiêng đầu) Rất vui được gặp lại bạn. \
+                       *gật đầu* [happy] Hôm nay chúng ta cùng học tiếp nhé!";
+
+    let mut parser = StreamParser::new();
+    let mut all_events = Vec::new();
+
+    // Stream in random-sized chunks (2, 3, 5 chars)
+    let mut pos = 0;
+    let chars: Vec<char> = test_stream.chars().collect();
+    let step_sizes = [2, 3, 5, 1, 4, 2, 7];
+    let mut step_idx = 0;
+
+    while pos < chars.len() {
+        let step = step_sizes[step_idx % step_sizes.len()];
+        step_idx += 1;
+        let end = (pos + step).min(chars.len());
+        let chunk: String = chars[pos..end].iter().collect();
+        all_events.extend(parser.feed(&chunk));
+        pos = end;
+    }
+    all_events.extend(parser.finish());
+
+    let thoughts: Vec<_> = all_events.iter().filter(|e| e.is_thought()).collect();
+    let emotions: Vec<_> = all_events.iter().filter(|e| e.is_emotion()).collect();
+    let gestures: Vec<_> = all_events.iter().filter(|e| e.is_gesture()).collect();
+    let speakable: Vec<_> = all_events.iter().filter(|e| e.is_speakable()).collect();
+
+    assert_eq!(thoughts.len(), 1);
+    assert_eq!(thoughts[0].as_thought().unwrap(), "Analyzing user question and mood");
+    assert!(emotions.iter().any(|e| e.as_emotion() == Some("happy")));
+    assert!(gestures.iter().any(|g| g.as_gesture() == Some("wave")));
+    assert!(gestures.iter().any(|g| g.as_gesture() == Some("tilt")));
+    assert!(gestures.iter().any(|g| g.as_gesture() == Some("nod")));
+
+    // Strict invariant: Speakable text contains ONLY spoken dialogue with zero thoughts, zero asterisks, and zero stage directions
+    for s in &speakable {
+        let text = s.as_speakable().unwrap();
+        assert!(!text.contains('*'), "Speakable text must not contain asterisks: {text}");
+        assert!(!text.contains('<'), "Speakable text must not contain '<': {text}");
+        assert!(!text.contains('>'), "Speakable text must not contain '>': {text}");
+        assert!(!text.contains('['), "Speakable text must not contain '[': {text}");
+        assert!(!text.contains(']'), "Speakable text must not contain ']': {text}");
+        assert!(!text.contains("cười tươi"), "Speakable text must not contain action 'cười tươi': {text}");
+        assert!(!text.contains("vẫy tay"), "Speakable text must not contain action 'vẫy tay': {text}");
+        assert!(!text.contains("nghiêng đầu"), "Speakable text must not contain action 'nghiêng đầu': {text}");
+        assert!(!text.contains("gật đầu"), "Speakable text must not contain action 'gật đầu': {text}");
+    }
+}
+
+#[test]
+fn test_stream_parser_generative_anatomical_anchors() {
+    let mut parser = StreamParser::new();
+    let stream = "*chống cằm* Để tôi xem. *che miệng cười* Thật thú vị! *đặt tay lên tim* Rất cảm ơn bạn. *day thái dương* Tôi cần suy nghĩ một chút.";
+    let events = parser.feed(stream);
+    let flushed = parser.finish();
+    let all = [events, flushed].concat();
+
+    let gestures: Vec<_> = all.iter().filter_map(|e| e.as_gesture()).collect();
+    assert!(gestures.contains(&"chin_touch"));
+    assert!(gestures.contains(&"mouth_cover"));
+    assert!(gestures.contains(&"hand_on_heart"));
+    assert!(gestures.contains(&"temple_rub"));
+}
+

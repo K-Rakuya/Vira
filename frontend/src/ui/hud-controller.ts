@@ -100,6 +100,8 @@ export class HudController {
   private speechRec: any = null;
   private dueCards: Array<any> = [];
   private currentStudyCard: any = null;
+  private speechQueue: SpeechSynthesisUtterance[] = [];
+  private isSpeakingSpeech = false;
 
   constructor(vrmViewer: VRMViewer) {
     this.vrmViewer = vrmViewer;
@@ -263,11 +265,10 @@ export class HudController {
       }
       if (payload?.text && typeof window !== 'undefined' && 'speechSynthesis' in window) {
         try {
-          window.speechSynthesis.cancel();
           const utter = new SpeechSynthesisUtterance(payload.text);
           utter.lang = payload.language || 'vi-VN';
           utter.rate = Number(payload.rate || 1.0);
-          window.speechSynthesis.speak(utter);
+          this.enqueueSpeech(utter);
         } catch (e) {
           console.warn('Speech synthesis error:', e);
         }
@@ -299,8 +300,8 @@ export class HudController {
           const scale = 1 + Math.min(0.4, rms * 4);
           this.el.btnMic.style.transform = this.isMicActive ? `scale(${scale})` : '';
         }
-        if (payload.barge_in_triggered && typeof window !== 'undefined' && 'speechSynthesis' in window) {
-          window.speechSynthesis.cancel();
+        if (payload.barge_in_triggered) {
+          this.cancelSpeech();
         }
       }
     });
@@ -598,6 +599,49 @@ export class HudController {
     }
   }
 
+  private enqueueSpeech(utter: SpeechSynthesisUtterance): void {
+    const handleNext = () => {
+      this.isSpeakingSpeech = false;
+      this.playNextSpeech();
+    };
+    utter.onend = handleNext;
+    utter.onerror = handleNext;
+    this.speechQueue.push(utter);
+    if (!this.isSpeakingSpeech) {
+      this.playNextSpeech();
+    }
+  }
+
+  private playNextSpeech(): void {
+    if (this.speechQueue.length === 0) {
+      this.isSpeakingSpeech = false;
+      return;
+    }
+    const next = this.speechQueue.shift();
+    if (next && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      this.isSpeakingSpeech = true;
+      try {
+        window.speechSynthesis.speak(next);
+      } catch (e) {
+        console.warn('Speech synthesis speak error:', e);
+        this.isSpeakingSpeech = false;
+        this.playNextSpeech();
+      }
+    }
+  }
+
+  public cancelSpeech(): void {
+    this.speechQueue = [];
+    this.isSpeakingSpeech = false;
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch (e) {
+        console.warn('Speech synthesis cancel error:', e);
+      }
+    }
+  }
+
   public async handleSendMessage(): Promise<void> {
     const text = this.el.chatInput.value.trim();
     if (!text) return;
@@ -617,9 +661,7 @@ export class HudController {
       this.el.thoughtCard.hidden = true;
     }
 
-    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
-    }
+    this.cancelSpeech();
 
     try {
       await TauriBridge.invoke('send_message', { payload: { text } });
@@ -1111,6 +1153,7 @@ export class HudController {
   }
 
   public dispose(): void {
+    this.cancelSpeech();
     for (const unlisten of this.unlisteners) {
       unlisten();
     }

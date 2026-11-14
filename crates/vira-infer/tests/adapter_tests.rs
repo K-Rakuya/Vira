@@ -543,3 +543,66 @@ fn test_kokoro_decode_wav_and_endpoint_config() {
     );
 }
 
+#[tokio::test]
+async fn test_openai_compat_reasoning_content_and_reasoning_deltas() {
+    let lines = vec![
+        serde_json::json!({
+            "id": "cmpl-r1",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "reasoning_content": "Thinking about user question... "
+                }
+            }]
+        }).to_string(),
+        serde_json::json!({
+            "id": "cmpl-r2",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "reasoning": "Step 2: form response."
+                }
+            }]
+        }).to_string(),
+        serde_json::json!({
+            "id": "cmpl-c1",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": "Chào bạn! Tôi có thể giúp gì cho bạn?"
+                }
+            }]
+        }).to_string(),
+        "[DONE]".to_string(),
+    ];
+
+    let transport = Arc::new(MockLlmTransport::new(lines));
+    let adapter = OpenAiCompatLlmAdapter::new(
+        "http://127.0.0.1:8080/v1".to_string(),
+        "deepseek-r1".to_string(),
+        None,
+    )
+    .with_transport(transport);
+
+    let (tx, mut rx) = mpsc::channel(32);
+    let cancel = CancellationToken::new();
+
+    let res = adapter.stream_chat(&[Message::user("Hello")], tx, cancel).await;
+    assert!(res.is_ok());
+
+    let mut chunks = Vec::new();
+    while let Some(chunk) = rx.recv().await {
+        chunks.push(chunk);
+    }
+
+    let thoughts: Vec<_> = chunks.iter().filter_map(|c| c.thought.as_deref()).collect();
+    assert_eq!(thoughts, vec!["Thinking about user question... ", "Step 2: form response."]);
+
+    let speakable: Vec<_> = chunks.iter().map(|c| c.delta.as_str()).filter(|s| !s.is_empty()).collect();
+    assert_eq!(speakable, vec!["Chào bạn!", "Tôi có thể giúp gì cho bạn?"]);
+}
+
+

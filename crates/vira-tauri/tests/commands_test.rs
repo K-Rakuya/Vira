@@ -46,12 +46,18 @@ async fn test_send_message_end_to_end_conversational_cycle() {
     let emitter = Arc::new(MockEventEmitter::new());
     let state = AppState::new_headless_with_emitter(emitter.clone());
 
+    let cancel = CancellationToken::new();
+    let tick_handle = spawn_viseme_tick_loop(state.clone(), cancel.clone());
+
     let payload = SendMessagePayload {
         text: "Xin chào bạn!".to_string(),
     };
 
     let res = handle_send_message(payload, &state).await.expect("turn succeeded");
     assert_eq!(res.status, "completed");
+
+    // Allow viseme tick loop to process subtitle clock
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
     // History verification: user + assistant messages recorded
     let history = state.history.read().await;
@@ -86,6 +92,8 @@ async fn test_send_message_end_to_end_conversational_cycle() {
     assert!(state.audio_playback.is_playing());
 
     // Flush playback and reset to idle
+    cancel.cancel();
+    let _ = tick_handle.await;
     state.audio_playback.flush().unwrap();
     state.force_state(ConversationState::Idle);
     state.emit_subtitle("", ConversationState::Idle);
@@ -1165,6 +1173,105 @@ fn test_binary_viseme_frame_streaming_compatibility() {
     assert_eq!(frame, recovered);
     assert_eq!(recovered.weights().aa, 0.7);
     assert_eq!(recovered.weights().ih, 0.2);
+}
+
+#[tokio::test]
+async fn test_scheduled_subtitles_sample_clock_tracking() {
+    use vira_tauri::state::ScheduledSubtitle;
+
+    let emitter = Arc::new(MockEventEmitter::new());
+    let state = AppState::new_headless_with_emitter(emitter.clone());
+
+    // Schedule 2 sequential sentences:
+    // Sentence 1: samples [0, 48000), text: "Sentence 1"
+    // Sentence 2: samples [48000, 96000), text: "Sentence 2"
+    {
+        let mut subs = state.scheduled_subtitles.write().unwrap();
+        subs.push_back(ScheduledSubtitle {
+            start_sample: 0,
+            end_sample: 48000,
+            text: "Sentence 1".to_string(),
+            state: ConversationState::Speaking,
+        });
+        subs.push_back(ScheduledSubtitle {
+            start_sample: 48000,
+            end_sample: 96000,
+            text: "Sentence 2".to_string(),
+            state: ConversationState::Speaking,
+        });
+    }
+
+    // Enqueue 96000 samples so audio_playback.is_playing() is true
+    let _ = state.audio_playback.enqueue_samples(&[0.1; 96000]);
+    state.force_state(ConversationState::Speaking);
+
+    let cancel = CancellationToken::new();
+    let tick_handle = spawn_viseme_tick_loop(state.clone(), cancel.clone());
+
+    // Allow tick loop to evaluate at playhead = 0
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    // Subtitle must be "Sentence 1"
+    assert_eq!(*state.current_subtitle.read().unwrap(), "Sentence 1");
+
+    // Advance clock to sample 50000 (past sentence 1, into sentence 2)
+    state.clock.set_sample(50000);
+    tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+
+    // Subtitle must have advanced to "Sentence 2" and sentence 1 popped
+    assert_eq!(*state.current_subtitle.read().unwrap(), "Sentence 2");
+    {
+        let subs = state.scheduled_subtitles.read().unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].text, "Sentence 2");
+    }
+
+    // Advance clock to sample 96000 and flush buffer (playback done)
+    state.clock.set_sample(96000);
+    state.audio_playback.flush().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+    // Queue must be empty, state Idle, and empty subtitle emitted
+    {
+        let subs = state.scheduled_subtitles.read().unwrap();
+        assert!(subs.is_empty(), "All scheduled subtitles should be popped past end_sample");
+    }
+    assert_eq!(*state.current_subtitle.read().unwrap(), "");
+
+    cancel.cancel();
+    let _ = tick_handle.await;
+}
+
+#[tokio::test]
+async fn test_cancel_active_speech_clears_scheduled_subtitles_and_resets_clock() {
+    use vira_tauri::state::ScheduledSubtitle;
+
+    let emitter = Arc::new(MockEventEmitter::new());
+    let state = AppState::new_headless_with_emitter(emitter.clone());
+
+    // Pre-populate scheduled subtitles
+    {
+        let mut subs = state.scheduled_subtitles.write().unwrap();
+        subs.push_back(ScheduledSubtitle {
+            start_sample: 1000,
+            end_sample: 5000,
+            text: "Interrupted speech".to_string(),
+            state: ConversationState::Speaking,
+        });
+    }
+    state.clock.set_sample(2500);
+    *state.current_subtitle.write().unwrap() = "Interrupted speech".to_string();
+
+    // Trigger instant barge-in cancellation
+    state.cancel_active_speech();
+
+    // Subtitles cleared
+    assert!(state.scheduled_subtitles.read().unwrap().is_empty());
+    // Clock reset to 0
+    assert_eq!(state.clock.current_sample(), 0);
+    assert_eq!(state.audio_playback.get_sample_clock(), 0);
+    // Subtitle cleared to empty string
+    assert_eq!(*state.current_subtitle.read().unwrap(), "");
 }
 
 

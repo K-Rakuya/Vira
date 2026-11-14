@@ -9,7 +9,543 @@ pub const DEFAULT_GESTURES: &[&str] = &[
     "wave", "nod", "think", "idea", "praise", "bow", "clap", "shake", "shrug", "point",
     "salute", "cheer", "laugh", "sigh", "tilt", "wink", "dance", "confused", "idle",
     "explain", "shy", "encourage", "surprise", "relax",
+    "chin_touch", "mouth_cover", "hand_on_heart", "temple_rub", "embrace", "rub_hands",
+    "lean_forward", "lean_back",
 ];
+
+/// Converts Vietnamese accented characters to plain ASCII lowercase characters.
+pub fn strip_vietnamese_diacritics(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let ch = match c.to_ascii_lowercase() {
+            'à' | 'á' | 'ả' | 'ã' | 'ạ' | 'ă' | 'ằ' | 'ắ' | 'ẳ' | 'ẵ' | 'ặ' | 'â' | 'ầ' | 'ấ' | 'ẩ' | 'ẫ' | 'ậ' => 'a',
+            'è' | 'é' | 'ẻ' | 'ẽ' | 'ẹ' | 'ê' | 'ề' | 'ế' | 'ể' | 'ễ' | 'ệ' => 'e',
+            'ì' | 'í' | 'ỉ' | 'ĩ' | 'ị' => 'i',
+            'ò' | 'ó' | 'ỏ' | 'õ' | 'ọ' | 'ô' | 'ồ' | 'ố' | 'ổ' | 'ỗ' | 'ộ' | 'ơ' | 'ờ' | 'ớ' | 'ở' | 'ỡ' | 'ợ' => 'o',
+            'ù' | 'ú' | 'ủ' | 'ũ' | 'ụ' | 'ư' | 'ừ' | 'ứ' | 'ử' | 'ữ' | 'ự' => 'u',
+            'ỳ' | 'ý' | 'ỷ' | 'ỹ' | 'ỵ' => 'y',
+            'đ' => 'd',
+            other => other,
+        };
+        out.push(ch);
+    }
+    out
+}
+
+fn is_word_boundary(text: &str, start: usize, len: usize) -> bool {
+    if start > 0 {
+        if let Some(prev) = text[..start].chars().last() {
+            if prev.is_alphanumeric() {
+                return false;
+            }
+        }
+    }
+    let end = start + len;
+    if end < text.len() {
+        if let Some(next) = text[end..].chars().next() {
+            if next.is_alphanumeric() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+struct GesturePattern {
+    target: &'static str,
+    patterns: &'static [&'static str],
+}
+
+static GESTURE_PATTERNS: &[GesturePattern] = &[
+    GesturePattern {
+        target: "wave",
+        patterns: &[
+            "vẫy tay chào", "vay tay chao",
+            "vẫy tay", "vay tay",
+            "vẫy chào", "vay chao",
+            "vẫy", "vay",
+            "chào bạn", "chao ban",
+            "chào", "chao",
+            "xin chào", "xin chao",
+            "wave", "waving", "waves", "greet", "greeting", "hello", "salute",
+        ],
+    },
+    GesturePattern {
+        target: "nod",
+        patterns: &[
+            "gật đầu", "gat dau",
+            "gật nhẹ", "gat nhe",
+            "gật", "gat",
+            "đồng ý", "dong y",
+            "tán thành", "tan thanh",
+            "nod", "nodding", "nods",
+        ],
+    },
+    GesturePattern {
+        target: "shake",
+        patterns: &[
+            "lắc đầu", "lac dau",
+            "lắc nhẹ", "lac nhe",
+            "lắc", "lac",
+            "từ chối", "tu choi",
+            "xua tay", "xua tay",
+            "shake", "shaking", "shakes",
+        ],
+    },
+    GesturePattern {
+        target: "chin_touch",
+        patterns: &[
+            "chống cằm", "chong cam",
+            "áp tay lên má", "ap tay len ma",
+            "xoa cằm", "xoa cam",
+            "sờ cằm", "so cam",
+            "đỡ cằm", "do cam",
+            "chin touch", "touch chin", "hand on chin", "hand on cheek",
+        ],
+    },
+    GesturePattern {
+        target: "mouth_cover",
+        patterns: &[
+            "che miệng cười", "che mieng cuoi",
+            "che miệng", "che mieng",
+            "bịt miệng", "bit mieng",
+            "lấy tay che miệng", "lay tay che mieng",
+            "mouth cover", "cover mouth", "covers mouth",
+        ],
+    },
+    GesturePattern {
+        target: "hand_on_heart",
+        patterns: &[
+            "đặt tay lên tim", "dat tay len tim",
+            "đặt tay lên ngực", "dat tay len nguc",
+            "chắp tay trước ngực", "chap tay truoc nguc",
+            "ôm ngực", "om nguc",
+            "hand on heart", "hand on chest", "hands on heart", "hands clasped",
+        ],
+    },
+    GesturePattern {
+        target: "temple_rub",
+        patterns: &[
+            "day thái dương", "day thai duong",
+            "xoa thái dương", "xoa thai duong",
+            "chỉ trán", "chi tran",
+            "xoa trán", "xoa tran",
+            "day trán", "day tran",
+            "temple rub", "rub temple", "rubbing temples",
+        ],
+    },
+    GesturePattern {
+        target: "embrace",
+        patterns: &[
+            "đưa hai tay ra trước muốn ôm", "dua hai tay ra truoc muon om",
+            "đưa tay muốn ôm", "dua tay muon om",
+            "muốn ôm", "muon om",
+            "dang tay", "dang hai tay",
+            "ôm", "om",
+            "embrace", "hug", "open arms",
+        ],
+    },
+    GesturePattern {
+        target: "rub_hands",
+        patterns: &[
+            "xoa hai bàn tay", "xoa hai ban tay",
+            "xoa bàn tay", "xoa ban tay",
+            "xoa hai tay", "xoa hai tay",
+            "xoa tay", "xoa tay",
+            "gõ nhịp", "go nhip",
+            "rub hands", "rubbing hands",
+        ],
+    },
+    GesturePattern {
+        target: "lean_forward",
+        patterns: &[
+            "cúi lại gần", "cui lai gan",
+            "ngả người về phía trước", "nga nguoi ve phia truoc",
+            "nghiêng người tới", "nghieng nguoi toi",
+            "tiến lại gần", "tien lai gan",
+            "lean forward", "leaning forward", "leans forward", "lean in",
+        ],
+    },
+    GesturePattern {
+        target: "lean_back",
+        patterns: &[
+            "ngả người ra sau", "nga nguoi ra sau",
+            "tựa lưng ra sau", "tua lung ra sau",
+            "dựa lưng", "dua lung",
+            "ngả lưng", "nga lung",
+            "lean back", "leaning back", "leans back",
+        ],
+    },
+    GesturePattern {
+        target: "tilt",
+        patterns: &[
+            "nghiêng đầu", "nghieng dau",
+            "nghiêng cổ", "nghieng co",
+            "nghiêng", "nghieng",
+            "tilt", "tilts", "tilting", "head tilt",
+        ],
+    },
+    GesturePattern {
+        target: "shrug",
+        patterns: &[
+            "nhún vai", "nhun vai",
+            "nhún", "nhun",
+            "shrug", "shrugs", "shrugging",
+        ],
+    },
+    GesturePattern {
+        target: "think",
+        patterns: &[
+            "suy nghĩ", "suy nghi",
+            "ngẫm nghĩ", "ngam nghi",
+            "trầm ngâm", "tram ngam",
+            "suy ngẫm", "suy ngam",
+            "băn khoăn", "ban khoan",
+            "think", "thinking", "thinks", "ponder", "pondering",
+        ],
+    },
+    GesturePattern {
+        target: "idea",
+        patterns: &[
+            "ý tưởng", "y tuong",
+            "sáng tạo", "sang tao",
+            "lóe sáng", "loe sang",
+            "nhớ ra", "nho ra",
+            "idea", "eureka",
+        ],
+    },
+    GesturePattern {
+        target: "praise",
+        patterns: &[
+            "khen ngợi", "khen ngoi",
+            "tán thưởng", "tan thuong",
+            "hoan hô", "hoan ho",
+            "khen", "khen",
+            "praise", "cheer", "cheering",
+        ],
+    },
+    GesturePattern {
+        target: "clap",
+        patterns: &[
+            "vỗ tay", "vo tay",
+            "clap", "clapping", "claps",
+        ],
+    },
+    GesturePattern {
+        target: "bow",
+        patterns: &[
+            "cúi đầu", "cui dau",
+            "cúi chào", "cui chao",
+            "cúi mình", "cui minh",
+            "khom lưng", "khom lung",
+            "bow", "bowing", "bows",
+        ],
+    },
+    GesturePattern {
+        target: "shy",
+        patterns: &[
+            "ngượng ngùng", "nguong ngung",
+            "ngượng", "nguong",
+            "e ấp", "e ap",
+            "xấu hổ", "xau ho",
+            "bẽn lẽn", "ben len",
+            "đỏ mặt", "do mat",
+            "gãi đầu", "gai dau",
+            "shy", "blush", "blushing",
+        ],
+    },
+    GesturePattern {
+        target: "encourage",
+        patterns: &[
+            "động viên", "dong vien",
+            "cổ vũ", "co vu",
+            "quyết tâm", "quyet tam",
+            "cố lên", "co len",
+            "khích lệ", "khich le",
+            "encourage", "fist pump",
+        ],
+    },
+    GesturePattern {
+        target: "point",
+        patterns: &[
+            "chỉ tay", "chi tay",
+            "chỉ hướng", "chi huong",
+            "chỉ vào", "chi vao",
+            "chỉ", "chi",
+            "point", "pointing", "points",
+        ],
+    },
+    GesturePattern {
+        target: "explain",
+        patterns: &[
+            "giải thích", "giai thich",
+            "trình bày", "trinh bay",
+            "diễn giải", "dien giai",
+            "explain", "explaining", "explains",
+        ],
+    },
+    GesturePattern {
+        target: "surprise",
+        patterns: &[
+            "ngạc nhiên", "ngac nhien",
+            "bất ngờ", "bat ngo",
+            "giật mình", "giat minh",
+            "tròn mắt", "tron mat",
+            "surprise", "surprised", "shocked", "gasp",
+        ],
+    },
+    GesturePattern {
+        target: "relax",
+        patterns: &[
+            "thư giãn", "thu gian",
+            "thả lỏng", "tha long",
+            "thở phào", "tho phao",
+            "thở dài", "tho dai",
+            "relax", "relaxing", "sigh", "sighs",
+        ],
+    },
+];
+
+struct EmotionPattern {
+    target: &'static str,
+    patterns: &'static [&'static str],
+}
+
+static EMOTION_PATTERNS: &[EmotionPattern] = &[
+    EmotionPattern {
+        target: "happy",
+        patterns: &[
+            "cười tươi", "cuoi tuoi",
+            "cười nhẹ", "cuoi nhe",
+            "mỉm cười", "mim cuoi",
+            "cười rạng rỡ", "cuoi rang ro",
+            "cười khúc khích", "cuoi khuc khich",
+            "cười", "cuoi",
+            "vui vẻ", "vui ve",
+            "hân hoan", "han hoan",
+            "hạnh phúc", "hanh phuc",
+            "vui", "vui",
+            "smile", "smiles", "smiling",
+            "laugh", "laughs", "laughing",
+            "chuckle", "chuckles",
+            "happy", "grin", "grinning", "cheerful",
+        ],
+    },
+    EmotionPattern {
+        target: "surprised",
+        patterns: &[
+            "ngạc nhiên", "ngac nhien",
+            "bất ngờ", "bat ngo",
+            "giật mình", "giat minh",
+            "trố mắt", "tro mat",
+            "surprised", "surprise", "astonished",
+        ],
+    },
+    EmotionPattern {
+        target: "sad",
+        patterns: &[
+            "buồn bã", "buon ba",
+            "thất vọng", "that vong",
+            "buồn", "buon",
+            "khóc", "khoc",
+            "rưng rưng", "rung rung",
+            "ủ rũ", "u ru",
+            "sad", "crying", "tears", "unhappy",
+        ],
+    },
+    EmotionPattern {
+        target: "angry",
+        patterns: &[
+            "tức giận", "tuc gian",
+            "giận dữ", "gian du",
+            "cau mày", "cau may",
+            "bực mình", "buc minh",
+            "khó chịu", "kho chiu",
+            "angry", "frown", "frowning", "mad",
+        ],
+    },
+    EmotionPattern {
+        target: "relaxed",
+        patterns: &[
+            "thư giãn", "thu gian",
+            "thả lỏng", "tha long",
+            "nhẹ nhõm", "nhe nhom",
+            "thở phào", "tho phao",
+            "thở dài", "tho dai",
+            "relaxed", "calm", "relieved",
+        ],
+    },
+    EmotionPattern {
+        target: "neutral",
+        patterns: &[
+            "bình thường", "binh thuong",
+            "thản nhiên", "than nhien",
+            "neutral",
+        ],
+    },
+];
+
+/// Extracts semantic gesture and emotion triggers from enclosed action/stage direction text.
+///
+/// Supports Vietnamese and English natural language descriptions, e.g.:
+/// - `*cười tươi, vẫy tay chào*` -> Emotion("happy"), Gesture("wave")
+/// - `*gật đầu*` -> Gesture("nod")
+/// - `(nghiêng đầu)` -> Gesture("tilt")
+/// - `(cười nhẹ)` -> Emotion("happy")
+pub fn extract_semantic_triggers(text: &str) -> Vec<ParsedStreamEvent> {
+    extract_semantic_triggers_internal(text, None)
+}
+
+fn extract_semantic_triggers_internal(
+    text: &str,
+    custom: Option<&HashSet<String>>,
+) -> Vec<ParsedStreamEvent> {
+    let raw_lower = text.trim().to_ascii_lowercase();
+    if raw_lower.is_empty() {
+        return Vec::new();
+    }
+
+    let inner_clean = raw_lower
+        .trim_matches(|c: char| c == '*' || c == '(' || c == ')' || c == '[' || c == ']')
+        .trim();
+    if DEFAULT_GESTURES.contains(&inner_clean) || custom.is_some_and(|c| c.contains(inner_clean)) {
+        return vec![ParsedStreamEvent::Gesture(inner_clean.to_string())];
+    }
+    if matches!(
+        inner_clean,
+        "neutral" | "happy" | "sad" | "angry" | "surprised" | "relaxed"
+    ) {
+        return vec![ParsedStreamEvent::Emotion(inner_clean.to_string())];
+    }
+
+    let norm_lower = strip_vietnamese_diacritics(&raw_lower);
+    let mut matches = Vec::new();
+
+    // Scan emotions
+    for ep in EMOTION_PATTERNS {
+        for pat in ep.patterns {
+            let mut search_from = 0;
+            while let Some(rel) = norm_lower[search_from..].find(pat) {
+                let idx = search_from + rel;
+                if is_word_boundary(&norm_lower, idx, pat.len()) {
+                    matches.push((idx, ParsedStreamEvent::Emotion(ep.target.to_string())));
+                    break;
+                }
+                search_from = idx + pat.len().max(1);
+            }
+        }
+    }
+
+    // Scan gestures
+    for gp in GESTURE_PATTERNS {
+        for pat in gp.patterns {
+            let mut search_from = 0;
+            while let Some(rel) = norm_lower[search_from..].find(pat) {
+                let idx = search_from + rel;
+                if is_word_boundary(&norm_lower, idx, pat.len()) {
+                    matches.push((idx, ParsedStreamEvent::Gesture(gp.target.to_string())));
+                    break;
+                }
+                search_from = idx + pat.len().max(1);
+            }
+        }
+    }
+
+    // Scan custom gestures
+    if let Some(cg) = custom {
+        for g in cg {
+            if let Some(idx) = norm_lower.find(g.as_str()) {
+                if is_word_boundary(&norm_lower, idx, g.len()) {
+                    matches.push((idx, ParsedStreamEvent::Gesture(g.clone())));
+                }
+            }
+        }
+    }
+
+    matches.sort_by_key(|(idx, _)| *idx);
+
+    let mut seen_emotions = HashSet::new();
+    let mut seen_gestures = HashSet::new();
+    let mut result = Vec::new();
+
+    for (_pos, event) in matches {
+        match event {
+            ParsedStreamEvent::Emotion(ref e) => {
+                if seen_emotions.insert(e.clone()) {
+                    result.push(event);
+                }
+            }
+            ParsedStreamEvent::Gesture(ref g) => {
+                if seen_gestures.insert(g.clone()) {
+                    result.push(event);
+                }
+            }
+            other => result.push(other),
+        }
+    }
+
+    result
+}
+
+fn is_parenthesized_stage_direction(
+    inner: &str,
+    last_char: Option<char>,
+    custom_gestures: &HashSet<String>,
+) -> bool {
+    if last_char == Some(']') {
+        return false;
+    }
+
+    let trimmed = inner.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('#')
+    {
+        return false;
+    }
+
+    if trimmed
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '.' || c == ',' || c == '-' || c == '+')
+    {
+        return false;
+    }
+
+    let is_all_caps = trimmed
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c == '.' || c == '/' || c == '-');
+    if is_all_caps && trimmed.len() <= 8 {
+        return false;
+    }
+
+    let triggers = extract_semantic_triggers_internal(trimmed, Some(custom_gestures));
+    if !triggers.is_empty() {
+        return true;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let norm = strip_vietnamese_diacritics(&lower);
+    const ACTION_KEYWORDS: &[&str] = &[
+        "cuoi", "nhin", "noi", "tho", "im lang", "buoc", "ngap ngung",
+        "hit", "ngam", "chay", "dung", "ngoi", "nam", "quay", "nhay",
+        "whisper", "sigh", "pause", "gasp", "look", "turn", "step", "walk",
+        "stand", "sit", "lie", "blink", "murmur", "mutter",
+    ];
+    for kw in ACTION_KEYWORDS {
+        if let Some(pos) = norm.find(kw) {
+            if is_word_boundary(&norm, pos, kw.len()) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
 
 /// Events produced during streaming LLM parsing for avatar animation and voice synthesis.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,10 +643,17 @@ impl ParsedStreamEvent {
     }
 }
 
+enum TagCandidate {
+    Thought(&'static str, usize),
+    Bracket,
+    Asterisk,
+    Paren,
+}
+
 /// Streaming tag parser and sentence chunker for LangIns LLM output.
 ///
-/// Strips inline avatar control tags (`[emotion:...]`, `[gesture:...]`, and shortened
-/// gestures like `[wave]`), emits them immediately for UI avatar state, and streams clean
+/// Strips inline avatar control tags (`[emotion:...]`, `[gesture:...]`, `*...*`, `(...)`, and `<think>...</think>`),
+/// emits extracted gestures and emotions immediately for avatar kinematics, and streams clean
 /// grammatical sentence chunks to the TTS queue to minimize Time-to-First-Audio.
 #[derive(Debug, Clone)]
 pub struct StreamParser {
@@ -242,13 +785,11 @@ impl StreamParser {
                 }
             }
 
-            // 2. Locate potential tags: [ for gestures/emotions and <thought> / <think>
-            let bracket_open = self.pending_raw.find('[');
+            // 2. Locate potential tags: thoughts, brackets, asterisks, parentheses
             let lower_raw = self.pending_raw.to_ascii_lowercase();
-            let thought_open = lower_raw.find("<thought>").map(|idx| (idx, "thought", 9));
-            let think_open = lower_raw.find("<think>").map(|idx| (idx, "think", 7));
 
-            // Select earliest matching complete tag
+            let thought_open = lower_raw.find("<thought>").map(|idx| (idx, TagCandidate::Thought("thought", 9)));
+            let think_open = lower_raw.find("<think>").map(|idx| (idx, TagCandidate::Thought("think", 7)));
             let earliest_thought = match (thought_open, think_open) {
                 (Some(a), Some(b)) => if a.0 <= b.0 { Some(a) } else { Some(b) },
                 (Some(a), None) => Some(a),
@@ -256,33 +797,44 @@ impl StreamParser {
                 (None, None) => None,
             };
 
-            // 3. Check for incomplete '<' opening tag fragment at or near end of pending_raw
+            // Incomplete '<' opening tag guard
             let incomplete_lt = lower_raw.rfind('<').and_then(|lt_idx| {
                 let tail = &lower_raw[lt_idx..];
                 let is_prefix = "<thought>".starts_with(tail) || "<think>".starts_with(tail);
-                if is_prefix && earliest_thought.is_none_or(|(t_idx, _, _)| lt_idx < t_idx) {
+                if is_prefix && earliest_thought.as_ref().is_none_or(|(t_idx, _)| lt_idx < *t_idx) {
                     Some(lt_idx)
                 } else {
                     None
                 }
             });
 
-            if let Some(lt_idx) = incomplete_lt {
-                // Bracket tag before incomplete tag?
-                if let Some(b_idx) = bracket_open {
-                    if b_idx < lt_idx {
-                        // Bracket tag is earlier, handle it below
-                    } else {
-                        // Flush text before incomplete '<' tag and wait for tag completion
-                        if lt_idx > 0 {
-                            let text_before = self.pending_raw[..lt_idx].to_string();
-                            self.push_text_to_chunker(&text_before, &mut events);
-                            self.pending_raw.drain(..lt_idx);
-                        }
-                        break;
-                    }
+            let bracket_open = self.pending_raw.find('[').map(|idx| (idx, TagCandidate::Bracket));
+            let asterisk_open = self.pending_raw.find('*').map(|idx| (idx, TagCandidate::Asterisk));
+            let paren_open = self.pending_raw.find('(').and_then(|idx| {
+                let is_after_bracket = if idx > 0 {
+                    self.pending_raw.as_bytes()[idx - 1] == b']'
                 } else {
-                    // Flush text before incomplete '<' tag and wait for tag completion
+                    self.last_char == Some(']')
+                };
+                if is_after_bracket {
+                    None
+                } else {
+                    Some((idx, TagCandidate::Paren))
+                }
+            });
+
+            let earliest_candidate_idx = [
+                earliest_thought.as_ref().map(|(i, _)| *i),
+                bracket_open.as_ref().map(|(i, _)| *i),
+                asterisk_open.as_ref().map(|(i, _)| *i),
+                paren_open.as_ref().map(|(i, _)| *i),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
+
+            if let Some(lt_idx) = incomplete_lt {
+                if earliest_candidate_idx.is_none_or(|c_idx| lt_idx < c_idx) {
                     if lt_idx > 0 {
                         let text_before = self.pending_raw[..lt_idx].to_string();
                         self.push_text_to_chunker(&text_before, &mut events);
@@ -292,49 +844,42 @@ impl StreamParser {
                 }
             }
 
-            match (bracket_open, earliest_thought) {
-                (None, None) => {
-                    // No open brackets or thought tags present; entire pending text is speakable
-                    let text = std::mem::take(&mut self.pending_raw);
-                    self.push_text_to_chunker(&text, &mut events);
-                    break;
-                }
-                (Some(b_idx), Some((t_idx, tag_name, tag_len))) if t_idx < b_idx => {
-                    // Thought opening tag appears before bracket tag
-                    if t_idx > 0 {
-                        let text_before = self.pending_raw[..t_idx].to_string();
-                        self.push_text_to_chunker(&text_before, &mut events);
-                        self.pending_raw.drain(..t_idx);
-                    }
-                    self.pending_raw.drain(..tag_len);
-                    self.in_thought = Some(tag_name.to_string());
-                    continue;
-                }
-                (None, Some((t_idx, tag_name, tag_len))) => {
-                    // Thought opening tag present with no bracket
-                    if t_idx > 0 {
-                        let text_before = self.pending_raw[..t_idx].to_string();
-                        self.push_text_to_chunker(&text_before, &mut events);
-                        self.pending_raw.drain(..t_idx);
-                    }
-                    self.pending_raw.drain(..tag_len);
-                    self.in_thought = Some(tag_name.to_string());
-                    continue;
-                }
-                (Some(idx), _) => {
-                    // Bracket tag appears first
-                    if idx > 0 {
-                        let text_before = self.pending_raw[..idx].to_string();
-                        self.push_text_to_chunker(&text_before, &mut events);
-                        self.pending_raw.drain(..idx);
-                    }
+            if earliest_candidate_idx.is_none() {
+                let text = std::mem::take(&mut self.pending_raw);
+                self.push_text_to_chunker(&text, &mut events);
+                break;
+            }
 
-                    // Now self.pending_raw starts with '['
+            let earliest = [
+                earliest_thought.map(|(i, t)| (i, t)),
+                bracket_open.map(|(i, t)| (i, t)),
+                asterisk_open.map(|(i, t)| (i, t)),
+                paren_open.map(|(i, t)| (i, t)),
+            ]
+            .into_iter()
+            .flatten()
+            .min_by_key(|(i, _)| *i)
+            .unwrap();
+
+            let (tag_idx, tag_type) = earliest;
+
+            if tag_idx > 0 {
+                let text_before = self.pending_raw[..tag_idx].to_string();
+                self.push_text_to_chunker(&text_before, &mut events);
+                self.pending_raw.drain(..tag_idx);
+            }
+
+            match tag_type {
+                TagCandidate::Thought(tag_name, tag_len) => {
+                    self.pending_raw.drain(..tag_len);
+                    self.in_thought = Some(tag_name.to_string());
+                    continue;
+                }
+                TagCandidate::Bracket => {
                     let close_idx = self.pending_raw.find(']');
                     match close_idx {
                         Some(c_idx) => {
                             let inner_slice = &self.pending_raw[1..c_idx];
-                            // If there is another '[' before ']', the first '[' is plain text
                             if let Some(second_open) = inner_slice.find('[') {
                                 let non_tag = self.pending_raw[..1 + second_open].to_string();
                                 self.pending_raw.drain(..1 + second_open);
@@ -365,17 +910,21 @@ impl StreamParser {
                                 events.push(ParsedStreamEvent::Emotion(inner.to_ascii_lowercase()));
                                 self.on_tag_removed(c_idx);
                             } else {
-                                // Not a tag (e.g. citation `[1]` or markdown `[Link]`). Treat as regular text.
-                                let non_tag = self.pending_raw[..=c_idx].to_string();
-                                self.pending_raw.drain(..=c_idx);
-                                self.push_text_to_chunker(&non_tag, &mut events);
+                                let triggers = extract_semantic_triggers_internal(inner, Some(&self.custom_gestures));
+                                if !triggers.is_empty() {
+                                    events.extend(triggers);
+                                    self.on_tag_removed(c_idx);
+                                } else {
+                                    let non_tag = self.pending_raw[..=c_idx].to_string();
+                                    self.pending_raw.drain(..=c_idx);
+                                    self.push_text_to_chunker(&non_tag, &mut events);
+                                }
                             }
                         }
                         None => {
-                            // Incomplete bracket tag (e.g. `[em` or `[gesture:wa`).
                             let slice = &self.pending_raw[1..];
                             let has_invalid_tag_char = slice.chars().any(|c| {
-                                matches!(c, '.' | '!' | '?' | ',' | ';' | '\n' | '\r' | '(' | ')' | '{' | '}')
+                                matches!(c, '.' | '!' | '?' | ';' | '\n' | '\r' | '(' | ')' | '{' | '}')
                             });
                             let has_second_open = slice.contains('[');
 
@@ -388,7 +937,76 @@ impl StreamParser {
                                 self.pending_raw.drain(..1 + second_open);
                                 self.push_text_to_chunker(&not_tag, &mut events);
                             }
-                            // Otherwise wait for the closing bracket in subsequent chunks
+                            break;
+                        }
+                    }
+                }
+                TagCandidate::Asterisk => {
+                    let asterisks_open_count = self.pending_raw.chars().take_while(|&c| c == '*').count();
+                    let close_offset = self.pending_raw[asterisks_open_count..].find('*');
+                    match close_offset {
+                        Some(c_off) => {
+                            let inner_slice = &self.pending_raw[asterisks_open_count..asterisks_open_count + c_off];
+                            if inner_slice.contains('\n') || inner_slice.contains('\r') {
+                                let non_tag = self.pending_raw[..asterisks_open_count].to_string();
+                                self.pending_raw.drain(..asterisks_open_count);
+                                self.push_text_to_chunker(&non_tag, &mut events);
+                                continue;
+                            }
+
+                            let rest_slice = &self.pending_raw[asterisks_open_count + c_off..];
+                            let asterisks_close_count = rest_slice.chars().take_while(|&c| c == '*').count();
+                            let total_end_idx = asterisks_open_count + c_off + asterisks_close_count - 1;
+
+                            let inner = inner_slice.trim();
+                            if !inner.is_empty() {
+                                let triggers = extract_semantic_triggers_internal(inner, Some(&self.custom_gestures));
+                                events.extend(triggers);
+                            }
+                            self.on_tag_removed(total_end_idx);
+                            continue;
+                        }
+                        None => {
+                            let slice = &self.pending_raw[asterisks_open_count..];
+                            if slice.contains('\n') || slice.contains('\r') || slice.contains('<') || slice.contains('>') || slice.contains('{') || slice.contains('}') || self.pending_raw.len() > 120 {
+                                let non_tag = std::mem::take(&mut self.pending_raw);
+                                self.push_text_to_chunker(&non_tag, &mut events);
+                            }
+                            break;
+                        }
+                    }
+                }
+                TagCandidate::Paren => {
+                    let close_idx = self.pending_raw.find(')');
+                    match close_idx {
+                        Some(c_idx) => {
+                            let inner_slice = &self.pending_raw[1..c_idx];
+                            if inner_slice.contains('\n') || inner_slice.contains('\r') {
+                                let non_tag = self.pending_raw[..1].to_string();
+                                self.pending_raw.drain(..1);
+                                self.push_text_to_chunker(&non_tag, &mut events);
+                                continue;
+                            }
+
+                            let inner = inner_slice.trim();
+                            if is_parenthesized_stage_direction(inner, self.last_char, &self.custom_gestures) {
+                                let triggers = extract_semantic_triggers_internal(inner, Some(&self.custom_gestures));
+                                events.extend(triggers);
+                                self.on_tag_removed(c_idx);
+                                continue;
+                            } else {
+                                let non_tag = self.pending_raw[..=c_idx].to_string();
+                                self.pending_raw.drain(..=c_idx);
+                                self.push_text_to_chunker(&non_tag, &mut events);
+                                continue;
+                            }
+                        }
+                        None => {
+                            let slice = &self.pending_raw[1..];
+                            if slice.contains('\n') || slice.contains('\r') || self.pending_raw.len() > 120 {
+                                let non_tag = std::mem::take(&mut self.pending_raw);
+                                self.push_text_to_chunker(&non_tag, &mut events);
+                            }
                             break;
                         }
                     }
@@ -411,9 +1029,23 @@ impl StreamParser {
             }
         } else if !self.pending_raw.is_empty() {
             let leftover = std::mem::take(&mut self.pending_raw);
-            let chunks = self.chunker.feed(&leftover);
-            for chunk in chunks {
-                events.push(ParsedStreamEvent::SpeakableText(chunk));
+            if leftover.starts_with('*') && leftover.ends_with('*') && leftover.len() >= 2 {
+                let inner = leftover.trim_matches('*').trim();
+                if !inner.is_empty() {
+                    let triggers = extract_semantic_triggers_internal(inner, Some(&self.custom_gestures));
+                    events.extend(triggers);
+                }
+            } else if leftover.starts_with('(') && is_parenthesized_stage_direction(&leftover[1..], self.last_char, &self.custom_gestures) {
+                let inner = leftover.trim_matches(|c| c == '(' || c == ')').trim();
+                if !inner.is_empty() {
+                    let triggers = extract_semantic_triggers_internal(inner, Some(&self.custom_gestures));
+                    events.extend(triggers);
+                }
+            } else {
+                let chunks = self.chunker.feed(&leftover);
+                for chunk in chunks {
+                    events.push(ParsedStreamEvent::SpeakableText(chunk));
+                }
             }
         }
 
@@ -453,7 +1085,6 @@ mod tests {
         assert!(s.is_speakable());
         assert_eq!(s.as_speakable(), Some("Hello!"));
 
-        // Serde test
         let json = serde_json::to_string(&e).unwrap();
         let parsed: ParsedStreamEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(e, parsed);
@@ -498,5 +1129,87 @@ mod tests {
 
         assert!(!events.is_empty());
         assert!(events.iter().any(|e| matches!(e, ParsedStreamEvent::SpeakableText(_))));
+    }
+
+    #[test]
+    fn test_stream_parser_asterisks_actions_and_emotions() {
+        let mut parser = StreamParser::new();
+        let events = parser.feed("*cười tươi, vẫy tay chào* Xin chào bạn!");
+        assert_eq!(
+            events,
+            vec![
+                ParsedStreamEvent::Emotion("happy".to_string()),
+                ParsedStreamEvent::Gesture("wave".to_string()),
+                ParsedStreamEvent::SpeakableText("Xin chào bạn!".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_stream_parser_parentheses_gestures_and_emotions() {
+        let mut parser = StreamParser::new();
+        let events = parser.feed("(nghiêng đầu) Bạn có khỏe không? (cười nhẹ)");
+        let flushed = parser.finish();
+        let all = [events, flushed].concat();
+
+        assert_eq!(
+            all,
+            vec![
+                ParsedStreamEvent::Gesture("tilt".to_string()),
+                ParsedStreamEvent::SpeakableText("Bạn có khỏe không?".to_string()),
+                ParsedStreamEvent::Emotion("happy".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_stream_parser_split_asterisk_lookahead() {
+        let mut parser = StreamParser::new();
+        let e1 = parser.feed("*vẫy");
+        assert!(e1.is_empty(), "Incomplete '*vẫy' must not be flushed prematurely");
+
+        let e2 = parser.feed(" tay* Xin chào!");
+        assert_eq!(
+            e2,
+            vec![
+                ParsedStreamEvent::Gesture("wave".to_string()),
+                ParsedStreamEvent::SpeakableText("Xin chào!".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_stream_parser_split_paren_lookahead() {
+        let mut parser = StreamParser::new();
+        let e1 = parser.feed("(nghiêng");
+        assert!(e1.is_empty(), "Incomplete '(nghiêng' must not be flushed prematurely");
+
+        let e2 = parser.feed(" đầu) Rất vui được gặp bạn.");
+        assert_eq!(
+            e2,
+            vec![
+                ParsedStreamEvent::Gesture("tilt".to_string()),
+                ParsedStreamEvent::SpeakableText("Rất vui được gặp bạn.".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_stream_parser_anatomical_spatial_anchors() {
+        let mut parser = StreamParser::new();
+        let events = parser.feed("*chống cằm* Tôi đang suy nghĩ. *che miệng cười* Bạn thật hài hước! *đặt tay lên tim* Cảm ơn bạn.");
+        assert!(events.contains(&ParsedStreamEvent::Gesture("chin_touch".to_string())));
+        assert!(events.contains(&ParsedStreamEvent::Gesture("mouth_cover".to_string())));
+        assert!(events.contains(&ParsedStreamEvent::Emotion("happy".to_string())));
+        assert!(events.contains(&ParsedStreamEvent::Gesture("hand_on_heart".to_string())));
+
+        for ev in &events {
+            if let ParsedStreamEvent::SpeakableText(ref text) = ev {
+                assert!(!text.contains('*'));
+                assert!(!text.contains("chống cằm"));
+                assert!(!text.contains("che miệng"));
+                assert!(!text.contains("đặt tay lên"));
+            }
+        }
     }
 }

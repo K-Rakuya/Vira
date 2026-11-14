@@ -4,6 +4,7 @@ use tokio_util::sync::CancellationToken;
 
 use vira_domain::message::Message;
 use vira_domain::state::{CharacterEmotion, ConversationState};
+use vira_domain::viseme::VisemeWeights;
 use vira_learn::SpacedRepetitionPort;
 use vira_ports::AgentPort;
 use vira_ports::tts::TimedViseme;
@@ -13,7 +14,7 @@ use crate::events::{
     EmotionPayload, GesturePayload, SpeakSentencePayload, ThoughtPayload, EVENT_EMOTION,
     EVENT_GESTURE, EVENT_SPEAK_SENTENCE, EVENT_THOUGHT,
 };
-use crate::state::{AppSettingsPayload, AppState, GetAppStateResponse, TutorMode};
+use crate::state::{AppSettingsPayload, AppState, GetAppStateResponse, ScheduledSubtitle, TutorMode};
 
 /// Payload sent from frontend webview to send a user message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,10 +206,32 @@ async fn process_speakable_sentence(
         let chunk_dur = chunk_dur_from_samples.max(chunk_dur_from_visemes);
 
         let _ = state.transition_state(ConversationState::Speaking);
-        state.emit_subtitle(clean, ConversationState::Speaking);
+
+        let current_clock = state.audio_playback.get_sample_clock();
+        let currently_buffered = state.audio_playback.buffered_samples() as u64;
 
         let enqueue_res = state.audio_playback.enqueue_samples(&samples);
-        let has_native_audio = enqueue_res.is_ok() && !samples.is_empty();
+        let enqueued_samples = match enqueue_res {
+            Ok(count) => count,
+            Err(_) => 0,
+        };
+        let has_native_audio = enqueued_samples > 0;
+
+        let mut subs = state.scheduled_subtitles.write().unwrap();
+        let start_sample = if let Some(last) = subs.back() {
+            last.end_sample.max(current_clock)
+        } else {
+            current_clock + currently_buffered
+        };
+        let end_sample = start_sample + enqueued_samples as u64;
+
+        subs.push_back(ScheduledSubtitle {
+            start_sample,
+            end_sample,
+            text: clean.to_string(),
+            state: ConversationState::Speaking,
+        });
+        drop(subs);
 
         // Emit speak_sentence for synchronized audible speech in frontend
         let tutor_mode = *state.tutor_mode.read().unwrap();
@@ -1427,4 +1450,94 @@ pub async fn execute_tool(
         payload.parameters,
     );
     state.agent.execute_tool(request).await.map_err(|e| e.to_string())
+}
+
+/// Spawns a dedicated 60Hz (~16.6ms) background loop that synchronizes Viseme blendshape
+/// weights and scheduled subtitles against the `MasterAudioClock` playhead and pushes them to the avatar stage.
+pub fn spawn_viseme_tick_loop(
+    state: AppState,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(16));
+        let mut was_active = false;
+        while !cancel.is_cancelled() {
+            interval.tick().await;
+
+            let is_playing = state.audio_playback.is_playing();
+            let is_gen = state.is_generating();
+            let current_conv_state = state.get_conversation_state();
+            let playhead = state.audio_playback.get_sample_clock();
+
+            // 1. Subtitle clock scheduling:
+            let mut sub_to_emit: Option<(String, ConversationState)> = None;
+            {
+                let mut subs = state.scheduled_subtitles.write().unwrap();
+                while let Some(front) = subs.front() {
+                    if playhead >= front.end_sample {
+                        subs.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+
+                if let Some(active) = subs.front() {
+                    if active.start_sample <= playhead && playhead < active.end_sample {
+                        let cur = state.current_subtitle.read().unwrap().clone();
+                        if cur != active.text {
+                            sub_to_emit = Some((active.text.clone(), active.state));
+                        }
+                    }
+                } else if !is_playing && !is_gen {
+                    // When queue is empty and playback is done, emit empty subtitle
+                    let cur = state.current_subtitle.read().unwrap().clone();
+                    if !cur.is_empty() {
+                        sub_to_emit = Some((String::new(), ConversationState::Idle));
+                    }
+                }
+            }
+
+            if let Some((text, sub_state)) = sub_to_emit {
+                state.emit_subtitle(&text, sub_state);
+            }
+
+            // 2. Detect speech completion: audio buffer drained, no active LLM/TTS generation,
+            // and state is still in Speaking.
+            if current_conv_state == ConversationState::Speaking && !is_playing && !is_gen {
+                let _ = state.transition_state(ConversationState::Idle);
+                let cur = state.current_subtitle.read().unwrap().clone();
+                if !cur.is_empty() {
+                    state.emit_subtitle("", ConversationState::Idle);
+                }
+                *state.active_visemes.write().unwrap() = Vec::new();
+                state.emit_viseme_tick(VisemeWeights::zero(), false);
+                was_active = false;
+                continue;
+            }
+
+            let is_active = is_playing || is_gen || current_conv_state == ConversationState::Speaking;
+
+            if !is_active {
+                if was_active {
+                    // Emit one zero viseme tick to reset the avatar mouth when entering idle
+                    state.emit_viseme_tick(VisemeWeights::zero(), false);
+                    was_active = false;
+                }
+                // Adaptive Viseme Gating: pause sending IPC ticks until audio playback or generation resumes
+                continue;
+            }
+
+            was_active = true;
+            let now_ms = state.clock.current_time_ms();
+
+            let weights = if is_playing {
+                let visemes = state.active_visemes.read().unwrap();
+                state.clock.sample_viseme_at_ms(&visemes, now_ms)
+            } else {
+                VisemeWeights::zero()
+            };
+
+            state.emit_viseme_tick(weights, is_playing);
+        }
+    })
 }
