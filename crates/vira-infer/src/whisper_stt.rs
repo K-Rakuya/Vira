@@ -25,6 +25,8 @@ pub struct WhisperConfig {
     pub vad_energy_threshold: f32,
     /// Optional path to Whisper ONNX model weights.
     pub model_path: Option<PathBuf>,
+    /// Optional HTTP endpoint URL for local Whisper server (e.g. "http://127.0.0.1:8080/v1/audio/transcriptions").
+    pub endpoint: Option<String>,
 }
 
 impl Default for WhisperConfig {
@@ -34,8 +36,46 @@ impl Default for WhisperConfig {
             language: "vi".to_string(),
             vad_energy_threshold: DEFAULT_VAD_THRESHOLD,
             model_path: None,
+            endpoint: None,
         }
     }
+}
+
+/// Encodes 32-bit floating-point mono audio samples to standard 16-bit PCM WAV in memory.
+pub fn encode_wav_mono_16bit(samples: &[f32], sample_rate: u32) -> Vec<u8> {
+    let num_samples = samples.len();
+    let data_bytes = (num_samples * 2) as u32;
+    let file_size_minus_8 = 36 + data_bytes;
+    let mut buf = Vec::with_capacity(44 + num_samples * 2);
+
+    // RIFF chunk
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&file_size_minus_8.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+
+    // fmt subchunk
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes()); // subchunk1 size
+    buf.extend_from_slice(&1u16.to_le_bytes());  // audio format (1 = PCM)
+    buf.extend_from_slice(&1u16.to_le_bytes());  // num channels (1 = mono)
+    buf.extend_from_slice(&sample_rate.to_le_bytes()); // sample rate
+    let byte_rate = sample_rate * 2;
+    buf.extend_from_slice(&byte_rate.to_le_bytes()); // byte rate
+    buf.extend_from_slice(&2u16.to_le_bytes()); // block align
+    buf.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+
+    // data subchunk
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_bytes.to_le_bytes());
+
+    // PCM samples
+    for &sample in samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        let val = (clamped * 32767.0).round() as i16;
+        buf.extend_from_slice(&val.to_le_bytes());
+    }
+
+    buf
 }
 
 /// Execution backend for Whisper STT.
@@ -44,6 +84,11 @@ pub enum WhisperBackend {
     /// In-memory virtual fallback engine for offline testing and CI.
     Virtual {
         mock_responses: Arc<std::sync::Mutex<Vec<String>>>,
+    },
+    /// Local neural Whisper HTTP server endpoint.
+    Http {
+        endpoint: String,
+        mock_fallback: Arc<std::sync::Mutex<Vec<String>>>,
     },
     /// ONNX Runtime model loaded from disk.
     Onnx {
@@ -111,6 +156,18 @@ impl WhisperSttAdapter {
         Self { config, backend }
     }
 
+    /// Configures the adapter to communicate with a local neural Whisper HTTP server endpoint.
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        let ep = endpoint.into();
+        self.config.endpoint = Some(ep.clone());
+        let mock_fallback = self.mock_queue();
+        self.backend = WhisperBackend::Http {
+            endpoint: ep,
+            mock_fallback,
+        };
+        self
+    }
+
     /// Sets target language code.
     pub fn with_language(mut self, language: impl Into<String>) -> Self {
         self.config.language = language.into();
@@ -146,32 +203,56 @@ impl WhisperSttAdapter {
 
     /// Enqueues a mock transcription for testing.
     pub fn push_mock_response(&self, text: impl Into<String>) {
-        if let WhisperBackend::Virtual { ref mock_responses } = self.backend {
-            mock_responses.lock().unwrap().push(text.into());
+        let val = text.into();
+        match self.backend {
+            WhisperBackend::Virtual { ref mock_responses } => {
+                mock_responses.lock().unwrap().push(val);
+            }
+            WhisperBackend::Http { ref mock_fallback, .. } => {
+                mock_fallback.lock().unwrap().push(val);
+            }
+            _ => {}
         }
     }
 
     fn mock_queue(&self) -> Arc<std::sync::Mutex<Vec<String>>> {
         match self.backend {
             WhisperBackend::Virtual { ref mock_responses } => Arc::clone(mock_responses),
+            WhisperBackend::Http { ref mock_fallback, .. } => Arc::clone(mock_fallback),
             WhisperBackend::Onnx { .. } => Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
     fn pop_mock_text(&self) -> Option<String> {
-        if let WhisperBackend::Virtual { ref mock_responses } = self.backend {
-            let mut lock = mock_responses.lock().unwrap();
-            if !lock.is_empty() {
-                return Some(lock.remove(0));
+        match self.backend {
+            WhisperBackend::Virtual { ref mock_responses } => {
+                let mut lock = mock_responses.lock().unwrap();
+                if !lock.is_empty() {
+                    return Some(lock.remove(0));
+                }
             }
+            WhisperBackend::Http { ref mock_fallback, .. } => {
+                let mut lock = mock_fallback.lock().unwrap();
+                if !lock.is_empty() {
+                    return Some(lock.remove(0));
+                }
+            }
+            _ => {}
         }
         None
     }
 
     fn peek_mock_text(&self) -> Option<String> {
-        if let WhisperBackend::Virtual { ref mock_responses } = self.backend {
-            let lock = mock_responses.lock().unwrap();
-            return lock.first().cloned();
+        match self.backend {
+            WhisperBackend::Virtual { ref mock_responses } => {
+                let lock = mock_responses.lock().unwrap();
+                return lock.first().cloned();
+            }
+            WhisperBackend::Http { ref mock_fallback, .. } => {
+                let lock = mock_fallback.lock().unwrap();
+                return lock.first().cloned();
+            }
+            _ => {}
         }
         None
     }
@@ -286,12 +367,48 @@ impl SttPort for WhisperSttAdapter {
                 .with_duration_ms(duration_ms));
         }
 
-        // Virtual backend transcription
+        // Virtual mock backend transcription (takes precedence for deterministic tests)
         if let Some(mock_text) = self.pop_mock_text() {
             return Ok(SttEvent::final_result(mock_text)
                 .with_confidence(0.96)
                 .with_language(&self.config.language)
                 .with_duration_ms(duration_ms));
+        }
+
+        // Local neural Whisper server dispatch
+        if let Some(ref endpoint) = self.config.endpoint {
+            let wav_bytes = encode_wav_mono_16bit(samples, sample_rate);
+            let part = reqwest::multipart::Part::bytes(wav_bytes)
+                .file_name("audio.wav")
+                .mime_str("audio/wav")
+                .unwrap_or_else(|_| reqwest::multipart::Part::bytes(vec![]));
+
+            let form = reqwest::multipart::Form::new()
+                .part("file", part)
+                .text("model", "whisper-1")
+                .text("language", self.config.language.clone());
+
+            let client = reqwest::Client::builder()
+                .tcp_nodelay(true)
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .unwrap_or_default();
+
+            if let Ok(resp) = client.post(endpoint).multipart(form).send().await {
+                if resp.status().is_success() {
+                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                        if let Some(text) = json.get("text").and_then(|t| t.as_str()) {
+                            let trimmed = text.trim();
+                            if !trimmed.is_empty() {
+                                return Ok(SttEvent::final_result(trimmed)
+                                    .with_confidence(0.95)
+                                    .with_language(&self.config.language)
+                                    .with_duration_ms(duration_ms));
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Default speech detected event when energy present and no mock queued

@@ -100,26 +100,92 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Normalizes a float vector in-place to unit L2 norm (||v||_2 = 1.0).
+/// Normalizes a float vector in-place to unit L2 norm (||v||_2 = 1.0) using 8-way unrolled SIMD.
 /// If vector is empty or has zero norm, it remains unchanged.
 pub fn normalize_vector(v: &mut [f32]) {
-    let mut sum_sq = 0.0f32;
-    for &x in v.iter() {
+    let len = v.len();
+    if len == 0 {
+        return;
+    }
+    let chunks = len / 8;
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let mut s4 = 0.0f32;
+    let mut s5 = 0.0f32;
+    let mut s6 = 0.0f32;
+    let mut s7 = 0.0f32;
+
+    for i in 0..chunks {
+        let base = i * 8;
+        let x0 = v[base];
+        let x1 = v[base + 1];
+        let x2 = v[base + 2];
+        let x3 = v[base + 3];
+        let x4 = v[base + 4];
+        let x5 = v[base + 5];
+        let x6 = v[base + 6];
+        let x7 = v[base + 7];
+        s0 += x0 * x0;
+        s1 += x1 * x1;
+        s2 += x2 * x2;
+        s3 += x3 * x3;
+        s4 += x4 * x4;
+        s5 += x5 * x5;
+        s6 += x6 * x6;
+        s7 += x7 * x7;
+    }
+    let mut sum_sq = (s0 + s1) + (s2 + s3) + (s4 + s5) + (s6 + s7);
+    for &x in &v[chunks * 8..] {
         sum_sq += x * x;
     }
+
     if sum_sq > f32::EPSILON && sum_sq.is_finite() {
         let inv = 1.0 / sum_sq.sqrt();
-        for x in v.iter_mut() {
+        for i in 0..chunks {
+            let base = i * 8;
+            v[base] *= inv;
+            v[base + 1] *= inv;
+            v[base + 2] *= inv;
+            v[base + 3] *= inv;
+            v[base + 4] *= inv;
+            v[base + 5] *= inv;
+            v[base + 6] *= inv;
+            v[base + 7] *= inv;
+        }
+        for x in &mut v[chunks * 8..] {
             *x *= inv;
         }
     }
 }
 
-/// Computes inner dot product between two float vectors.
+/// Computes inner dot product between two float vectors using 8-way unrolled SIMD loop.
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len().min(b.len());
-    let mut sum = 0.0f32;
-    for i in 0..len {
+    let chunks = len / 8;
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    let mut s4 = 0.0f32;
+    let mut s5 = 0.0f32;
+    let mut s6 = 0.0f32;
+    let mut s7 = 0.0f32;
+
+    for i in 0..chunks {
+        let base = i * 8;
+        s0 += a[base] * b[base];
+        s1 += a[base + 1] * b[base + 1];
+        s2 += a[base + 2] * b[base + 2];
+        s3 += a[base + 3] * b[base + 3];
+        s4 += a[base + 4] * b[base + 4];
+        s5 += a[base + 5] * b[base + 5];
+        s6 += a[base + 6] * b[base + 6];
+        s7 += a[base + 7] * b[base + 7];
+    }
+    let mut sum = (s0 + s1) + (s2 + s3) + (s4 + s5) + (s6 + s7);
+    for i in (chunks * 8)..len {
         sum += a[i] * b[i];
     }
     sum

@@ -507,3 +507,39 @@ async fn test_whisper_rms_large_buffer_precision() {
     assert!((rms - 0.5).abs() < 1e-4, "RMS of constant 0.5 must be 0.5");
     assert!(!adapter.is_onnx_active());
 }
+
+#[test]
+fn test_whisper_encode_wav_and_endpoint_config() {
+    let samples = vec![0.0f32, 0.5, -0.5, 1.0, -1.0];
+    let wav = vira_infer::whisper_stt::encode_wav_mono_16bit(&samples, 16000);
+    assert_eq!(&wav[0..4], b"RIFF");
+    assert_eq!(&wav[8..12], b"WAVE");
+    assert_eq!(&wav[12..16], b"fmt ");
+    assert_eq!(&wav[36..40], b"data");
+    assert_eq!(wav.len(), 44 + samples.len() * 2);
+
+    let adapter = WhisperSttAdapter::new().with_endpoint("http://127.0.0.1:8080/v1/audio/transcriptions");
+    assert_eq!(
+        adapter.config().endpoint.as_deref(),
+        Some("http://127.0.0.1:8080/v1/audio/transcriptions")
+    );
+}
+
+#[test]
+fn test_kokoro_decode_wav_and_endpoint_config() {
+    let samples = vec![0.0f32, 0.25, -0.25, 0.5, -0.5];
+    let wav = vira_infer::whisper_stt::encode_wav_mono_16bit(&samples, 24000);
+    let (decoded, rate) = vira_infer::kokoro_tts::decode_wav_or_raw_pcm16(&wav, 24000);
+    assert_eq!(rate, 24000);
+    assert_eq!(decoded.len(), samples.len());
+    for (s_orig, s_dec) in samples.iter().zip(decoded.iter()) {
+        assert!((s_orig - s_dec).abs() < 1e-3);
+    }
+
+    let adapter = KokoroTtsAdapter::new().with_endpoint("http://127.0.0.1:8880/v1/audio/speech");
+    assert_eq!(
+        adapter.config().endpoint.as_deref(),
+        Some("http://127.0.0.1:8880/v1/audio/speech")
+    );
+}
+

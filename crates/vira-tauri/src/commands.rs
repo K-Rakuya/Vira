@@ -164,7 +164,7 @@ async fn process_speakable_sentence(
     }
     full_assistant_text.push_str(clean);
 
-    let tts_out = match state.tts.synthesize(clean).await {
+    let tts_out = match state.get_tts().synthesize(clean).await {
         Ok(out) => out,
         Err(_) => return true,
     };
@@ -861,7 +861,7 @@ pub async fn handle_toggle_mic(
 
         // Transcribe voice input if enough audio was recorded (>= 100ms)
         if sample_rate > 0 && samples.len() >= (sample_rate as usize / 10) {
-            let stt = state.stt.clone();
+            let stt = state.get_stt();
             let state_clone = state.clone();
             tokio::spawn(async move {
                 if let Ok(stt_event) = stt.transcribe_slice(&samples, sample_rate).await {
@@ -914,6 +914,42 @@ pub async fn handle_save_settings(
             endpoint, model, api_key,
         ));
         state.set_dynamic_llm(new_llm);
+    }
+
+    // Dynamic reconfiguration of active TTS endpoint & voice
+    if settings.tts_endpoint.is_some()
+        || settings.tts_voice.is_some()
+        || settings.tts_speed.is_some()
+    {
+        let pb_rate = state.audio_playback.sample_rate();
+        let mut tts = vira_infer::kokoro_tts::KokoroTtsAdapter::new().with_sample_rate(pb_rate);
+        if let Some(ref voice) = settings.tts_voice {
+            tts = tts.with_voice(voice);
+        }
+        if let Some(speed) = settings.tts_speed {
+            tts = tts.with_speed(speed);
+        }
+        if let Some(ref ep) = settings.tts_endpoint {
+            tts = tts.with_endpoint(ep);
+        }
+        state.set_dynamic_tts(std::sync::Arc::new(tts));
+    }
+
+    // Dynamic reconfiguration of active STT endpoint & language
+    if settings.stt_endpoint.is_some() || settings.stt_model.is_some() {
+        let mut stt = vira_infer::whisper_stt::WhisperSttAdapter::new();
+        let tutor_mode = *state.tutor_mode.read().unwrap();
+        let lang = match tutor_mode {
+            TutorMode::English => "en",
+            TutorMode::Japanese => "ja",
+            TutorMode::Vietnamese => "vi",
+            TutorMode::GeneralAssistant => "vi",
+        };
+        stt = stt.with_language(lang);
+        if let Some(ref ep) = settings.stt_endpoint {
+            stt = stt.with_endpoint(ep);
+        }
+        state.set_dynamic_stt(std::sync::Arc::new(stt));
     }
 
     // Persist to local SQLite store

@@ -105,6 +105,8 @@ pub struct AppSettingsPayload {
     pub rag_enabled: Option<bool>,
     pub system_prompt: Option<String>,
     pub temperature: Option<f32>,
+    pub tts_endpoint: Option<String>,
+    pub stt_endpoint: Option<String>,
 }
 
 /// Comprehensive state snapshot returned by `get_app_state`.
@@ -127,7 +129,9 @@ pub struct AppState {
     pub llm: Arc<dyn LlmPort>,
     pub dynamic_llm: Arc<RwLock<Option<Arc<dyn LlmPort>>>>,
     pub tts: Arc<dyn TtsPort>,
+    pub dynamic_tts: Arc<RwLock<Option<Arc<dyn TtsPort>>>>,
     pub stt: Arc<dyn SttPort>,
+    pub dynamic_stt: Arc<RwLock<Option<Arc<dyn SttPort>>>>,
     pub audio_playback: Arc<dyn AudioPlaybackPort>,
     pub audio_capture: Arc<dyn AudioCapturePort>,
     pub rag: Arc<HybridRagEngine>,
@@ -171,7 +175,9 @@ impl AppState {
             llm,
             dynamic_llm: Arc::new(RwLock::new(None)),
             tts,
+            dynamic_tts: Arc::new(RwLock::new(None)),
             stt,
+            dynamic_stt: Arc::new(RwLock::new(None)),
             audio_playback,
             audio_capture,
             rag,
@@ -260,6 +266,32 @@ impl AppState {
     /// Dynamically reconfigures the active LLM instance.
     pub fn set_dynamic_llm(&self, llm: Arc<dyn LlmPort>) {
         *self.dynamic_llm.write().unwrap() = Some(llm);
+    }
+
+    /// Obtains the active TTS port (either dynamically reconfigured or initial fallback).
+    pub fn get_tts(&self) -> Arc<dyn TtsPort> {
+        if let Some(ref dynamic) = *self.dynamic_tts.read().unwrap() {
+            return dynamic.clone();
+        }
+        self.tts.clone()
+    }
+
+    /// Dynamically reconfigures the active TTS instance.
+    pub fn set_dynamic_tts(&self, tts: Arc<dyn TtsPort>) {
+        *self.dynamic_tts.write().unwrap() = Some(tts);
+    }
+
+    /// Obtains the active STT port (either dynamically reconfigured or initial fallback).
+    pub fn get_stt(&self) -> Arc<dyn SttPort> {
+        if let Some(ref dynamic) = *self.dynamic_stt.read().unwrap() {
+            return dynamic.clone();
+        }
+        self.stt.clone()
+    }
+
+    /// Dynamically reconfigures the active STT instance.
+    pub fn set_dynamic_stt(&self, stt: Arc<dyn SttPort>) {
+        *self.dynamic_stt.write().unwrap() = Some(stt);
     }
 
     /// Returns a copy of the recorded microphone audio samples.

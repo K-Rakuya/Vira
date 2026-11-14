@@ -31,6 +31,8 @@ pub struct KokoroConfig {
     pub voices_path: Option<PathBuf>,
     /// Chunk size in milliseconds for streaming synthesis (default 50ms).
     pub chunk_ms: u64,
+    /// Optional HTTP endpoint URL for local neural Kokoro TTS server (e.g. "http://127.0.0.1:8880/v1/audio/speech").
+    pub endpoint: Option<String>,
 }
 
 impl Default for KokoroConfig {
@@ -42,8 +44,48 @@ impl Default for KokoroConfig {
             model_path: None,
             voices_path: None,
             chunk_ms: 50,
+            endpoint: None,
         }
     }
+}
+
+/// Decodes in-memory WAV or raw 16-bit PCM buffer into floating-point audio samples [-1.0, 1.0].
+#[allow(clippy::chunks_exact_to_as_chunks)]
+pub fn decode_wav_or_raw_pcm16(bytes: &[u8], expected_rate: u32) -> (Vec<f32>, u32) {
+    if bytes.starts_with(b"RIFF") && bytes.len() >= 44 && &bytes[8..12] == b"WAVE" {
+        let rate = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+        let mut idx = 12;
+        while idx + 8 <= bytes.len() {
+            if &bytes[idx..idx + 4] == b"data" {
+                let data_len = u32::from_le_bytes([
+                    bytes[idx + 4],
+                    bytes[idx + 5],
+                    bytes[idx + 6],
+                    bytes[idx + 7],
+                ]) as usize;
+                let audio_start = idx + 8;
+                let audio_end = (audio_start + data_len).min(bytes.len());
+                let samples = bytes[audio_start..audio_end]
+                    .chunks_exact(2)
+                    .map(|c| {
+                        let val = i16::from_le_bytes([c[0], c[1]]);
+                        val as f32 / 32767.0
+                    })
+                    .collect();
+                return (samples, if rate > 0 { rate } else { expected_rate });
+            }
+            idx += 1;
+        }
+    }
+
+    let samples = bytes
+        .chunks_exact(2)
+        .map(|c| {
+            let val = i16::from_le_bytes([c[0], c[1]]);
+            val as f32 / 32767.0
+        })
+        .collect();
+    (samples, expected_rate)
 }
 
 /// Execution backend for Kokoro TTS.
@@ -53,6 +95,10 @@ pub enum KokoroBackend {
     VirtualFallback,
     /// Native CPU synthesis with natural harmonic overtones and formant mapping.
     RustNative,
+    /// Local neural Kokoro HTTP server endpoint.
+    Http {
+        endpoint: String,
+    },
     /// ONNX Runtime model loaded from disk (with automatic fallback if file missing).
     Onnx {
         model_path: PathBuf,
@@ -146,6 +192,14 @@ impl KokoroTtsAdapter {
         };
 
         Self { config, backend }
+    }
+
+    /// Configures the adapter to communicate with a local neural Kokoro HTTP server endpoint.
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        let ep = endpoint.into();
+        self.config.endpoint = Some(ep.clone());
+        self.backend = KokoroBackend::Http { endpoint: ep };
+        self
     }
 
     /// Sets the active voice profile (e.g. "af_sarah", "am_adam", "vi_vn").
@@ -342,6 +396,75 @@ impl KokoroTtsAdapter {
 
         (samples, visemes)
     }
+
+    /// Generates smooth 60Hz TimedViseme timeline matching a given target duration in milliseconds.
+    pub fn generate_visemes_for_duration(&self, text: &str, total_duration_ms: u64) -> Vec<TimedViseme> {
+        let clean = strip_tags(text);
+        let trimmed = clean.trim();
+        if trimmed.is_empty() || total_duration_ms == 0 {
+            return vec![TimedViseme::zero(0)];
+        }
+
+        let chars: Vec<char> = trimmed.chars().collect();
+        let num_chars = chars.len().max(1);
+        let ms_per_char = (total_duration_ms as f64 / num_chars as f64).max(10.0);
+
+        let mut visemes = Vec::new();
+        let mut current_weights = VisemeWeights::zero();
+        let frame_step_ms = VISEME_TICK_INTERVAL_MS;
+        let mut t = 0u64;
+
+        while t <= total_duration_ms {
+            let char_idx = ((t as f64 / ms_per_char).floor() as usize).min(num_chars - 1);
+            let (target, _) = Self::char_to_viseme_target(chars[char_idx]);
+            current_weights = current_weights.lerp(&target, 0.4);
+            visemes.push(TimedViseme::new(t, current_weights.clamped()));
+            t += frame_step_ms;
+        }
+
+        visemes
+    }
+
+    /// Asynchronously synthesizes audio and 60Hz visemes, utilizing neural HTTP endpoint if configured,
+    /// or falling back to native harmonic synthesis.
+    pub async fn synthesize_neural_or_fallback(&self, text: &str) -> (Vec<f32>, Vec<TimedViseme>, u32) {
+        let clean = strip_tags(text);
+        let trimmed = clean.trim();
+        if trimmed.is_empty() {
+            return (Vec::new(), vec![TimedViseme::zero(0)], self.config.sample_rate);
+        }
+
+        if let Some(ref endpoint) = self.config.endpoint {
+            let body = serde_json::json!({
+                "input": trimmed,
+                "voice": self.config.voice,
+                "speed": self.config.speed,
+                "model": "kokoro",
+                "response_format": "wav"
+            });
+            let client = reqwest::Client::builder()
+                .tcp_nodelay(true)
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .unwrap_or_default();
+
+            if let Ok(resp) = client.post(endpoint).json(&body).send().await {
+                if resp.status().is_success() {
+                    if let Ok(bytes) = resp.bytes().await {
+                        let (samples, rate) = decode_wav_or_raw_pcm16(&bytes, self.config.sample_rate);
+                        if !samples.is_empty() {
+                            let duration_ms = (samples.len() as u64 * 1000) / rate as u64;
+                            let visemes = self.generate_visemes_for_duration(trimmed, duration_ms);
+                            return (samples, visemes, rate);
+                        }
+                    }
+                }
+            }
+        }
+
+        let (samples, visemes) = self.generate_audio_and_visemes(text);
+        (samples, visemes, self.config.sample_rate)
+    }
 }
 
 #[async_trait]
@@ -356,13 +479,12 @@ impl TtsPort for KokoroTtsAdapter {
             return Err(TtsError::Cancelled);
         }
 
-        let (samples, visemes) = self.generate_audio_and_visemes(text);
+        let (samples, visemes, sample_rate) = self.synthesize_neural_or_fallback(text).await;
         if samples.is_empty() {
             let _ = sender.send(TtsStreamEvent::Done).await;
             return Ok(());
         }
 
-        let sample_rate = self.config.sample_rate;
         let chunk_size = ((self.config.chunk_ms as f64 / 1000.0) * sample_rate as f64) as usize;
         let chunk_size = chunk_size.max(480); // At least 20ms chunk
 
@@ -416,8 +538,8 @@ impl TtsPort for KokoroTtsAdapter {
     }
 
     async fn synthesize(&self, text: &str) -> Result<TtsOutput, TtsError> {
-        let (samples, visemes) = self.generate_audio_and_visemes(text);
-        Ok(TtsOutput::new(samples, self.config.sample_rate, visemes))
+        let (samples, visemes, sample_rate) = self.synthesize_neural_or_fallback(text).await;
+        Ok(TtsOutput::new(samples, sample_rate, visemes))
     }
 
     fn sample_rate(&self) -> u32 {

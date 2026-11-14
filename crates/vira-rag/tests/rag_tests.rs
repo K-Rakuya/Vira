@@ -354,3 +354,22 @@ fn test_top_k_min_heap_selection_accuracy() {
     assert!(hits[0].score > hits[1].score);
     assert!(hits[1].score > 0.85);
 }
+
+#[test]
+fn test_simd_dot_product_performance_and_accuracy() {
+    let a: Vec<f32> = (0..384).map(|i| (i as f32 * 0.01).sin()).collect();
+    let b: Vec<f32> = (0..384).map(|i| (i as f32 * 0.02).cos()).collect();
+    let start = std::time::Instant::now();
+    let mut sum = 0.0;
+    for _ in 0..10_000 {
+        sum += vira_rag::vector_store::dot_product(&a, &b);
+    }
+    let elapsed = start.elapsed();
+    assert!(sum.is_finite());
+    assert!(
+        elapsed.as_millis() < 50,
+        "10,000 384-d dot products should finish in < 50ms, took {:?}",
+        elapsed
+    );
+}
+

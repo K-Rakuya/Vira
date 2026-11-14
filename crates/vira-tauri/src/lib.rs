@@ -196,6 +196,32 @@ pub fn run() {
                             ));
                             state_for_init.set_dynamic_llm(new_llm);
                         }
+
+                        if saved_settings.tts_endpoint.is_some()
+                            || saved_settings.tts_voice.is_some()
+                            || saved_settings.tts_speed.is_some()
+                        {
+                            let mut tts = KokoroTtsAdapter::new().with_sample_rate(pb_sample_rate);
+                            if let Some(ref voice) = saved_settings.tts_voice {
+                                tts = tts.with_voice(voice);
+                            }
+                            if let Some(speed) = saved_settings.tts_speed {
+                                tts = tts.with_speed(speed);
+                            }
+                            if let Some(ref ep) = saved_settings.tts_endpoint {
+                                tts = tts.with_endpoint(ep);
+                            }
+                            state_for_init.set_dynamic_tts(Arc::new(tts));
+                        }
+
+                        if saved_settings.stt_endpoint.is_some() {
+                            let mut stt = WhisperSttAdapter::new();
+                            if let Some(ref ep) = saved_settings.stt_endpoint {
+                                stt = stt.with_endpoint(ep);
+                            }
+                            state_for_init.set_dynamic_stt(Arc::new(stt));
+                        }
+
                         *state_for_init.settings.write().unwrap() = saved_settings;
                     }
                 }
