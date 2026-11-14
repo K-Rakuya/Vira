@@ -829,5 +829,17 @@ fn test_stream_parser_secondary_safety_filter_direct() {
     let s6 = sanitize_speakable_text("Đoạn trước. *(Vira hơi lùi lại một chút vì", &gestures, &mut events);
     assert_eq!(s6.trim(), "Đoạn trước.");
     assert!(events.contains(&ParsedStreamEvent::Gesture("lean_back".to_string())));
+
+    // 7. Markdown bold and technical terms preserved without asterisks
+    events.clear();
+    let s7 = sanitize_speakable_text(
+        "Nếu chúng ta nói về **ứng dụng**, thì đây là **vận hành thực tế**.",
+        &gestures,
+        &mut events,
+    );
+    assert_eq!(
+        s7.trim(),
+        "Nếu chúng ta nói về ứng dụng, thì đây là vận hành thực tế."
+    );
 }
 

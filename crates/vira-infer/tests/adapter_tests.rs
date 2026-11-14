@@ -585,6 +585,7 @@ async fn test_openai_compat_reasoning_content_and_reasoning_deltas() {
         "deepseek-r1".to_string(),
         None,
     )
+    .with_streaming_mode(StreamingMode::SentenceChunked)
     .with_transport(transport);
 
     let (tx, mut rx) = mpsc::channel(32);

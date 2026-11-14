@@ -359,8 +359,18 @@ pub async fn execute_conversation_turn(
     let _ = state.store.save_message("default_session", &user_msg).await;
 
     // 5. Build conversation history with tutor system prompt if not present
-    let mut history_snapshot = state.history.read().await.clone();
+    let raw_history = state.history.read().await.clone();
     let tutor_mode = *state.tutor_mode.read().unwrap();
+
+    // 5a. Sliding Context Window: Keep the conversation fresh and prevent old roleplay patterns from poisoning current turn
+    // Take the most recent 8 messages (4 turns) to avoid accumulated context drift and long preamble/outro mimicry
+    let max_history_messages = 8usize;
+    let mut history_snapshot = if raw_history.len() > max_history_messages {
+        raw_history[raw_history.len() - max_history_messages..].to_vec()
+    } else {
+        raw_history
+    };
+
     let has_system_msg = history_snapshot.first().is_some_and(|m| m.is_system());
     if !has_system_msg {
         let mut prompt = state
@@ -400,11 +410,17 @@ pub async fn execute_conversation_turn(
         if let Ok(hits) = state.rag.search(trimmed, 3).await {
             let relevant: Vec<_> = hits.into_iter().filter(|h| h.score > 0.005).collect();
             if !relevant.is_empty() {
-                let mut context_msg = String::from("Relevant context from knowledge base:\n");
+                let mut context_msg = String::from("\n\n[Tài liệu tham khảo từ Knowledge Base]:\n");
                 for (idx, hit) in relevant.iter().enumerate() {
                     context_msg.push_str(&format!("{}. [{}] {}\n", idx + 1, hit.title, hit.text));
                 }
-                history_snapshot.push(Message::system(context_msg));
+                context_msg.push_str("\nHãy sử dụng tài liệu trên để trả lời trực tiếp, chính xác và tự nhiên vào trọng tâm câu hỏi của người dùng mà không cần phần mở đầu hay kết luận dài dòng.");
+
+                if let Some(sys_msg) = history_snapshot.iter_mut().find(|m| m.is_system()) {
+                    sys_msg.raw_content.push_str(&context_msg);
+                } else {
+                    history_snapshot.insert(0, Message::system(context_msg));
+                }
             }
         }
     }
@@ -867,7 +883,10 @@ pub async fn handle_toggle_mic(
                         let rms = vira_infer::SherpaSttAdapter::calculate_rms(&chunk);
                         state_clone.append_recorded_audio(&chunk);
 
-                        if rms >= vad_energy_threshold {
+                        let is_avatar_speaking = state_clone.audio_playback.is_playing();
+                        let effective_threshold = if is_avatar_speaking { 0.20f32 } else { vad_energy_threshold };
+
+                        if rms >= effective_threshold {
                             if !in_speech {
                                 // Transition: user started talking!
                                 // Trigger barge-in: cancel any active avatar speech

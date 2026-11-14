@@ -327,7 +327,7 @@ export class HudController {
           }
         };
         this.speechRec.onend = () => {
-          if (this.isMicActive) {
+          if (this.isMicActive && this.vrmViewer.state !== 'speaking' && !this.isSpeakingSpeech) {
             const text = this.el.chatInput.value.trim();
             if (text) {
               this.handleSendMessage();
@@ -549,8 +549,8 @@ export class HudController {
     this.el.btnMic.classList.toggle('listening', active);
     this.el.btnMic.setAttribute('aria-pressed', String(active));
 
-    // Handle Web Speech API
-    if (this.speechRec) {
+    // Handle Web Speech API only in non-Tauri browser environments to avoid conflicting double STT & mic echo
+    if (this.speechRec && !TauriBridge.isTauri()) {
       try {
         if (active) {
           const preset = TUTOR_PRESETS[this.currentModeKey];

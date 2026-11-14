@@ -722,7 +722,7 @@ pub fn sanitize_speakable_text(
                 }
             }
 
-            // Case C: *...* (residual asterisk action description)
+            // Case C: *...* or **...**
             if let Some(next_star) = after_open.find('*') {
                 let inner = &after_open[..next_star];
                 let rest_after_star = &after_open[next_star..];
@@ -730,12 +730,30 @@ pub fn sanitize_speakable_text(
                 let matched_bytes = stars_open + next_star + close_stars;
                 let matched_chars = rest[..matched_bytes.min(rest.len())].chars().count();
 
-                let triggers = extract_semantic_triggers_internal(inner, Some(custom_gestures));
-                events.extend(triggers);
+                let is_markdown_emphasis = stars_open >= 2 && close_stars >= 2;
+                let is_stage_direction = is_parenthesized_stage_direction(inner, None, custom_gestures);
 
-                if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
-                    out.push(' ');
+                if is_stage_direction && !is_markdown_emphasis {
+                    // True stage direction / action tag (e.g. *mỉm cười*, *Vira hơi lùi lại một chút*)
+                    let triggers = extract_semantic_triggers_internal(inner, Some(custom_gestures));
+                    events.extend(triggers);
+                    if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
+                        out.push(' ');
+                    }
+                } else {
+                    // Regular markdown emphasis / bold or technical term (e.g. **ứng dụng**, *Carnot*)
+                    // Retain inner text in spoken output!
+                    let triggers = extract_semantic_triggers_internal(inner, Some(custom_gestures));
+                    events.extend(triggers);
+                    let trimmed_inner = inner.trim();
+                    if !trimmed_inner.is_empty() {
+                        if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
+                            out.push(' ');
+                        }
+                        out.push_str(trimmed_inner);
+                    }
                 }
+
                 i += matched_chars;
                 continue;
             }

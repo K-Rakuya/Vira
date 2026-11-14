@@ -33,7 +33,7 @@ impl Default for ChunkerConfig {
         Self {
             sentence_delimiters: vec!['.', '!', '?', '\n', '。', '！', '？'],
             clause_delimiters: vec![',', ';', ':', '—'],
-            split_on_clauses: true,
+            split_on_clauses: false,
             min_clause_chars: 12,
             max_chunk_chars: 160,
             abbreviations: vec![

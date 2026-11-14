@@ -542,7 +542,7 @@ impl OpenAiCompatConfig {
             temperature: Some(0.7),
             max_tokens: Some(2048),
             system_prompt: None,
-            streaming_mode: StreamingMode::SentenceChunked,
+            streaming_mode: StreamingMode::IncrementalToken,
         }
     }
 }
@@ -886,11 +886,14 @@ impl LlmPort for OpenAiCompatLlmAdapter {
 
         // Build request payload
         let mut request_messages = Vec::with_capacity(messages.len() + 1);
-        if let Some(ref sys) = self.config.system_prompt {
-            request_messages.push(OpenAiMessagePayload {
-                role: Role::System.as_str(),
-                content: sys.as_str(),
-            });
+        let first_is_system = messages.first().is_some_and(|m| m.is_system());
+        if !first_is_system {
+            if let Some(ref sys) = self.config.system_prompt {
+                request_messages.push(OpenAiMessagePayload {
+                    role: Role::System.as_str(),
+                    content: sys.as_str(),
+                });
+            }
         }
 
         for msg in messages {
