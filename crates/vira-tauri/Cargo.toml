@@ -22,6 +22,10 @@ vira-domain = { workspace = true }
 vira-ports = { workspace = true }
 vira-voice = { workspace = true }
 vira-infer = { workspace = true }
+vira-rag = { workspace = true }
+vira-store = { workspace = true }
+vira-learn = { workspace = true }
+vira-agent = { workspace = true }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

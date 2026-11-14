@@ -47,13 +47,30 @@ TUTOR_PRESETS.general = TUTOR_PRESETS.general_assistant;
 
 export function normalizeTutorMode(modeKey: string): string {
   const lower = String(modeKey || '').trim().toLowerCase().replace(/[- ]/g, '_');
-  if (lower === 'vietnamese' || lower === 'vietnamesetutor' || lower === 'vietnamese_tutor' || lower === 'vi' || lower === 'vn') {
+  if (
+    lower === 'vietnamese' ||
+    lower === 'vietnamesetutor' ||
+    lower === 'vietnamese_tutor' ||
+    lower === 'vi' ||
+    lower === 'vn'
+  ) {
     return 'vietnamese';
   }
-  if (lower === 'english' || lower === 'englishtutor' || lower === 'english_tutor' || lower === 'en') {
+  if (
+    lower === 'english' ||
+    lower === 'englishtutor' ||
+    lower === 'english_tutor' ||
+    lower === 'en'
+  ) {
     return 'english';
   }
-  if (lower === 'japanese' || lower === 'japanesetutor' || lower === 'japanese_tutor' || lower === 'ja' || lower === 'jp') {
+  if (
+    lower === 'japanese' ||
+    lower === 'japanesetutor' ||
+    lower === 'japanese_tutor' ||
+    lower === 'ja' ||
+    lower === 'jp'
+  ) {
     return 'japanese';
   }
   return 'general_assistant';
@@ -79,6 +96,9 @@ export class HudController {
   private isMicActive = false;
   private spaceHeld = false;
   private unlisteners: Array<() => void> = [];
+  private speechRec: any = null;
+  private dueCards: Array<any> = [];
+  private currentStudyCard: any = null;
 
   constructor(vrmViewer: VRMViewer) {
     this.vrmViewer = vrmViewer;
@@ -87,11 +107,13 @@ export class HudController {
   public async init(): Promise<void> {
     this.cacheElements();
     this.bindDomEvents();
+    this.initSpeechRecognition();
     await this.setupIpcListeners();
-    this.refreshDocumentList();
+    await this.refreshDocumentList();
+    await this.refreshFlashcards();
     this.setStatus('idle');
 
-    // Sync initial state if available
+    // Sync initial state from backend
     try {
       const appState = await TauriBridge.invoke('get_app_state');
       if (appState?.tutor_mode) {
@@ -115,6 +137,9 @@ export class HudController {
       brandModeLabel: $('brand-mode-label') as HTMLElement,
       btnGestures: $('btn-gestures') as HTMLButtonElement,
       gesturePanel: $('gesture-panel') as HTMLElement,
+      btnResetCamera: $('btn-reset-camera') as HTMLButtonElement,
+
+      // Knowledge drawer
       btnKnowledge: $('btn-knowledge-toggle') as HTMLButtonElement,
       btnCloseKnowledge: $('btn-close-knowledge') as HTMLButtonElement,
       knowledgeDrawer: $('knowledge-drawer') as HTMLElement,
@@ -124,6 +149,8 @@ export class HudController {
       docFile: $('doc-file-input') as HTMLInputElement,
       btnIngest: $('btn-ingest-doc') as HTMLButtonElement,
       docList: $('doc-list-container') as HTMLElement,
+
+      // Settings drawer
       btnSettings: $('btn-settings-toggle') as HTMLButtonElement,
       btnCloseSettings: $('btn-close-settings') as HTMLButtonElement,
       settingsDrawer: $('settings-drawer') as HTMLElement,
@@ -140,7 +167,37 @@ export class HudController {
       outRate: $('out-rate') as HTMLElement,
       rag: $('setting-rag-enabled') as HTMLInputElement,
       btnSave: $('btn-save-settings') as HTMLButtonElement,
-      btnResetCamera: $('btn-reset-camera') as HTMLButtonElement,
+
+      // Flashcards drawer
+      btnFlashcards: $('btn-flashcards-toggle') as HTMLButtonElement,
+      dueBadge: $('due-badge') as HTMLElement,
+      flashcardsDrawer: $('flashcards-drawer') as HTMLElement,
+      btnCloseFlashcards: $('btn-close-flashcards') as HTMLButtonElement,
+      fcDuePill: $('fc-due-pill') as HTMLElement,
+      fcTotalCount: $('fc-total-count') as HTMLElement,
+      fcActiveCard: $('fc-active-card') as HTMLElement,
+      fcCardLevel: $('fc-card-level') as HTMLElement,
+      fcCardFront: $('fc-card-front') as HTMLElement,
+      fcCardBack: $('fc-card-back') as HTMLElement,
+      btnFcReveal: $('btn-fc-reveal') as HTMLButtonElement,
+      fcRatingActions: $('fc-rating-actions') as HTMLElement,
+      fcInputFront: $('fc-input-front') as HTMLInputElement,
+      fcInputBack: $('fc-input-back') as HTMLTextAreaElement,
+      fcSelectLevel: $('fc-select-level') as HTMLSelectElement,
+      btnFcSave: $('btn-fc-save') as HTMLButtonElement,
+      fcListContainer: $('fc-list-container') as HTMLElement,
+
+      // Pronunciation modal
+      btnPronounce: $('btn-pronounce-toggle') as HTMLButtonElement,
+      pronounceModal: $('pronounce-modal') as HTMLDialogElement,
+      btnClosePronounce: $('btn-close-pronounce') as HTMLButtonElement,
+      pronounceTarget: $('pronounce-target-input') as HTMLInputElement,
+      btnPronounceAssess: $('btn-pronounce-assess') as HTMLButtonElement,
+      pronounceResult: $('pronounce-result') as HTMLElement,
+      pronounceOverallScore: $('pronounce-overall-score') as HTMLElement,
+      pronounceAccuracyLabel: $('pronounce-accuracy-label') as HTMLElement,
+      pronouncePhonemes: $('pronounce-phonemes-container') as HTMLElement,
+
       toast: $('toast') as HTMLElement,
       scrim: $('scrim') as HTMLElement,
     };
@@ -161,7 +218,23 @@ export class HudController {
     });
     this.unlisteners.push(unlistenSubtitle);
 
-    // 3. Gesture event broadcast
+    // 3. Audible Speech Synthesis event
+    const unlistenSpeak = await TauriBridge.listen('speak_sentence', (payload: any) => {
+      if (payload?.text && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        try {
+          window.speechSynthesis.cancel();
+          const utter = new SpeechSynthesisUtterance(payload.text);
+          utter.lang = payload.language || 'vi-VN';
+          utter.rate = Number(payload.rate || 1.0);
+          window.speechSynthesis.speak(utter);
+        } catch (e) {
+          console.warn('Speech synthesis error:', e);
+        }
+      }
+    });
+    this.unlisteners.push(unlistenSpeak);
+
+    // 4. Gesture event broadcast
     const unlistenGesture = await TauriBridge.listen('gesture_event', (payload: any) => {
       if (payload?.name) {
         this.vrmViewer.playGesture(payload.name, payload.duration);
@@ -169,13 +242,60 @@ export class HudController {
     });
     this.unlisteners.push(unlistenGesture);
 
-    // 4. Emotion event broadcast
+    // 5. Emotion event broadcast
     const unlistenEmotion = await TauriBridge.listen('emotion_event', (payload: any) => {
       if (payload?.name) {
         this.vrmViewer.setEmotion(payload.name, payload.weight ?? 1.0);
       }
     });
     this.unlisteners.push(unlistenEmotion);
+
+    // 6. Audio RMS state event
+    const unlistenAudio = await TauriBridge.listen('audio_state', (payload: any) => {
+      if (payload) {
+        const rms = Number(payload.rms_level || 0);
+        if (this.el.btnMic) {
+          const scale = 1 + Math.min(0.4, rms * 4);
+          this.el.btnMic.style.transform = this.isMicActive ? `scale(${scale})` : '';
+        }
+        if (payload.barge_in_triggered && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+          window.speechSynthesis.cancel();
+        }
+      }
+    });
+    this.unlisteners.push(unlistenAudio);
+  }
+
+  private initSpeechRecognition(): void {
+    if (typeof window === 'undefined') return;
+    const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (SpeechRec) {
+      try {
+        this.speechRec = new SpeechRec();
+        this.speechRec.continuous = false;
+        this.speechRec.interimResults = true;
+        this.speechRec.onresult = (ev: any) => {
+          let transcript = '';
+          for (let i = ev.resultIndex; i < ev.results.length; i++) {
+            transcript += ev.results[i][0].transcript;
+          }
+          if (transcript.trim()) {
+            this.el.chatInput.value = transcript;
+            this.updateSubtitle('listening', transcript);
+          }
+        };
+        this.speechRec.onend = () => {
+          if (this.isMicActive) {
+            const text = this.el.chatInput.value.trim();
+            if (text) {
+              this.handleSendMessage();
+            }
+          }
+        };
+      } catch {
+        this.speechRec = null;
+      }
+    }
   }
 
   private bindDomEvents(): void {
@@ -207,9 +327,24 @@ export class HudController {
     e.btnGestures.addEventListener('click', () => this.toggleGesturePanel());
     e.btnKnowledge.addEventListener('click', () => this.toggleDrawer('knowledge'));
     e.btnSettings.addEventListener('click', () => this.toggleDrawer('settings'));
+    if (e.btnFlashcards) {
+      e.btnFlashcards.addEventListener('click', () => this.toggleDrawer('flashcards'));
+    }
+    if (e.btnPronounce) {
+      e.btnPronounce.addEventListener('click', () => this.openPronounceModal());
+    }
+
+    // Close buttons
     e.btnCloseKnowledge.addEventListener('click', () => this.closeDrawer());
     e.btnCloseSettings.addEventListener('click', () => this.closeDrawer());
+    if (e.btnCloseFlashcards) {
+      e.btnCloseFlashcards.addEventListener('click', () => this.closeDrawer());
+    }
+    if (e.btnClosePronounce) {
+      e.btnClosePronounce.addEventListener('click', () => this.closePronounceModal());
+    }
     e.scrim.addEventListener('click', () => this.closeDrawer());
+
     e.btnResetCamera.addEventListener('click', () => {
       this.vrmViewer.resetCamera();
       this.showToast('Góc nhìn đã được căn chỉnh lại');
@@ -239,6 +374,14 @@ export class HudController {
     this.setupDropZone(e.docDrop, e.docFile, (file) => this.readDocumentFile(file));
     this.setupDropZone(e.vrmDrop, e.vrmFile, (file) => this.loadVrmFile(file));
 
+    // Flashcards tabs & actions
+    this.bindFlashcardEvents();
+
+    // Pronunciation assessment actions
+    if (e.btnPronounceAssess) {
+      e.btnPronounceAssess.addEventListener('click', () => this.handleAssessPronunciation());
+    }
+
     // Mic interaction (push-to-talk + click toggle)
     this.setupMic();
 
@@ -258,7 +401,10 @@ export class HudController {
 
     // Push-to-talk with Space bar
     window.addEventListener('keydown', (ev: KeyboardEvent) => {
-      if (ev.key === 'Escape') this.closeDrawer();
+      if (ev.key === 'Escape') {
+        this.closeDrawer();
+        this.closePronounceModal();
+      }
       if (ev.code === 'Space' && !ev.repeat && this.canPushToTalkKey(ev)) {
         ev.preventDefault();
         this.spaceHeld = true;
@@ -283,11 +429,53 @@ export class HudController {
     });
   }
 
+  private bindFlashcardEvents(): void {
+    const e = this.el;
+    if (!e.flashcardsDrawer) return;
+
+    // Tabs
+    const tabs = e.flashcardsDrawer.querySelectorAll('.drawer-tab');
+    tabs.forEach((tab: Element) => {
+      tab.addEventListener('click', () => {
+        const tabEl = tab as HTMLElement;
+        const tabKey = tabEl.dataset.tab;
+        tabs.forEach((t: Element) => t.classList.remove('active'));
+        tabEl.classList.add('active');
+        e.flashcardsDrawer.querySelectorAll('.tab-content').forEach((tc: Element) => {
+          const tcEl = tc as HTMLElement;
+          tcEl.classList.toggle('active', tcEl.id === `tab-fc-${tabKey}`);
+        });
+      });
+    });
+
+    // Reveal answer
+    if (e.btnFcReveal) {
+      e.btnFcReveal.addEventListener('click', () => this.handleRevealAnswer());
+    }
+
+    // Rating buttons
+    if (e.fcRatingActions) {
+      e.fcRatingActions.addEventListener('click', (ev: MouseEvent) => {
+        const btn = (ev.target as HTMLElement).closest('[data-rating]') as HTMLElement | null;
+        if (btn?.dataset.rating) {
+          this.handleReviewCard(btn.dataset.rating);
+        }
+      });
+    }
+
+    // Create card
+    if (e.btnFcSave) {
+      e.btnFcSave.addEventListener('click', () => this.handleCreateCard());
+    }
+  }
+
   private canPushToTalkKey(ev: KeyboardEvent): boolean {
     const t = ev.target;
     const isTyping =
       t instanceof HTMLElement &&
-      (t.matches('input, textarea, select, button, [contenteditable]') || Boolean(t.closest('.drawer')));
+      (t.matches('input, textarea, select, button, [contenteditable]') ||
+        Boolean(t.closest('.drawer')) ||
+        Boolean(t.closest('dialog')));
     return !isTyping && !this.openDrawerName;
   }
 
@@ -319,6 +507,22 @@ export class HudController {
     this.el.btnMic.classList.toggle('listening', active);
     this.el.btnMic.setAttribute('aria-pressed', String(active));
 
+    // Handle Web Speech API
+    if (this.speechRec) {
+      try {
+        if (active) {
+          const preset = TUTOR_PRESETS[this.currentModeKey];
+          this.speechRec.lang = preset?.language || 'vi-VN';
+          this.speechRec.start();
+        } else {
+          this.speechRec.stop();
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    // Handle native audio capture in Tauri
     try {
       await TauriBridge.invoke('toggle_mic', { active });
       if (active) {
@@ -346,6 +550,10 @@ export class HudController {
     this.setStatus(state);
     if (text !== undefined && text !== '') {
       this.el.subtitleText.textContent = text;
+      // Pre-fill pronunciation input with last spoken tutor phrase
+      if (this.el.pronounceTarget && state === 'speaking') {
+        this.el.pronounceTarget.value = text;
+      }
     }
   }
 
@@ -356,6 +564,10 @@ export class HudController {
     this.el.chatInput.value = '';
     this.setMicActive(false);
     this.updateSubtitle('thinking', text);
+
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
 
     try {
       await TauriBridge.invoke('send_message', { payload: { text } });
@@ -399,29 +611,60 @@ export class HudController {
     this.el.btnGestures.setAttribute('aria-expanded', String(isHidden));
   }
 
-  private toggleDrawer(name: 'knowledge' | 'settings'): void {
+  private toggleDrawer(name: 'knowledge' | 'settings' | 'flashcards'): void {
     if (this.openDrawerName === name) {
       this.closeDrawer();
       return;
     }
     this.closeDrawer();
     this.openDrawerName = name;
-    const drawer = name === 'knowledge' ? this.el.knowledgeDrawer : this.el.settingsDrawer;
-    drawer.classList.add('open');
-    drawer.setAttribute('aria-hidden', 'false');
-    drawer.removeAttribute('inert');
-    this.el.scrim.hidden = false;
-    (name === 'knowledge' ? this.el.btnCloseKnowledge : this.el.btnCloseSettings).focus();
+    let drawer: HTMLElement | null = null;
+    if (name === 'knowledge') drawer = this.el.knowledgeDrawer;
+    else if (name === 'settings') drawer = this.el.settingsDrawer;
+    else if (name === 'flashcards') drawer = this.el.flashcardsDrawer;
+
+    if (drawer) {
+      drawer.classList.add('open');
+      drawer.setAttribute('aria-hidden', 'false');
+      drawer.removeAttribute('inert');
+      this.el.scrim.hidden = false;
+    }
   }
 
   private closeDrawer(): void {
     if (!this.openDrawerName) return;
-    const drawer = this.openDrawerName === 'knowledge' ? this.el.knowledgeDrawer : this.el.settingsDrawer;
-    drawer.classList.remove('open');
-    drawer.setAttribute('aria-hidden', 'true');
-    drawer.setAttribute('inert', '');
+    let drawer: HTMLElement | null = null;
+    if (this.openDrawerName === 'knowledge') drawer = this.el.knowledgeDrawer;
+    else if (this.openDrawerName === 'settings') drawer = this.el.settingsDrawer;
+    else if (this.openDrawerName === 'flashcards') drawer = this.el.flashcardsDrawer;
+
+    if (drawer) {
+      drawer.classList.remove('open');
+      drawer.setAttribute('aria-hidden', 'true');
+      drawer.setAttribute('inert', '');
+    }
     this.el.scrim.hidden = true;
     this.openDrawerName = null;
+  }
+
+  private openPronounceModal(): void {
+    if (this.el.pronounceModal) {
+      if (typeof this.el.pronounceModal.showModal === 'function') {
+        this.el.pronounceModal.showModal();
+      } else {
+        this.el.pronounceModal.setAttribute('open', '');
+      }
+    }
+  }
+
+  private closePronounceModal(): void {
+    if (this.el.pronounceModal) {
+      if (typeof this.el.pronounceModal.close === 'function') {
+        this.el.pronounceModal.close();
+      } else {
+        this.el.pronounceModal.removeAttribute('open');
+      }
+    }
   }
 
   private async handleSaveSettings(): Promise<void> {
@@ -450,6 +693,7 @@ export class HudController {
   }
 
   private setupDropZone(zone: HTMLElement, input: HTMLInputElement, onFile: (file: File) => void): void {
+    if (!zone || !input) return;
     zone.addEventListener('click', () => input.click());
     zone.addEventListener('keydown', (ev: KeyboardEvent) => {
       if (ev.key === 'Enter' || ev.key === ' ') {
@@ -490,7 +734,11 @@ export class HudController {
     reader.readAsText(file);
   }
 
-  private handleIngestDoc(): void {
+  // ============================================================================
+  // Knowledge Base (RAG) Actions
+  // ============================================================================
+
+  private async handleIngestDoc(): Promise<void> {
     const title = this.el.docTitle.value.trim();
     const content = this.el.docContent.value.trim();
     if (!title || !content) {
@@ -498,36 +746,32 @@ export class HudController {
       return;
     }
 
-    const docs = this.getStoredDocs();
-    docs.push({
-      id: 'doc_' + Date.now(),
-      title,
-      content,
-      createdAt: new Date().toISOString(),
-    });
-    localStorage.setItem('vira_docs', JSON.stringify(docs));
-
-    this.el.docTitle.value = '';
-    this.el.docContent.value = '';
-    this.refreshDocumentList();
-    this.showToast(`Đã lưu "${title}" vào bộ nhớ`);
-  }
-
-  private getStoredDocs(): Array<{ id: string; title: string; content: string; createdAt: string }> {
     try {
-      const raw = localStorage.getItem('vira_docs');
-      return raw ? JSON.parse(raw) : [];
-    } catch {
-      return [];
+      await TauriBridge.invoke('ingest_document', {
+        payload: { title, content },
+      });
+      this.el.docTitle.value = '';
+      this.el.docContent.value = '';
+      await this.refreshDocumentList();
+      this.showToast(`Đã lưu "${title}" vào bộ nhớ kiến thức (RAG)`);
+    } catch (err: any) {
+      this.showToast(`Lỗi thêm tài liệu: ${err.message || err}`);
     }
   }
 
-  private refreshDocumentList(): void {
+  private async refreshDocumentList(): Promise<void> {
     const box = this.el.docList;
+    if (!box) return;
     box.replaceChildren();
-    const docs = this.getStoredDocs();
 
-    if (!docs.length) {
+    let docs: Array<any> = [];
+    try {
+      docs = await TauriBridge.invoke('list_documents');
+    } catch {
+      docs = [];
+    }
+
+    if (!docs || !docs.length) {
       const empty = document.createElement('div');
       empty.className = 'doc-empty';
       empty.textContent = 'Chưa có tài liệu nào.';
@@ -548,7 +792,8 @@ export class HudController {
 
       const meta = document.createElement('div');
       meta.className = 'doc-meta';
-      meta.textContent = `${new Date(doc.createdAt).toLocaleDateString()} · ${doc.content.length} ký tự`;
+      const count = doc.chunk_count ? `${doc.chunk_count} phân đoạn · ` : '';
+      meta.textContent = `${count}${doc.content?.length || 0} ký tự`;
       info.append(title, meta);
 
       const del = document.createElement('button');
@@ -557,15 +802,233 @@ export class HudController {
       del.title = 'Xóa tài liệu';
       del.innerHTML =
         '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>';
-      del.addEventListener('click', () => {
-        const remaining = this.getStoredDocs().filter((d) => d.id !== doc.id);
-        localStorage.setItem('vira_docs', JSON.stringify(remaining));
-        this.refreshDocumentList();
-        this.showToast(`Đã xóa "${doc.title}"`);
+      del.addEventListener('click', async () => {
+        try {
+          await TauriBridge.invoke('delete_document', { doc_id: doc.id });
+          await this.refreshDocumentList();
+          this.showToast(`Đã xóa "${doc.title}"`);
+        } catch (err: any) {
+          this.showToast(`Lỗi xóa: ${err.message || err}`);
+        }
       });
 
       card.append(info, del);
       box.appendChild(card);
+    }
+  }
+
+  // ============================================================================
+  // Flashcards (FSRS) Actions
+  // ============================================================================
+
+  public async refreshFlashcards(): Promise<void> {
+    const e = this.el;
+    if (!e.flashcardsDrawer) return;
+
+    try {
+      const allCards = (await TauriBridge.invoke('list_flashcards')) || [];
+      const due = (await TauriBridge.invoke('get_due_flashcards')) || [];
+      this.dueCards = due;
+
+      if (e.fcTotalCount) e.fcTotalCount.textContent = String(allCards.length);
+      if (e.fcDuePill) e.fcDuePill.textContent = `${due.length} thẻ cần ôn`;
+      if (e.dueBadge) {
+        e.dueBadge.textContent = String(due.length);
+        e.dueBadge.hidden = due.length === 0;
+      }
+
+      this.renderFlashcardsList(allCards);
+      this.presentNextDueCard();
+    } catch {
+      // ignore
+    }
+  }
+
+  private presentNextDueCard(): void {
+    const e = this.el;
+    if (!this.dueCards.length) {
+      this.currentStudyCard = null;
+      if (e.fcCardFront) e.fcCardFront.textContent = '🎉 Tuyệt vời! Bạn đã hoàn thành tất cả thẻ ôn tập hôm nay!';
+      if (e.fcCardBack) e.fcCardBack.hidden = true;
+      if (e.btnFcReveal) e.btnFcReveal.hidden = true;
+      if (e.fcRatingActions) e.fcRatingActions.hidden = true;
+      return;
+    }
+
+    this.currentStudyCard = this.dueCards[0];
+    if (e.fcCardLevel) e.fcCardLevel.textContent = this.currentStudyCard.cefr_level || 'A1';
+    if (e.fcCardFront) e.fcCardFront.textContent = this.currentStudyCard.front;
+    if (e.fcCardBack) {
+      e.fcCardBack.textContent = this.currentStudyCard.back;
+      e.fcCardBack.hidden = true;
+    }
+    if (e.btnFcReveal) e.btnFcReveal.hidden = false;
+    if (e.fcRatingActions) e.fcRatingActions.hidden = true;
+  }
+
+  private handleRevealAnswer(): void {
+    if (!this.currentStudyCard) return;
+    this.el.fcCardBack.hidden = false;
+    this.el.btnFcReveal.hidden = true;
+    this.el.fcRatingActions.hidden = false;
+  }
+
+  private async handleReviewCard(rating: string): Promise<void> {
+    if (!this.currentStudyCard) return;
+    try {
+      await TauriBridge.invoke('review_flashcard', {
+        payload: {
+          card_id: this.currentStudyCard.id,
+          rating,
+        },
+      });
+      this.dueCards.shift();
+      this.presentNextDueCard();
+      await this.refreshFlashcards();
+    } catch (err: any) {
+      this.showToast(`Lỗi lưu đánh giá: ${err.message || err}`);
+    }
+  }
+
+  private async handleCreateCard(): Promise<void> {
+    const e = this.el;
+    const front = e.fcInputFront.value.trim();
+    const back = e.fcInputBack.value.trim();
+    const cefr_level = e.fcSelectLevel.value;
+
+    if (!front || !back) {
+      this.showToast('Vui lòng nhập cả mặt trước và mặt sau thẻ');
+      return;
+    }
+
+    try {
+      await TauriBridge.invoke('create_flashcard', {
+        payload: { front, back, cefr_level },
+      });
+      e.fcInputFront.value = '';
+      e.fcInputBack.value = '';
+      await this.refreshFlashcards();
+      this.showToast(`Đã tạo flashcard "${front}"`);
+    } catch (err: any) {
+      this.showToast(`Lỗi tạo thẻ: ${err.message || err}`);
+    }
+  }
+
+  private renderFlashcardsList(cards: Array<any>): void {
+    const box = this.el.fcListContainer;
+    if (!box) return;
+    box.replaceChildren();
+
+    if (!cards.length) {
+      const empty = document.createElement('div');
+      empty.className = 'doc-empty';
+      empty.textContent = 'Chưa có thẻ từ vựng nào.';
+      box.appendChild(empty);
+      return;
+    }
+
+    for (const card of cards) {
+      const row = document.createElement('div');
+      row.className = 'doc-card';
+
+      const info = document.createElement('div');
+      info.className = 'doc-info';
+
+      const front = document.createElement('div');
+      front.className = 'doc-title';
+      front.textContent = card.front;
+
+      const meta = document.createElement('div');
+      meta.className = 'doc-meta';
+      meta.textContent = `${card.back} · [${card.cefr_level || 'A1'}] · Đã ôn ${card.reps || 0} lần`;
+
+      info.append(front, meta);
+
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'btn-delete';
+      del.title = 'Xóa thẻ';
+      del.innerHTML =
+        '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+      del.addEventListener('click', async () => {
+        try {
+          await TauriBridge.invoke('delete_flashcard', { card_id: card.id });
+          await this.refreshFlashcards();
+          this.showToast(`Đã xóa thẻ "${card.front}"`);
+        } catch (err: any) {
+          this.showToast(`Lỗi xóa: ${err.message || err}`);
+        }
+      });
+
+      row.append(info, del);
+      box.appendChild(row);
+    }
+  }
+
+  // ============================================================================
+  // Pronunciation Assessment (GOP) Actions
+  // ============================================================================
+
+  private async handleAssessPronunciation(): Promise<void> {
+    const target = this.el.pronounceTarget.value.trim();
+    if (!target) {
+      this.showToast('Vui lòng nhập câu cần luyện phát âm');
+      return;
+    }
+
+    this.el.btnPronounceAssess.disabled = true;
+    this.el.btnPronounceAssess.textContent = 'Đang phân tích âm học GOP…';
+
+    try {
+      const result = await TauriBridge.invoke('assess_pronunciation', {
+        payload: { target_text: target },
+      });
+
+      this.el.pronounceResult.hidden = false;
+      const score = Math.round(result.overall_score || 0);
+      this.el.pronounceOverallScore.textContent = String(score);
+
+      const status = this.el.pronounceAccuracyLabel;
+      if (score >= 80) {
+        status.textContent = 'Xuất sắc · Chuẩn giọng bản ngữ';
+        status.className = 'score-status status-correct';
+      } else if (score >= 55) {
+        status.textContent = 'Khá tốt · Cần chú ý âm sắc';
+        status.className = 'score-status status-flaw';
+      } else {
+        status.textContent = 'Cần luyện tập thêm';
+        status.className = 'score-status status-mispronounced';
+      }
+
+      // Render phoneme chips
+      const container = this.el.pronouncePhonemes;
+      container.replaceChildren();
+
+      const scores = result.phoneme_scores || [];
+      for (const p of scores) {
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = `phoneme-chip accuracy-${String(p.accuracy).toLowerCase()}`;
+        chip.innerHTML = `<span class="ph-symbol">${p.phoneme}</span><span class="ph-score">${Math.round(p.score)}%</span>`;
+        chip.title = `Âm [${p.phoneme}] - Điểm: ${Math.round(p.score)}%. Nhấn để xem khẩu hình trên 3D avatar`;
+
+        chip.addEventListener('click', () => {
+          if (p.viseme_hint) {
+            this.vrmViewer.onVisemeTick({
+              weights: p.viseme_hint,
+              is_speaking: true,
+            });
+            this.showToast(`Khẩu hình cho âm [${p.phoneme}] (${p.recommended_viseme || 'aa'})`);
+          }
+        });
+
+        container.appendChild(chip);
+      }
+    } catch (err: any) {
+      this.showToast(`Lỗi đánh giá phát âm: ${err.message || err}`);
+    } finally {
+      this.el.btnPronounceAssess.disabled = false;
+      this.el.btnPronounceAssess.textContent = 'Ghi âm & Đánh giá phát âm';
     }
   }
 

@@ -5314,9 +5314,13 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+ "vira-agent",
  "vira-domain",
  "vira-infer",
+ "vira-learn",
  "vira-ports",
+ "vira-rag",
+ "vira-store",
  "vira-voice",
 ]
 

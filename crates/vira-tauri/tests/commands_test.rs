@@ -224,6 +224,7 @@ async fn test_save_settings_and_get_app_state() {
         tts_speed: Some(1.1),
         stt_model: Some("whisper-base".to_string()),
         tutor_mode: Some("japanese".to_string()),
+        ..Default::default()
     };
 
     let save_res = handle_save_settings(settings.clone(), &state).await;
@@ -540,6 +541,111 @@ async fn test_set_emotion_canonical_and_custom() {
     // Custom non-domain blendshape emotion preserved as trimmed string
     assert!(handle_set_emotion("custom_sparkle_eyes".to_string(), 0.9, &state).await.is_ok());
     assert_eq!(state.emotion.read().unwrap().0, "custom_sparkle_eyes");
+}
+
+#[tokio::test]
+async fn test_rag_ingest_and_context_search() {
+    let state = AppState::new_headless();
+
+    // Ingest a Japanese grammar note
+    let doc_id = "test_doc_jp";
+    let title = "Japanese Particles";
+    let content = "The particle 'wa' marks the topic of a sentence. The particle 'ga' marks the subject.";
+    let chunks = state
+        .rag
+        .ingest_document(doc_id, title, content, None)
+        .await
+        .expect("ingest doc");
+    assert!(!chunks.is_empty());
+
+    // Search query
+    let hits = state
+        .rag
+        .search("topic marker wa", 3)
+        .await
+        .expect("search hits");
+    assert!(!hits.is_empty());
+    assert_eq!(hits[0].title, "Japanese Particles");
+}
+
+#[tokio::test]
+async fn test_flashcard_lifecycle_fsrs() {
+    use vira_learn::SpacedRepetitionPort;
+    let state = AppState::new_headless();
+
+    // Create flashcard
+    let card = state
+        .learn
+        .create_card("hello", "xin chào", Some("A1".to_string()))
+        .await
+        .expect("create card");
+    assert_eq!(card.front, "hello");
+    assert_eq!(card.back, "xin chào");
+    assert_eq!(card.reps, 0);
+
+    // List flashcards
+    let cards = state.learn.list_cards(10).await.expect("list cards");
+    assert_eq!(cards.len(), 1);
+
+    // Review card with Good rating
+    let reviewed = state
+        .learn
+        .review_card(&card.id, vira_learn::fsrs_scheduler::CardRating::Good)
+        .await
+        .expect("review card");
+    assert_eq!(reviewed.reps, 1);
+    assert!(reviewed.stability > 0.0);
+
+    // Preview intervals
+    let intervals = state
+        .learn
+        .preview_intervals(&card.id)
+        .await
+        .expect("preview intervals");
+    assert!(intervals.good >= 1);
+}
+
+#[tokio::test]
+async fn test_pronunciation_assessment_gop() {
+    let _state = AppState::new_headless();
+
+    let target = "xin chào";
+    let converter = vira_voice::phoneme_aligner::G2pConverter::new();
+    let phonemes = converter.text_to_phonemes(target, vira_voice::phoneme_aligner::PhonemeLanguage::Auto);
+    assert!(!phonemes.is_empty());
+
+    let evaluator = vira_voice::gop::GopEvaluator::new(vira_voice::gop::GopConfig::default());
+    let mut items = Vec::new();
+    for (i, p) in phonemes.iter().enumerate() {
+        let frames = vec![-0.05, -0.08];
+        items.push((p.as_str(), frames, (i * 100) as u32, ((i + 1) * 100) as u32));
+    }
+
+    let ref_items: Vec<(&str, &[f32], u32, u32)> = items
+        .iter()
+        .map(|(p, f, s, e)| (*p, f.as_slice(), *s, *e))
+        .collect();
+
+    let assessment = evaluator.evaluate_phonemes(&ref_items);
+    assert!(assessment.overall_score >= 80.0);
+    assert!(assessment.is_passing(70.0));
+    assert_eq!(assessment.accuracy, vira_voice::gop::AccuracyLevel::Correct);
+}
+
+#[tokio::test]
+async fn test_agent_tool_executor_builtin_math() {
+    use vira_ports::AgentPort;
+    let state = AppState::new_headless();
+
+    let req = vira_ports::agent::ToolCallRequest::new(
+        "math_1",
+        "calculator",
+        serde_json::json!({ "expression": "24 * 5 + 10" }),
+    );
+
+    let res = state.agent.execute_tool(req).await.expect("execute tool");
+    assert!(!res.is_error);
+    assert!(res.content.contains("130"));
 }
 
 

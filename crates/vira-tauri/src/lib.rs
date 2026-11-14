@@ -9,16 +9,21 @@ pub mod state;
 use std::sync::Arc;
 use tauri::Manager;
 use tokio_util::sync::CancellationToken;
+use vira_agent::{ToolCallExecutor, ToolRegistry};
 use vira_domain::viseme::VisemeWeights;
 use vira_infer::kokoro_tts::KokoroTtsAdapter;
 use vira_infer::openai_compat::OpenAiCompatLlmAdapter;
 use vira_infer::whisper_stt::WhisperSttAdapter;
+use vira_learn::service::SpacedRepetitionService;
 use vira_ports::audio::AudioPlaybackPort;
+use vira_ports::store::StorePort;
+use vira_rag::{HybridRagConfig, HybridRagEngine};
+use vira_store::SqliteStore;
 use vira_voice::capture::{CaptureConfig, CaptureEngine};
 use vira_voice::playback::{PlaybackConfig, PlaybackEngine};
 
 use crate::events::TauriEventEmitter;
-use crate::state::AppState;
+use crate::state::{AppSettingsPayload, AppState};
 
 /// Spawns a dedicated 60Hz (~16.6ms) background loop that synchronizes Viseme blendshape
 /// weights against the `MasterAudioClock` playhead and pushes them to the avatar stage.
@@ -91,6 +96,42 @@ pub fn run() {
                 virtual_cap
             });
 
+            // Local application data directory for SQLite and RAG index
+            let data_dir = app
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("data"));
+            let _ = std::fs::create_dir_all(&data_dir);
+
+            // Persistent local SQLite store
+            let db_path = data_dir.join("vira.db");
+            let store: Arc<dyn StorePort> = Arc::new(
+                SqliteStore::open(&db_path)
+                    .unwrap_or_else(|_| SqliteStore::open_in_memory().expect("in-memory sqlite store")),
+            );
+
+            // Persistent Hybrid RAG Engine
+            let rag_dir = data_dir.join("rag");
+            let rag = Arc::new(
+                HybridRagEngine::new_persistent(&rag_dir, HybridRagConfig::default()).unwrap_or_else(
+                    |_| {
+                        HybridRagEngine::new_in_memory(HybridRagConfig::default())
+                            .expect("in-memory RAG engine")
+                    },
+                ),
+            );
+
+            // FSRS Spaced Repetition Service
+            let learn = Arc::new(SpacedRepetitionService::new(store.clone()));
+
+            // Subagent Tool Registry and Executor
+            let mut tool_registry = ToolRegistry::new();
+            tool_registry.register_builtin_tools();
+            tool_registry.register_knowledge_search(rag.clone());
+            let agent = Arc::new(ToolCallExecutor::new(Arc::new(tokio::sync::RwLock::new(
+                tool_registry,
+            ))));
+
             // Default AI inference adapters with synchronized sample rate
             let llm = Arc::new(OpenAiCompatLlmAdapter::new(
                 "http://127.0.0.1:8080/v1".to_string(),
@@ -106,9 +147,50 @@ pub fn run() {
                 stt,
                 Arc::new(playback),
                 Arc::new(capture),
+                rag,
+                store.clone(),
+                learn,
+                agent,
                 clock,
                 emitter,
             );
+
+            // Restore saved settings and chat history from SQLite store on boot
+            let state_for_init = app_state.clone();
+            let store_for_init = store.clone();
+            tokio::spawn(async move {
+                if let Ok(Some(settings_json)) = store_for_init.get_setting("app_settings").await {
+                    if let Ok(saved_settings) =
+                        serde_json::from_str::<AppSettingsPayload>(&settings_json)
+                    {
+                        if saved_settings.llm_endpoint.is_some()
+                            || saved_settings.llm_model.is_some()
+                            || saved_settings.llm_api_key.is_some()
+                        {
+                            let endpoint = saved_settings
+                                .llm_endpoint
+                                .clone()
+                                .unwrap_or_else(|| "http://127.0.0.1:8080/v1".to_string());
+                            let model = saved_settings
+                                .llm_model
+                                .clone()
+                                .unwrap_or_else(|| "default".to_string());
+                            let api_key = saved_settings.llm_api_key.clone();
+                            let new_llm = Arc::new(OpenAiCompatLlmAdapter::new(
+                                endpoint, model, api_key,
+                            ));
+                            state_for_init.set_dynamic_llm(new_llm);
+                        }
+                        *state_for_init.settings.write().unwrap() = saved_settings;
+                    }
+                }
+
+                if let Ok(history_msgs) = store_for_init.get_history("default_session", 50).await {
+                    if !history_msgs.is_empty() {
+                        *state_for_init.history.write().await = history_msgs;
+                    }
+                }
+            });
 
             // Spawn 60Hz lip-sync broadcast loop
             let loop_cancel = CancellationToken::new();
@@ -128,6 +210,18 @@ pub fn run() {
             crate::commands::toggle_mic,
             crate::commands::save_settings,
             crate::commands::get_app_state,
+            crate::commands::ingest_document,
+            crate::commands::list_documents,
+            crate::commands::delete_document,
+            crate::commands::search_knowledge,
+            crate::commands::create_flashcard,
+            crate::commands::list_flashcards,
+            crate::commands::get_due_flashcards,
+            crate::commands::review_flashcard,
+            crate::commands::delete_flashcard,
+            crate::commands::preview_flashcard_intervals,
+            crate::commands::assess_pronunciation,
+            crate::commands::execute_tool,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Vira Tauri application");

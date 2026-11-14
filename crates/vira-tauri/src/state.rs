@@ -4,16 +4,21 @@ use std::sync::{Arc, Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use vira_agent::{ToolCallExecutor, ToolRegistry};
 use vira_domain::message::Message;
 use vira_domain::state::{ConversationState, StateTransitionError, StateTransitionEvent};
 use vira_domain::viseme::VisemeWeights;
 use vira_infer::kokoro_tts::KokoroTtsAdapter;
 use vira_infer::openai_compat::{MockLlmTransport, OpenAiCompatLlmAdapter};
 use vira_infer::whisper_stt::WhisperSttAdapter;
+use vira_learn::service::SpacedRepetitionService;
 use vira_ports::audio::{AudioCapturePort, AudioPlaybackPort};
 use vira_ports::llm::LlmPort;
+use vira_ports::store::StorePort;
 use vira_ports::stt::SttPort;
 use vira_ports::tts::{TimedViseme, TtsPort};
+use vira_rag::{HybridRagConfig, HybridRagEngine};
+use vira_store::SqliteStore;
 use vira_voice::capture::CaptureEngine;
 use vira_voice::clock::MasterAudioClock;
 use vira_voice::playback::PlaybackEngine;
@@ -97,6 +102,9 @@ pub struct AppSettingsPayload {
     pub tts_speed: Option<f32>,
     pub stt_model: Option<String>,
     pub tutor_mode: Option<String>,
+    pub rag_enabled: Option<bool>,
+    pub system_prompt: Option<String>,
+    pub temperature: Option<f32>,
 }
 
 /// Comprehensive state snapshot returned by `get_app_state`.
@@ -117,10 +125,15 @@ pub struct GetAppStateResponse {
 #[derive(Clone)]
 pub struct AppState {
     pub llm: Arc<dyn LlmPort>,
+    pub dynamic_llm: Arc<RwLock<Option<Arc<dyn LlmPort>>>>,
     pub tts: Arc<dyn TtsPort>,
     pub stt: Arc<dyn SttPort>,
     pub audio_playback: Arc<dyn AudioPlaybackPort>,
     pub audio_capture: Arc<dyn AudioCapturePort>,
+    pub rag: Arc<HybridRagEngine>,
+    pub store: Arc<dyn StorePort>,
+    pub learn: Arc<SpacedRepetitionService>,
+    pub agent: Arc<ToolCallExecutor>,
     pub clock: MasterAudioClock,
     pub conversation_state: Arc<RwLock<ConversationState>>,
     pub emotion: Arc<RwLock<(String, f32)>>,
@@ -134,6 +147,8 @@ pub struct AppState {
     pub settings: Arc<RwLock<AppSettingsPayload>>,
     pub is_generating: Arc<AtomicBool>,
     pub turn_lock: Arc<tokio::sync::Mutex<()>>,
+    pub recorded_audio: Arc<Mutex<Vec<f32>>>,
+    pub mic_task_cancel: Arc<Mutex<Option<CancellationToken>>>,
 }
 
 impl AppState {
@@ -145,15 +160,24 @@ impl AppState {
         stt: Arc<dyn SttPort>,
         audio_playback: Arc<dyn AudioPlaybackPort>,
         audio_capture: Arc<dyn AudioCapturePort>,
+        rag: Arc<HybridRagEngine>,
+        store: Arc<dyn StorePort>,
+        learn: Arc<SpacedRepetitionService>,
+        agent: Arc<ToolCallExecutor>,
         clock: MasterAudioClock,
         emitter: Arc<dyn AppEventEmitter>,
     ) -> Self {
         Self {
             llm,
+            dynamic_llm: Arc::new(RwLock::new(None)),
             tts,
             stt,
             audio_playback,
             audio_capture,
+            rag,
+            store,
+            learn,
+            agent,
             clock,
             conversation_state: Arc::new(RwLock::new(ConversationState::Idle)),
             emotion: Arc::new(RwLock::new(("neutral".to_string(), 1.0))),
@@ -167,6 +191,8 @@ impl AppState {
             settings: Arc::new(RwLock::new(AppSettingsPayload::default())),
             is_generating: Arc::new(AtomicBool::new(false)),
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
+            recorded_audio: Arc::new(Mutex::new(Vec::new())),
+            mic_task_cancel: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -195,6 +221,18 @@ impl AppState {
         );
         let tts = Arc::new(KokoroTtsAdapter::virtual_fallback().with_sample_rate(pb_sample_rate));
         let stt = Arc::new(WhisperSttAdapter::virtual_fallback());
+        let rag = Arc::new(
+            HybridRagEngine::new_in_memory(HybridRagConfig::default())
+                .expect("in-memory RAG engine"),
+        );
+        let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory SqliteStore"));
+        let learn = Arc::new(SpacedRepetitionService::new(store.clone()));
+
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register_builtin_tools();
+        let agent = Arc::new(ToolCallExecutor::new(Arc::new(tokio::sync::RwLock::new(
+            tool_registry,
+        ))));
 
         Self::new(
             llm,
@@ -202,9 +240,49 @@ impl AppState {
             stt,
             Arc::new(playback),
             Arc::new(capture),
+            rag,
+            store,
+            learn,
+            agent,
             clock,
             emitter,
         )
+    }
+
+    /// Obtains the active LLM port (either dynamically reconfigured or initial fallback).
+    pub fn get_llm(&self) -> Arc<dyn LlmPort> {
+        if let Some(ref dynamic) = *self.dynamic_llm.read().unwrap() {
+            return dynamic.clone();
+        }
+        self.llm.clone()
+    }
+
+    /// Dynamically reconfigures the active LLM instance.
+    pub fn set_dynamic_llm(&self, llm: Arc<dyn LlmPort>) {
+        *self.dynamic_llm.write().unwrap() = Some(llm);
+    }
+
+    /// Returns a copy of the recorded microphone audio samples.
+    pub fn get_recorded_audio(&self) -> Vec<f32> {
+        self.recorded_audio.lock().unwrap().clone()
+    }
+
+    /// Appends PCM audio samples to the microphone recording buffer.
+    pub fn append_recorded_audio(&self, samples: &[f32]) {
+        self.recorded_audio.lock().unwrap().extend_from_slice(samples);
+    }
+
+    /// Takes the recorded microphone audio buffer, clearing it atomically.
+    pub fn take_recorded_audio(&self) -> Vec<f32> {
+        let mut guard = self.recorded_audio.lock().unwrap();
+        let samples = guard.clone();
+        guard.clear();
+        samples
+    }
+
+    /// Clears the microphone recording buffer.
+    pub fn clear_recorded_audio(&self) {
+        self.recorded_audio.lock().unwrap().clear();
     }
 
     /// Returns true if an active LLM generation or TTS synthesis pipeline is in progress.

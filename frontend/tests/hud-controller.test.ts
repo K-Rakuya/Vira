@@ -43,4 +43,35 @@ describe('HudController tutor presets and normalization', () => {
     expect(TUTOR_PRESETS.japaneseTutor).toBe(TUTOR_PRESETS.japanese);
     expect(TUTOR_PRESETS.general).toBe(TUTOR_PRESETS.general_assistant);
   });
+
+  it('supports flashcard and pronunciation mock operations in tauri-bridge', async () => {
+    const { TauriBridge } = await import('../src/ipc/tauri-bridge');
+
+    // Create flashcard
+    const card = await TauriBridge.invoke('create_flashcard', {
+      payload: { front: 'Arigatou', back: 'Cảm ơn', cefr_level: 'A1' },
+    });
+    expect(card.front).toBe('Arigatou');
+    expect(card.back).toBe('Cảm ơn');
+
+    // List flashcards
+    const cards = await TauriBridge.invoke('list_flashcards');
+    expect(cards.length).toBeGreaterThan(0);
+
+    // Assess pronunciation
+    const assessment = await TauriBridge.invoke('assess_pronunciation', {
+      payload: { target_text: 'Xin chào' },
+    });
+    expect(assessment.overall_score).toBeGreaterThan(80);
+    expect(assessment.phoneme_scores.length).toBeGreaterThan(0);
+
+    // Document ingest & list
+    const doc = await TauriBridge.invoke('ingest_document', {
+      payload: { title: 'Grammar Note', content: 'Grammar rule 1' },
+    });
+    expect(doc.title).toBe('Grammar Note');
+
+    const docs = await TauriBridge.invoke('list_documents');
+    expect(docs.length).toBeGreaterThan(0);
+  });
 });

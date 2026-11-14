@@ -9,6 +9,25 @@ pub const EVENT_AUDIO_STATE: &str = "audio_state";
 pub const EVENT_GESTURE: &str = "gesture_event";
 pub const EVENT_EMOTION: &str = "emotion_event";
 pub const EVENT_STATE_CHANGE: &str = "state_change";
+pub const EVENT_SPEAK_SENTENCE: &str = "speak_sentence";
+
+/// Payload emitted for audible speech synthesis in the frontend.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakSentencePayload {
+    pub text: String,
+    pub language: String,
+    pub rate: f32,
+}
+
+impl SpeakSentencePayload {
+    pub fn new(text: impl Into<String>, language: impl Into<String>, rate: f32) -> Self {
+        Self {
+            text: text.into(),
+            language: language.into(),
+            rate,
+        }
+    }
+}
 
 /// Payload emitted for 60Hz Viseme lip-sync ticks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
