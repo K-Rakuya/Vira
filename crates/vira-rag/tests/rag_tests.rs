@@ -327,3 +327,30 @@ async fn test_hybrid_rag_empty_and_whitespace_search() {
     let results_zero_limit = engine.search("something", 0).await.expect("search limit 0");
     assert!(results_zero_limit.is_empty());
 }
+
+#[test]
+fn test_top_k_min_heap_selection_accuracy() {
+    let mut store = LocalVectorStore::new();
+
+    // Insert 5 records with known angles relative to [1.0, 0.0]
+    // Vector Record 1: [0.1, 0.99] -> low similarity with [1.0, 0.0] (~0.10)
+    // Vector Record 2: [0.9, 0.43] -> high similarity (~0.90)
+    // Vector Record 3: [0.5, 0.86] -> medium similarity (~0.50)
+    // Vector Record 4: [0.98, 0.19] -> highest similarity (~0.98)
+    // Vector Record 5: [0.2, 0.97] -> low similarity (~0.20)
+    store.insert(VectorRecord::new("c1", "doc1", "Doc 1", vec![0.1, 0.99]));
+    store.insert(VectorRecord::new("c2", "doc2", "Doc 2", vec![0.9, 0.43]));
+    store.insert(VectorRecord::new("c3", "doc3", "Doc 3", vec![0.5, 0.86]));
+    store.insert(VectorRecord::new("c4", "doc4", "Doc 4", vec![0.98, 0.19]));
+    store.insert(VectorRecord::new("c5", "doc5", "Doc 5", vec![0.2, 0.97]));
+
+    // Query for top 2 records closest to [1.0, 0.0]
+    let hits = store.search(&[1.0, 0.0], 2);
+    assert_eq!(hits.len(), 2, "Should return exactly limit=2 items");
+
+    // The top 2 must be c4 (score ~0.98) and c2 (score ~0.90), strictly ordered descending
+    assert_eq!(hits[0].chunk_id, "c4");
+    assert_eq!(hits[1].chunk_id, "c2");
+    assert!(hits[0].score > hits[1].score);
+    assert!(hits[1].score > 0.85);
+}

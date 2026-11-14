@@ -26,6 +26,8 @@ export class ExpressionController {
   public gestureHint: Record<string, number> = {};
 
   private values = new Map<string, number>();
+  private targets = new Map<string, number>();
+  private activeNames = new Set<string>();
   private blinkTimer = 0;
   private nextBlink = 2.5;
   private blinkPhase = -1;
@@ -74,12 +76,12 @@ export class ExpressionController {
       }
     }
 
-    const targets = new Map<string, number>();
+    this.targets.clear();
     const push = (name: string, weight: number) => {
       if (weight <= 0) return;
       const resolved = this.has(manager, name) ? { [name]: weight } : FALLBACKS[name] || {};
       for (const [k, v] of Object.entries(resolved)) {
-        targets.set(k, clamp((targets.get(k) || 0) + v, 0, 1));
+        this.targets.set(k, clamp((this.targets.get(k) || 0) + v, 0, 1));
       }
     };
 
@@ -91,11 +93,15 @@ export class ExpressionController {
     }
 
     const k = 1 - Math.exp(-9 * dt);
-    const names = new Set([...this.values.keys(), ...targets.keys()]);
-    for (const name of names) {
+    this.activeNames.clear();
+    for (const k of this.values.keys()) this.activeNames.add(k);
+    for (const k of this.targets.keys()) this.activeNames.add(k);
+
+    for (const name of this.activeNames) {
       const cur = this.values.get(name) || 0;
-      const next = cur + ((targets.get(name) || 0) - cur) * k;
-      if (next < 0.002 && !targets.has(name)) {
+      const targetVal = this.targets.get(name) || 0;
+      const next = cur + (targetVal - cur) * k;
+      if (next < 0.002 && !this.targets.has(name)) {
         this.values.delete(name);
         manager.setValue(name, 0);
       } else {

@@ -374,3 +374,114 @@ fn test_url_with_colon_not_split_early() {
     assert_eq!(chunks[0], "Hãy truy cập http://localhost:8080/api ngay hôm nay.");
     assert_eq!(chunks[1], "Hẹn gặp lại!");
 }
+
+#[test]
+fn test_stream_parser_sync_gestures_explain_shy_encourage() {
+    let mut parser = StreamParser::new();
+    let events = parser.feed("[explain] Để tôi giải thích cho bạn. [shy] Hì hì.");
+    assert!(events.contains(&ParsedStreamEvent::Gesture("explain".to_string())));
+    assert!(events.contains(&ParsedStreamEvent::Gesture("shy".to_string())));
+    assert!(events.contains(&ParsedStreamEvent::SpeakableText("Để tôi giải thích cho bạn.".to_string())));
+}
+
+#[test]
+fn test_stream_parser_dual_channel_thought_scratchpad() {
+    let mut parser = StreamParser::new();
+    let events = parser.feed("<thought>Người dùng đang hỏi về ngữ pháp tiếng Nhật N3.</thought>Dưới đây là cấu trúc câu.");
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[0],
+        ParsedStreamEvent::Thought("Người dùng đang hỏi về ngữ pháp tiếng Nhật N3.".to_string())
+    );
+    assert_eq!(
+        events[1],
+        ParsedStreamEvent::SpeakableText("Dưới đây là cấu trúc câu.".to_string())
+    );
+
+    // Also verify <think>...</think> variant
+    let mut parser2 = StreamParser::new();
+    let events2 = parser2.feed("<think>Analyzing user question</think>Chào bạn! [happy]");
+    assert_eq!(
+        events2[0],
+        ParsedStreamEvent::Thought("Analyzing user question".to_string())
+    );
+    assert!(events2.contains(&ParsedStreamEvent::Emotion("happy".to_string())));
+    assert!(events2.contains(&ParsedStreamEvent::SpeakableText("Chào bạn!".to_string())));
+
+    // Verify thoughts NEVER enter speakable text
+    for ev in events.iter().chain(events2.iter()) {
+        if let ParsedStreamEvent::SpeakableText(ref text) = ev {
+            assert!(!text.contains("Người dùng đang hỏi"));
+            assert!(!text.contains("Analyzing user"));
+        }
+    }
+}
+
+#[test]
+fn test_stream_parser_streaming_thought_across_chunks() {
+    let mut parser = StreamParser::new();
+    let e1 = parser.feed("<think>Bước 1: suy luận. ");
+    assert!(e1.is_empty(), "Unclosed thought must not emit premature events");
+
+    let e2 = parser.feed("Bước 2: tổng hợp.</think>Xin chào!");
+    assert_eq!(e2.len(), 2);
+    assert_eq!(
+        e2[0],
+        ParsedStreamEvent::Thought("Bước 1: suy luận. Bước 2: tổng hợp.".to_string())
+    );
+    assert_eq!(e2[1], ParsedStreamEvent::SpeakableText("Xin chào!".to_string()));
+}
+
+#[test]
+fn test_stream_parser_tag_fragmentation_at_1_byte_boundaries() {
+    let mut parser = StreamParser::new();
+
+    // Opening tag split across chunks: "<", "th", "ought>"
+    let e1 = parser.feed("Xin chào bạn. <");
+    assert_eq!(e1.len(), 1);
+    assert_eq!(e1[0], ParsedStreamEvent::SpeakableText("Xin chào bạn.".to_string()));
+
+    let e2 = parser.feed("th");
+    assert!(e2.is_empty(), "Incomplete '<th' must not leak to speech");
+
+    let e3 = parser.feed("ought>Đây là suy nghĩ bí mật</");
+    assert!(e3.is_empty(), "Inside thought must not leak to speech");
+
+    let e4 = parser.feed("thought>Chúc một ngày tốt lành!");
+    assert_eq!(e4.len(), 2);
+    assert_eq!(
+        e4[0],
+        ParsedStreamEvent::Thought("Đây là suy nghĩ bí mật".to_string())
+    );
+    assert_eq!(
+        e4[1],
+        ParsedStreamEvent::SpeakableText("Chúc một ngày tốt lành!".to_string())
+    );
+}
+
+#[test]
+fn test_stream_parser_think_tag_fragmentation_at_1_byte_boundaries() {
+    let mut parser = StreamParser::new();
+
+    // Opening tag split across chunks: "<", "thi", "nk>"
+    let e1 = parser.feed("Hôm nay trời đẹp. <");
+    assert_eq!(e1.len(), 1);
+    assert_eq!(e1[0], ParsedStreamEvent::SpeakableText("Hôm nay trời đẹp.".to_string()));
+
+    let e2 = parser.feed("thi");
+    assert!(e2.is_empty(), "Incomplete '<thi' must not leak to speech");
+
+    let e3 = parser.feed("nk>Suy nghĩ cẩn thận</");
+    assert!(e3.is_empty(), "Inside think must not leak to speech");
+
+    let e4 = parser.feed("think>Cùng bắt đầu nhé!");
+    assert_eq!(e4.len(), 2);
+    assert_eq!(
+        e4[0],
+        ParsedStreamEvent::Thought("Suy nghĩ cẩn thận".to_string())
+    );
+    assert_eq!(
+        e4[1],
+        ParsedStreamEvent::SpeakableText("Cùng bắt đầu nhé!".to_string())
+    );
+}

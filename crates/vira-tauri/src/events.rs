@@ -10,6 +10,23 @@ pub const EVENT_GESTURE: &str = "gesture_event";
 pub const EVENT_EMOTION: &str = "emotion_event";
 pub const EVENT_STATE_CHANGE: &str = "state_change";
 pub const EVENT_SPEAK_SENTENCE: &str = "speak_sentence";
+pub const EVENT_THOUGHT: &str = "thought_event";
+
+/// Payload emitted when internal reasoning scratchpad steps occur.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThoughtPayload {
+    pub text: String,
+    pub is_done: bool,
+}
+
+impl ThoughtPayload {
+    pub fn new(text: impl Into<String>, is_done: bool) -> Self {
+        Self {
+            text: text.into(),
+            is_done,
+        }
+    }
+}
 
 /// Payload emitted for audible speech synthesis in the frontend.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -17,6 +34,8 @@ pub struct SpeakSentencePayload {
     pub text: String,
     pub language: String,
     pub rate: f32,
+    #[serde(default)]
+    pub native_audio: bool,
 }
 
 impl SpeakSentencePayload {
@@ -25,7 +44,13 @@ impl SpeakSentencePayload {
             text: text.into(),
             language: language.into(),
             rate,
+            native_audio: false,
         }
+    }
+
+    pub fn with_native_audio(mut self, native_audio: bool) -> Self {
+        self.native_audio = native_audio;
+        self
     }
 }
 

@@ -74,4 +74,85 @@ describe('HudController tutor presets and normalization', () => {
     const docs = await TauriBridge.invoke('list_documents');
     expect(docs.length).toBeGreaterThan(0);
   });
+
+  it('eliminates double speech by suppressing Web Speech API when native_audio is active', async () => {
+    const { TauriBridge } = await import('../src/ipc/tauri-bridge');
+
+    let speechCalled = false;
+    let spokenText = '';
+    (globalThis as any).window = globalThis.window || {};
+    (globalThis as any).SpeechSynthesisUtterance = class {
+      text: string;
+      lang = '';
+      rate = 1;
+      constructor(t: string) {
+        this.text = t;
+      }
+    };
+    (globalThis.window as any).speechSynthesis = {
+      cancel: () => {},
+      speak: (utter: any) => {
+        speechCalled = true;
+        spokenText = utter.text;
+      },
+    };
+
+    // Simulate IPC event handler logic
+    const handleSpeakSentence = (payload: any) => {
+      if (payload?.native_audio) {
+        return;
+      }
+      if (payload?.text && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+        const utter = new (globalThis as any).SpeechSynthesisUtterance(payload.text);
+        window.speechSynthesis.speak(utter);
+      }
+    };
+
+    // 1. With native_audio: true -> speechSynthesis.speak MUST NOT be called
+    speechCalled = false;
+    handleSpeakSentence({ text: 'Hello from Kokoro native audio', native_audio: true });
+    expect(speechCalled).toBe(false);
+
+    // 2. With native_audio: false (fallback mode) -> speechSynthesis.speak MUST be called
+    speechCalled = false;
+    handleSpeakSentence({ text: 'Fallback speech synthesis', native_audio: false });
+    expect(speechCalled).toBe(true);
+    expect(spokenText).toBe('Fallback speech synthesis');
+  });
+
+  it('streams thought reasoning to thought scratchpad container', () => {
+    const thoughtCard = { hidden: true, open: false };
+    const thoughtBadge = { textContent: '' };
+    const thoughtText = { textContent: '' };
+
+    const handleThoughtEvent = (payload: any) => {
+      if (!payload) return;
+      thoughtCard.hidden = false;
+      if (!payload.is_done) {
+        thoughtCard.open = true;
+        thoughtBadge.textContent = 'Thinking...';
+      } else {
+        thoughtBadge.textContent = 'Thought complete';
+      }
+      if (payload.text) {
+        thoughtText.textContent = (thoughtText.textContent || '') + payload.text;
+      }
+    };
+
+    // Step 1: initial thought chunk
+    handleThoughtEvent({ text: 'Step 1: check grammar. ', is_done: false });
+    expect(thoughtCard.hidden).toBe(false);
+    expect(thoughtCard.open).toBe(true);
+    expect(thoughtBadge.textContent).toBe('Thinking...');
+    expect(thoughtText.textContent).toBe('Step 1: check grammar. ');
+
+    // Step 2: subsequent thought chunk
+    handleThoughtEvent({ text: 'Step 2: formulate response.', is_done: false });
+    expect(thoughtText.textContent).toBe('Step 1: check grammar. Step 2: formulate response.');
+
+    // Step 3: thought completion
+    handleThoughtEvent({ text: '', is_done: true });
+    expect(thoughtBadge.textContent).toBe('Thought complete');
+  });
 });

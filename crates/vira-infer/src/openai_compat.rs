@@ -376,6 +376,7 @@ impl HttpTransport for NativeHttpTransport {
 #[derive(Debug, Clone, Default)]
 pub struct MockLlmTransport {
     lines: Arc<std::sync::Mutex<Vec<String>>>,
+    script: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
     delay_ms: u64,
     fail_error: Arc<std::sync::Mutex<Option<LlmError>>>,
 }
@@ -385,6 +386,7 @@ impl MockLlmTransport {
     pub fn new(lines: Vec<String>) -> Self {
         Self {
             lines: Arc::new(std::sync::Mutex::new(lines)),
+            script: Arc::new(std::sync::Mutex::new(Vec::new())),
             delay_ms: 0,
             fail_error: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -407,6 +409,34 @@ impl MockLlmTransport {
         }
         lines.push("[DONE]".to_string());
         Self::new(lines)
+    }
+
+    /// Helper to create mock transport from a scripted sequence of multiple turns (e.g. for multi-step ReAct loops).
+    pub fn from_script(turns: Vec<Vec<&str>>) -> Self {
+        let mut script_lines = Vec::new();
+        for turn in turns {
+            let mut lines = Vec::new();
+            for delta in turn {
+                let json = serde_json::json!({
+                    "id": "mock-cmpl",
+                    "object": "chat.completion.chunk",
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": delta },
+                        "finish_reason": null
+                    }]
+                });
+                lines.push(json.to_string());
+            }
+            lines.push("[DONE]".to_string());
+            script_lines.push(lines);
+        }
+        Self {
+            lines: Arc::new(std::sync::Mutex::new(Vec::new())),
+            script: Arc::new(std::sync::Mutex::new(script_lines)),
+            delay_ms: 0,
+            fail_error: Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 
     /// Sets simulated per-chunk delay in milliseconds.
@@ -439,7 +469,14 @@ impl HttpTransport for MockLlmTransport {
             return Err(err);
         }
 
-        let lines = self.lines.lock().unwrap().clone();
+        let lines = {
+            let mut script_lock = self.script.lock().unwrap();
+            if !script_lock.is_empty() {
+                script_lock.remove(0)
+            } else {
+                self.lines.lock().unwrap().clone()
+            }
+        };
         let delay_ms = self.delay_ms;
         let (tx, rx) = mpsc::channel(64);
 
@@ -504,6 +541,7 @@ impl OpenAiCompatConfig {
 #[derive(Debug, Default)]
 pub struct StreamingTagExtractor {
     pending: String,
+    in_thought: Option<String>,
 }
 
 impl StreamingTagExtractor {
@@ -511,6 +549,7 @@ impl StreamingTagExtractor {
     pub fn new() -> Self {
         Self {
             pending: String::new(),
+            in_thought: None,
         }
     }
 
@@ -520,15 +559,87 @@ impl StreamingTagExtractor {
         let mut chunks = Vec::new();
 
         loop {
-            match self.pending.find('[') {
-                None => {
+            // 1. Inside thought scratchpad
+            if let Some(ref tag_name) = self.in_thought.clone() {
+                let lower = self.pending.to_ascii_lowercase();
+                let close_tag = format!("</{}>", tag_name);
+                if let Some(close_idx) = lower.find(&close_tag) {
+                    let thought_content = self.pending[..close_idx].trim().to_string();
+                    self.pending.drain(..close_idx + close_tag.len());
+                    self.in_thought = None;
+                    if !thought_content.is_empty() {
+                        chunks.push(LlmStreamChunk::new("").with_thought(thought_content));
+                    }
+                    continue;
+                } else {
+                    break;
+                }
+            }
+
+            // 2. Search for tags: '[' or '<thought>' / '<think>'
+            let open_bracket = self.pending.find('[');
+            let lower = self.pending.to_ascii_lowercase();
+            let thought_open = lower.find("<thought>").map(|idx| (idx, "thought", 9));
+            let think_open = lower.find("<think>").map(|idx| (idx, "think", 7));
+
+            let earliest_thought = match (thought_open, think_open) {
+                (Some(a), Some(b)) => if a.0 <= b.0 { Some(a) } else { Some(b) },
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+
+            // Incomplete '<' opening tag guard
+            let incomplete_lt = lower.rfind('<').and_then(|lt_idx| {
+                let tail = &lower[lt_idx..];
+                if ("<thought>".starts_with(tail) || "<think>".starts_with(tail))
+                    && earliest_thought.is_none_or(|(t_idx, _, _)| lt_idx < t_idx)
+                {
+                    return Some(lt_idx);
+                }
+                None
+            });
+
+            if let Some(lt_idx) = incomplete_lt {
+                if open_bracket.is_none_or(|b_idx| lt_idx < b_idx) {
+                    if lt_idx > 0 {
+                        let before = self.pending[..lt_idx].to_string();
+                        chunks.push(LlmStreamChunk::new(before));
+                        self.pending.drain(..lt_idx);
+                    }
+                    break;
+                }
+            }
+
+            match (open_bracket, earliest_thought) {
+                (None, None) => {
                     if !self.pending.is_empty() {
                         let delta = std::mem::take(&mut self.pending);
                         chunks.push(LlmStreamChunk::new(delta));
                     }
                     break;
                 }
-                Some(open_idx) => {
+                (Some(b_idx), Some((t_idx, tag_name, tag_len))) if t_idx < b_idx => {
+                    if t_idx > 0 {
+                        let before = self.pending[..t_idx].to_string();
+                        chunks.push(LlmStreamChunk::new(before));
+                        self.pending.drain(..t_idx);
+                    }
+                    self.pending.drain(..tag_len);
+                    self.in_thought = Some(tag_name.to_string());
+                    continue;
+                }
+                (None, Some((t_idx, tag_name, tag_len))) => {
+                    if t_idx > 0 {
+                        let before = self.pending[..t_idx].to_string();
+                        chunks.push(LlmStreamChunk::new(before));
+                        self.pending.drain(..t_idx);
+                    }
+                    self.pending.drain(..tag_len);
+                    self.in_thought = Some(tag_name.to_string());
+                    continue;
+                }
+                (Some(open_idx), _) => {
                     if open_idx > 0 {
                         let before = self.pending[..open_idx].to_string();
                         chunks.push(LlmStreamChunk::new(before));
@@ -601,7 +712,15 @@ impl StreamingTagExtractor {
 
     /// Concludes extraction, flushing any remaining pending bracket fragments.
     pub fn finish(&mut self) -> Vec<LlmStreamChunk> {
-        if self.pending.is_empty() {
+        if self.in_thought.take().is_some() {
+            let leftover = std::mem::take(&mut self.pending);
+            let trimmed = leftover.trim();
+            if !trimmed.is_empty() {
+                vec![LlmStreamChunk::new("").with_thought(trimmed)]
+            } else {
+                Vec::new()
+            }
+        } else if self.pending.is_empty() {
             Vec::new()
         } else {
             let leftover = std::mem::take(&mut self.pending);
@@ -820,6 +939,7 @@ impl LlmPort for OpenAiCompatLlmAdapter {
                                                 let chunk = match event {
                                                     ParsedStreamEvent::Emotion(e) => LlmStreamChunk::new("").with_emotion(e),
                                                     ParsedStreamEvent::Gesture(g) => LlmStreamChunk::new("").with_gesture(g),
+                                                    ParsedStreamEvent::Thought(th) => LlmStreamChunk::new("").with_thought(th),
                                                     ParsedStreamEvent::SpeakableText(t) => LlmStreamChunk::new(t),
                                                 };
                                                 if sender.send(chunk).await.is_err() {
@@ -830,7 +950,10 @@ impl LlmPort for OpenAiCompatLlmAdapter {
                                         StreamingMode::IncrementalToken => {
                                             let chunks = tag_extractor.feed(&delta_text);
                                             for chunk in chunks {
-                                                if (!chunk.is_empty() || chunk.emotion.is_some() || chunk.gesture.is_some())
+                                                if (!chunk.is_empty()
+                                                    || chunk.emotion.is_some()
+                                                    || chunk.gesture.is_some()
+                                                    || chunk.thought.is_some())
                                                     && sender.send(chunk).await.is_err()
                                                 {
                                                     return Err(LlmError::Channel("receiver dropped".to_string()));
@@ -860,6 +983,7 @@ impl LlmPort for OpenAiCompatLlmAdapter {
                     let chunk = match event {
                         ParsedStreamEvent::Emotion(e) => LlmStreamChunk::new("").with_emotion(e),
                         ParsedStreamEvent::Gesture(g) => LlmStreamChunk::new("").with_gesture(g),
+                        ParsedStreamEvent::Thought(th) => LlmStreamChunk::new("").with_thought(th),
                         ParsedStreamEvent::SpeakableText(t) => LlmStreamChunk::new(t),
                     };
                     if sender.send(chunk).await.is_err() {
@@ -870,7 +994,7 @@ impl LlmPort for OpenAiCompatLlmAdapter {
             StreamingMode::IncrementalToken => {
                 let trailing = tag_extractor.finish();
                 for chunk in trailing {
-                    if !chunk.is_empty() && sender.send(chunk).await.is_err() {
+                    if (!chunk.is_empty() || chunk.thought.is_some()) && sender.send(chunk).await.is_err() {
                         return Err(LlmError::Channel("receiver dropped".to_string()));
                     }
                 }

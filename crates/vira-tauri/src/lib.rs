@@ -33,6 +33,7 @@ pub fn spawn_viseme_tick_loop(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(16));
+        let mut was_active = false;
         while !cancel.is_cancelled() {
             interval.tick().await;
 
@@ -47,9 +48,23 @@ pub fn spawn_viseme_tick_loop(
                 state.emit_subtitle("", vira_domain::state::ConversationState::Idle);
                 *state.active_visemes.write().unwrap() = Vec::new();
                 state.emit_viseme_tick(VisemeWeights::zero(), false);
+                was_active = false;
                 continue;
             }
 
+            let is_active = is_playing || is_gen || current_conv_state == vira_domain::state::ConversationState::Speaking;
+
+            if !is_active {
+                if was_active {
+                    // Emit one zero viseme tick to reset the avatar mouth when entering idle
+                    state.emit_viseme_tick(VisemeWeights::zero(), false);
+                    was_active = false;
+                }
+                // Adaptive Viseme Gating: pause sending IPC ticks until audio playback or generation resumes
+                continue;
+            }
+
+            was_active = true;
             let now_ms = state.clock.current_time_ms();
 
             let weights = if is_playing {

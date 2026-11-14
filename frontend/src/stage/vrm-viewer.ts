@@ -289,15 +289,18 @@ export class VRMViewer {
     }
   }
 
+  private _rightScratch = new THREE.Vector3();
+  private _upScratch = new THREE.Vector3();
+
   private updateLookTarget(): void {
     const gaze = this.proceduralAnimator.eyeGaze;
     if (!gaze || !this.camera) return;
-    const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrixWorld, 0);
-    const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrixWorld, 1);
+    this._rightScratch.setFromMatrixColumn(this.camera.matrixWorld, 0);
+    this._upScratch.setFromMatrixColumn(this.camera.matrixWorld, 1);
     this.lookTarget.position
       .copy(this.camera.position)
-      .addScaledVector(right, gaze.x * 0.45)
-      .addScaledVector(up, -gaze.y * 0.3);
+      .addScaledVector(this._rightScratch, gaze.x * 0.45)
+      .addScaledVector(this._upScratch, -gaze.y * 0.3);
     this.lookTarget.updateMatrixWorld(true);
   }
 
@@ -312,7 +315,7 @@ export class VRMViewer {
     this.controls?.update();
 
     if (this.currentVrm) {
-      this.proceduralAnimator.update(this.currentVrm, dt, this.time, { mouth: this.lipSyncAnimator.mouthEnergy });
+      this.proceduralAnimator.update(this.currentVrm, dt, this.time, this.lipSyncAnimator.mouthEnergy);
       this.lipSyncAnimator.update(this.currentVrm, dt);
       this.updateLookTarget();
       this.currentVrm.update(dt);

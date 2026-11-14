@@ -61,6 +61,15 @@
     </header>
 
     <main class="center-hud">
+      <details id="thought-card" class="thought-card interactive" hidden>
+        <summary class="thought-summary">
+          <span class="thought-icon" aria-hidden="true">💭</span>
+          <span class="thought-title">Internal Reasoning / Scratchpad</span>
+          <span class="thought-badge" id="thought-badge">Thinking...</span>
+        </summary>
+        <div id="thought-text" class="thought-text" aria-live="polite"></div>
+      </details>
+
       <div id="subtitle-card" class="subtitle-card interactive active" data-state="idle">
         <div class="subtitle-head">
           <span class="status-dot" aria-hidden="true"></span>

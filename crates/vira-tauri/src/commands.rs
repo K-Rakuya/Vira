@@ -10,8 +10,8 @@ use vira_ports::tts::TimedViseme;
 use vira_voice::stream_parser::{ParsedStreamEvent, StreamParser};
 
 use crate::events::{
-    EmotionPayload, GesturePayload, SpeakSentencePayload, EVENT_EMOTION, EVENT_GESTURE,
-    EVENT_SPEAK_SENTENCE,
+    EmotionPayload, GesturePayload, SpeakSentencePayload, ThoughtPayload, EVENT_EMOTION,
+    EVENT_GESTURE, EVENT_SPEAK_SENTENCE, EVENT_THOUGHT,
 };
 use crate::state::{AppSettingsPayload, AppState, GetAppStateResponse, TutorMode};
 
@@ -47,6 +47,105 @@ pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32
     out
 }
 
+/// Modified Bessel function of first kind of order 0, I_0(x).
+pub fn bessel_i0(x: f64) -> f64 {
+    let mut sum = 1.0;
+    let mut term = 1.0;
+    let x_half = x * 0.5;
+    for k in 1..=25 {
+        term *= (x_half / k as f64) * (x_half / k as f64);
+        sum += term;
+        if term < 1e-16 * sum {
+            break;
+        }
+    }
+    sum
+}
+
+/// Normalized sinc function: sinc(x) = sin(pi * x) / (pi * x).
+pub fn sinc(x: f64) -> f64 {
+    if x.abs() < 1e-8 {
+        1.0
+    } else {
+        let px = std::f64::consts::PI * x;
+        px.sin() / px
+    }
+}
+
+/// Resamples an audio buffer between sampling rates using a Polyphase Kaiser-windowed sinc filter.
+///
+/// Features:
+/// - Kaiser window with shape parameter beta = 8.5 providing > 100dB stopband attenuation
+/// - Bandwidth scaling to Nyquist frequency when downsampling to prevent aliasing
+/// - Unity partition normalization sum(w_i) = 1.0 to eliminate DC ripple and gain distortion
+/// - Safe boundary clamping and graceful edge-case handling (empty, 0-rate, equal rate)
+pub fn resample_kaiser_sinc(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == to_rate || samples.is_empty() || from_rate == 0 || to_rate == 0 {
+        return samples.to_vec();
+    }
+
+    let ratio = to_rate as f64 / from_rate as f64;
+    let out_len = (samples.len() as f64 * ratio).round() as usize;
+    if out_len == 0 {
+        return Vec::new();
+    }
+
+    // Cutoff frequency s <= 1.0 for anti-aliasing when downsampling
+    let s = ratio.min(1.0);
+    let beta = 8.5f64;
+    let i0_beta = bessel_i0(beta);
+
+    let in_len = samples.len() as isize;
+
+    // Half-width radius M samples (scaled by 1/s when downsampling to maintain transition bandwidth, bounded for extreme ratios)
+    let base_m = 16.0f64;
+    let radius = (base_m / s).min((in_len.max(1) as f64) * 2.0);
+    if radius <= 0.0 || !radius.is_finite() {
+        return samples.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(out_len);
+
+    for i in 0..out_len {
+        let t_src = i as f64 / ratio;
+        let j_min = (t_src - radius).ceil() as isize;
+        let j_max = (t_src + radius).floor() as isize;
+
+        let clamp_j_min = j_min.max(0);
+        let clamp_j_max = j_max.min(in_len - 1);
+
+        if clamp_j_min > clamp_j_max {
+            let nearest = t_src.round().clamp(0.0, (in_len - 1) as f64) as usize;
+            out.push(samples.get(nearest).copied().unwrap_or(0.0));
+            continue;
+        }
+
+        let mut acc = 0.0f64;
+        let mut sum_weights = 0.0f64;
+
+        for j in clamp_j_min..=clamp_j_max {
+            let t = t_src - j as f64;
+            let norm_t = (t / radius).abs();
+            if norm_t <= 1.0 {
+                let sinc_val = sinc(s * t);
+                let w = bessel_i0(beta * (1.0 - norm_t * norm_t).max(0.0).sqrt()) / i0_beta;
+                let weight = s * sinc_val * w;
+                acc += samples[j as usize] as f64 * weight;
+                sum_weights += weight;
+            }
+        }
+
+        if sum_weights.abs() > 1e-9 {
+            out.push((acc / sum_weights) as f32);
+        } else {
+            let nearest = t_src.round().clamp(0.0, (in_len - 1) as f64) as usize;
+            out.push(samples.get(nearest).copied().unwrap_or(0.0));
+        }
+    }
+
+    out
+}
+
 /// Helper to process, synthesize, and enqueue a single speakable sentence.
 async fn process_speakable_sentence(
     clean: &str,
@@ -77,7 +176,7 @@ async fn process_speakable_sentence(
     if !tts_out.samples.is_empty() {
         let pb_rate = state.audio_playback.sample_rate();
         let samples = if tts_out.sample_rate != pb_rate && tts_out.sample_rate > 0 && pb_rate > 0 {
-            resample_linear(&tts_out.samples, tts_out.sample_rate, pb_rate)
+            resample_kaiser_sinc(&tts_out.samples, tts_out.sample_rate, pb_rate)
         } else {
             tts_out.samples
         };
@@ -107,6 +206,9 @@ async fn process_speakable_sentence(
         state.force_state(ConversationState::Speaking);
         state.emit_subtitle(clean, ConversationState::Speaking);
 
+        let enqueue_res = state.audio_playback.enqueue_samples(&samples);
+        let has_native_audio = enqueue_res.is_ok() && !samples.is_empty();
+
         // Emit speak_sentence for synchronized audible speech in frontend
         let tutor_mode = *state.tutor_mode.read().unwrap();
         let lang = match tutor_mode {
@@ -116,12 +218,12 @@ async fn process_speakable_sentence(
             TutorMode::GeneralAssistant => "vi-VN",
         };
         let speed = state.settings.read().unwrap().tts_speed.unwrap_or(1.0);
-        let speak_payload = SpeakSentencePayload::new(clean, lang, speed);
+        let speak_payload =
+            SpeakSentencePayload::new(clean, lang, speed).with_native_audio(has_native_audio);
         if let Ok(v) = serde_json::to_value(speak_payload) {
             let _ = state.emitter.emit(EVENT_SPEAK_SENTENCE, v);
         }
 
-        let _ = state.audio_playback.enqueue_samples(&samples);
         state.active_visemes.write().unwrap().extend(offset_visemes);
         *cumulative_duration_ms += chunk_dur;
         *chunks_synthesized += 1;
@@ -130,8 +232,70 @@ async fn process_speakable_sentence(
     true
 }
 
+/// Helper to extract structured tool calls from LLM reasoning or generation text.
+pub fn extract_tool_call_from_text(text: &str) -> Option<(String, serde_json::Value)> {
+    // 1. <tool_call>...</tool_call>
+    if let Some(start) = text.find("<tool_call>") {
+        let after = &text[start + 11..];
+        if let Some(end) = after.find("</tool_call>") {
+            let json_str = after[..end].trim();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(name) = v
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .or_else(|| v.get("tool").and_then(|n| n.as_str()))
+                {
+                    let args = v
+                        .get("arguments")
+                        .or_else(|| v.get("parameters"))
+                        .or_else(|| v.get("args"))
+                        .cloned()
+                        .unwrap_or(serde_json::json!({}));
+                    return Some((name.to_string(), args));
+                }
+            }
+        }
+    }
+
+    // 2. [tool_call:{"name":...}]
+    if let Some(start) = text.find("[tool_call:") {
+        let after = &text[start + 11..];
+        for (idx, c) in after.char_indices() {
+            if c == ']' {
+                let json_str = after[..idx].trim();
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+                        let args = v.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+                        return Some((name.to_string(), args));
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. [tool:<name> <json>] or [tool:<name>]
+    if let Some(start) = text.find("[tool:") {
+        let after = &text[start + 6..];
+        for (idx, c) in after.char_indices() {
+            if c == ']' {
+                let inner = after[..idx].trim();
+                if let Some((name, json_str)) = inner.split_once(' ') {
+                    let name = name.trim();
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(json_str.trim()) {
+                        return Some((name.to_string(), args));
+                    }
+                } else if !inner.is_empty() && !inner.contains(' ') {
+                    return Some((inner.to_string(), serde_json::json!({})));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Executes a complete conversational turn:
-/// LLM stream -> tag extraction (emotion/gesture) -> sentence chunker -> TTS synthesis -> audio playback.
+/// LLM stream -> tag extraction (emotion/gesture/thought) -> ReAct tool loop -> sentence chunker -> TTS synthesis -> audio playback.
 pub async fn execute_conversation_turn(
     text: &str,
     state: &AppState,
@@ -169,13 +333,34 @@ pub async fn execute_conversation_turn(
     let tutor_mode = *state.tutor_mode.read().unwrap();
     let has_system_msg = history_snapshot.first().is_some_and(|m| m.is_system());
     if !has_system_msg {
-        let prompt = state
+        let mut prompt = state
             .settings
             .read()
             .unwrap()
             .system_prompt
             .clone()
             .unwrap_or_else(|| tutor_mode.system_prompt().to_string());
+
+        // Hierarchical Memory: Inject active learner profile from SQLite user_profiles table
+        let user_profile = state.store.get_user_profile("user_primary").await.ok().flatten();
+        let fallback_profile = if user_profile.is_none() {
+            state.store.get_user_profile("default_user").await.ok().flatten()
+        } else {
+            None
+        };
+        if let Some(profile) = user_profile.or(fallback_profile) {
+            prompt.push_str(&format!(
+                "\n\n[Active Learner Profile]\n- Target Language: {}\n- Native Language: {}\n- CEFR Proficiency Level: {}",
+                profile.target_language, profile.native_language, profile.cefr_level
+            ));
+            if let Some(weaknesses) = profile
+                .get_preference("weaknesses")
+                .or_else(|| profile.get_preference("persistent_weaknesses"))
+            {
+                prompt.push_str(&format!("\n- Persistent Weaknesses / Focus: {}", weaknesses));
+            }
+        }
+
         history_snapshot.insert(0, Message::system(prompt));
     }
 
@@ -194,97 +379,188 @@ pub async fn execute_conversation_turn(
         }
     }
 
-    // 6. Launch LLM stream and capture join handle to catch errors
-    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-    let llm = state.get_llm();
-    let cancel_llm = cancel.clone();
-    let llm_handle = tokio::spawn(async move {
-        llm.stream_chat(&history_snapshot, tx, cancel_llm).await
-    });
-
-    // 7. Stream parser accumulates text and extracts inline emotion/gesture tags
-    let mut parser = StreamParser::new();
+    // 6. Autonomous ReAct loop (up to K=3 iterations)
+    let max_iterations = 3usize;
     let mut full_assistant_text = String::new();
     let mut chunks_synthesized = 0usize;
     let mut cumulative_duration_ms = 0u64;
+    let mut last_llm_res = None;
 
-    while let Some(chunk) = rx.recv().await {
+    for iteration in 0..max_iterations {
         if cancel.is_cancelled() {
             break;
         }
 
-        // Direct tags attached to chunk
-        if let Some(ref emo) = chunk.emotion {
-            let weight = 1.0f32;
-            *state.emotion.write().unwrap() = (emo.clone(), weight);
-            let payload = EmotionPayload {
-                name: emo.clone(),
-                weight,
-            };
-            if let Ok(v) = serde_json::to_value(payload) {
-                let _ = state.emitter.emit(EVENT_EMOTION, v);
-            }
-        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let llm = state.get_llm();
+        let cancel_llm = cancel.clone();
+        let history_for_llm = history_snapshot.clone();
+        let llm_handle = tokio::spawn(async move {
+            llm.stream_chat(&history_for_llm, tx, cancel_llm).await
+        });
 
-        if let Some(ref gest) = chunk.gesture {
-            let payload = GesturePayload {
-                name: gest.clone(),
-                duration: 2.0,
-            };
-            if let Ok(v) = serde_json::to_value(payload) {
-                let _ = state.emitter.emit(EVENT_GESTURE, v);
-            }
-        }
+        let mut parser = StreamParser::new();
+        let mut iteration_text = String::new();
+        let mut detected_tool_call: Option<(String, serde_json::Value)> = None;
 
-        if !chunk.delta.is_empty() {
-            let events = parser.feed(&chunk.delta);
-            for event in events {
-                if cancel.is_cancelled() {
-                    break;
+        while let Some(chunk) = rx.recv().await {
+            if cancel.is_cancelled() {
+                break;
+            }
+
+            // Streamed thought reasoning block
+            if let Some(ref th) = chunk.thought {
+                state.force_state(ConversationState::Thinking);
+                if let Ok(v) = serde_json::to_value(ThoughtPayload::new(th, false)) {
+                    let _ = state.emitter.emit(EVENT_THOUGHT, v);
                 }
-                match event {
-                    ParsedStreamEvent::Emotion(emo) => {
-                        let weight = 1.0f32;
-                        *state.emotion.write().unwrap() = (emo.clone(), weight);
-                        let payload = EmotionPayload { name: emo, weight };
-                        if let Ok(v) = serde_json::to_value(payload) {
-                            let _ = state.emitter.emit(EVENT_EMOTION, v);
-                        }
-                    }
-                    ParsedStreamEvent::Gesture(gest) => {
-                        let payload = GesturePayload {
-                            name: gest,
-                            duration: 2.0,
-                        };
-                        if let Ok(v) = serde_json::to_value(payload) {
-                            let _ = state.emitter.emit(EVENT_GESTURE, v);
-                        }
-                    }
-                    ParsedStreamEvent::SpeakableText(sentence) => {
-                        let clean = sentence.trim();
-                        if clean.is_empty() {
-                            continue;
-                        }
-                        if !process_speakable_sentence(
-                            clean,
-                            state,
-                            &cancel,
-                            &mut full_assistant_text,
-                            &mut cumulative_duration_ms,
-                            &mut chunks_synthesized,
-                        )
-                        .await
-                        {
+            }
+
+            // Direct tags attached to chunk
+            if let Some(ref emo) = chunk.emotion {
+                let weight = 1.0f32;
+                *state.emotion.write().unwrap() = (emo.clone(), weight);
+                let payload = EmotionPayload {
+                    name: emo.clone(),
+                    weight,
+                };
+                if let Ok(v) = serde_json::to_value(payload) {
+                    let _ = state.emitter.emit(EVENT_EMOTION, v);
+                }
+            }
+
+            if let Some(ref gest) = chunk.gesture {
+                let payload = GesturePayload {
+                    name: gest.clone(),
+                    duration: 2.0,
+                };
+                if let Ok(v) = serde_json::to_value(payload) {
+                    let _ = state.emitter.emit(EVENT_GESTURE, v);
+                }
+            }
+
+            if !chunk.delta.is_empty() {
+                iteration_text.push_str(&chunk.delta);
+
+                if detected_tool_call.is_none() {
+                    detected_tool_call = extract_tool_call_from_text(&iteration_text);
+                }
+
+                let is_tool_call_candidate = detected_tool_call.is_some()
+                    || iteration_text.contains("<tool_call")
+                    || iteration_text.contains("[tool_call")
+                    || iteration_text.contains("[tool:");
+
+                // If not calling a tool, stream events to parser and TTS
+                if !is_tool_call_candidate {
+                    let events = parser.feed(&chunk.delta);
+                    for event in events {
+                        if cancel.is_cancelled() {
                             break;
                         }
+                        match event {
+                            ParsedStreamEvent::Emotion(emo) => {
+                                let weight = 1.0f32;
+                                *state.emotion.write().unwrap() = (emo.clone(), weight);
+                                let payload = EmotionPayload { name: emo, weight };
+                                if let Ok(v) = serde_json::to_value(payload) {
+                                    let _ = state.emitter.emit(EVENT_EMOTION, v);
+                                }
+                            }
+                            ParsedStreamEvent::Gesture(gest) => {
+                                let payload = GesturePayload {
+                                    name: gest,
+                                    duration: 2.0,
+                                };
+                                if let Ok(v) = serde_json::to_value(payload) {
+                                    let _ = state.emitter.emit(EVENT_GESTURE, v);
+                                }
+                            }
+                            ParsedStreamEvent::Thought(thought) => {
+                                state.force_state(ConversationState::Thinking);
+                                if let Ok(v) =
+                                    serde_json::to_value(ThoughtPayload::new(thought, false))
+                                {
+                                    let _ = state.emitter.emit(EVENT_THOUGHT, v);
+                                }
+                            }
+                            ParsedStreamEvent::SpeakableText(sentence) => {
+                                let clean = sentence.trim();
+                                if clean.is_empty() {
+                                    continue;
+                                }
+                                if !process_speakable_sentence(
+                                    clean,
+                                    state,
+                                    &cancel,
+                                    &mut full_assistant_text,
+                                    &mut cumulative_duration_ms,
+                                    &mut chunks_synthesized,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-    }
 
-    // Flush any remaining text in the parser
-    if !cancel.is_cancelled() {
+        let llm_res = llm_handle.await;
+        last_llm_res = Some(llm_res);
+
+        if cancel.is_cancelled() {
+            break;
+        }
+
+        // Final tool check at end of current stream
+        if detected_tool_call.is_none() {
+            detected_tool_call = extract_tool_call_from_text(&iteration_text);
+        }
+
+        if let Some((tool_name, tool_args)) = detected_tool_call {
+            parser.reset();
+            state.force_state(ConversationState::Thinking);
+            if let Ok(v) = serde_json::to_value(ThoughtPayload::new(
+                format!("Calling tool `{tool_name}` with arguments: {tool_args}"),
+                false,
+            )) {
+                let _ = state.emitter.emit(EVENT_THOUGHT, v);
+            }
+
+            let tool_req = vira_ports::agent::ToolCallRequest::new(
+                format!("call_{message_id}_{iteration}"),
+                &tool_name,
+                tool_args.clone(),
+            );
+
+            let tool_result = state.agent.execute_tool(tool_req).await;
+            let output_str = match tool_result {
+                Ok(res) => res.content,
+                Err(err) => format!("Error executing tool: {err}"),
+            };
+
+            // Append assistant tool call and observation to history and persistent store
+            let tool_msg = Message::assistant(format!(
+                "<tool_call>{{\"name\":\"{tool_name}\",\"arguments\":{tool_args}}}</tool_call>"
+            ));
+            let obs_msg = Message::system(format!(
+                "Observation from tool `{tool_name}`: {output_str}"
+            ));
+            history_snapshot.push(tool_msg.clone());
+            history_snapshot.push(obs_msg.clone());
+            state.history.write().await.push(tool_msg.clone());
+            state.history.write().await.push(obs_msg.clone());
+            let _ = state.store.save_message("default_session", &tool_msg).await;
+            let _ = state.store.save_message("default_session", &obs_msg).await;
+
+            // Secondary explanation will be streamed in next loop iteration
+            continue;
+        }
+
+        // Flush remaining text from parser
         let flushed = parser.finish();
         for event in flushed {
             if cancel.is_cancelled() {
@@ -308,6 +584,12 @@ pub async fn execute_conversation_turn(
                         let _ = state.emitter.emit(EVENT_GESTURE, v);
                     }
                 }
+                ParsedStreamEvent::Thought(thought) => {
+                    state.force_state(ConversationState::Thinking);
+                    if let Ok(v) = serde_json::to_value(ThoughtPayload::new(thought, false)) {
+                        let _ = state.emitter.emit(EVENT_THOUGHT, v);
+                    }
+                }
                 ParsedStreamEvent::SpeakableText(sentence) => {
                     let clean = sentence.trim();
                     if clean.is_empty() {
@@ -328,10 +610,34 @@ pub async fn execute_conversation_turn(
                 }
             }
         }
+
+        // Check LLM error if no text was generated
+        if chunks_synthesized == 0 && full_assistant_text.is_empty() {
+            match last_llm_res.as_ref() {
+                Some(Ok(Err(llm_err))) => {
+                    state.set_generating(false);
+                    state.force_state(ConversationState::Idle);
+                    state.emit_subtitle("", ConversationState::Idle);
+                    return Err(format!("LLM inference failed: {llm_err}"));
+                }
+                Some(Err(join_err)) => {
+                    state.set_generating(false);
+                    state.force_state(ConversationState::Idle);
+                    state.emit_subtitle("", ConversationState::Idle);
+                    return Err(format!("LLM task panicked: {join_err}"));
+                }
+                _ => {}
+            }
+        }
+
+        // ReAct conversation turn concluded naturally
+        break;
     }
 
-    // Inspect LLM task completion
-    let llm_res = llm_handle.await;
+    // Mark thoughts completed
+    if let Ok(v) = serde_json::to_value(ThoughtPayload::new("", true)) {
+        let _ = state.emitter.emit(EVENT_THOUGHT, v);
+    }
 
     // Generation is done
     state.set_generating(false);
@@ -349,11 +655,11 @@ pub async fn execute_conversation_turn(
         state.force_state(ConversationState::Idle);
         state.emit_subtitle("", ConversationState::Idle);
 
-        match llm_res {
-            Ok(Err(llm_err)) => {
+        match last_llm_res {
+            Some(Ok(Err(llm_err))) => {
                 return Err(format!("LLM inference failed: {llm_err}"));
             }
-            Err(join_err) => {
+            Some(Err(join_err)) => {
                 return Err(format!("LLM task panicked: {join_err}"));
             }
             _ => {

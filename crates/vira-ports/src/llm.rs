@@ -77,6 +77,9 @@ pub struct LlmStreamChunk {
     /// Optional avatar gesture tag extracted from or associated with this chunk (e.g. "wave", "nod").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gesture: Option<String>,
+    /// Optional internal thought/scratchpad reasoning extracted from this chunk (e.g. `<thought>...</thought>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought: Option<String>,
 }
 
 impl LlmStreamChunk {
@@ -87,6 +90,7 @@ impl LlmStreamChunk {
             is_final: false,
             emotion: None,
             gesture: None,
+            thought: None,
         }
     }
 
@@ -97,6 +101,7 @@ impl LlmStreamChunk {
             is_final: true,
             emotion: None,
             gesture: None,
+            thought: None,
         }
     }
 
@@ -107,6 +112,7 @@ impl LlmStreamChunk {
             is_final: true,
             emotion: None,
             gesture: None,
+            thought: None,
         }
     }
 
@@ -122,6 +128,12 @@ impl LlmStreamChunk {
         self
     }
 
+    /// Attaches an internal thought reasoning string to this chunk.
+    pub fn with_thought(mut self, thought: impl Into<String>) -> Self {
+        self.thought = Some(thought.into());
+        self
+    }
+
     /// Constructs a chunk by extracting inline `[emotion:...]` and `[gesture:...]` tags
     /// from the raw text delta, populating `emotion` and `gesture` and leaving clean text in `delta`.
     pub fn from_delta_extracting_tags(raw_delta: &str) -> Self {
@@ -133,6 +145,7 @@ impl LlmStreamChunk {
             is_final: false,
             emotion,
             gesture,
+            thought: None,
         }
     }
 

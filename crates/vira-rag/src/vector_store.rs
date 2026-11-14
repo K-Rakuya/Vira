@@ -35,13 +35,14 @@ pub struct VectorRecord {
 }
 
 impl VectorRecord {
-    /// Creates a new vector record with empty metadata.
+    /// Creates a new vector record with empty metadata and pre-normalizes vector to unit L2 norm.
     pub fn new(
         chunk_id: impl Into<String>,
         doc_id: impl Into<String>,
         text: impl Into<String>,
-        vector: Vec<f32>,
+        mut vector: Vec<f32>,
     ) -> Self {
+        normalize_vector(&mut vector);
         Self {
             chunk_id: chunk_id.into(),
             doc_id: doc_id.into(),
@@ -99,6 +100,59 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Normalizes a float vector in-place to unit L2 norm (||v||_2 = 1.0).
+/// If vector is empty or has zero norm, it remains unchanged.
+pub fn normalize_vector(v: &mut [f32]) {
+    let mut sum_sq = 0.0f32;
+    for &x in v.iter() {
+        sum_sq += x * x;
+    }
+    if sum_sq > f32::EPSILON && sum_sq.is_finite() {
+        let inv = 1.0 / sum_sq.sqrt();
+        for x in v.iter_mut() {
+            *x *= inv;
+        }
+    }
+}
+
+/// Computes inner dot product between two float vectors.
+pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len().min(b.len());
+    let mut sum = 0.0f32;
+    for i in 0..len {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
+#[derive(Clone, PartialEq)]
+struct HeapCandidate {
+    score: f32,
+    chunk_id: String,
+    record_idx: usize,
+}
+
+impl Eq for HeapCandidate {}
+
+impl PartialOrd for HeapCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Min-heap ordering in Rust's max-heap BinaryHeap:
+        // Smaller score is ranked Greater so it stays at the top of the heap (peek/pop).
+        // Tie-breaker: lexicographically larger chunk_id has greater priority to pop first.
+        other
+            .score
+            .partial_cmp(&self.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.chunk_id.cmp(&other.chunk_id))
+    }
+}
+
 /// In-process local embedded vector store.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LocalVectorStore {
@@ -134,8 +188,9 @@ impl LocalVectorStore {
         }
     }
 
-    /// Inserts a vector record into the store.
-    pub fn insert(&mut self, record: VectorRecord) {
+    /// Inserts a vector record into the store, ensuring unit L2 vector normalization.
+    pub fn insert(&mut self, mut record: VectorRecord) {
+        normalize_vector(&mut record.vector);
         // If chunk_id already exists, replace it
         if let Some(pos) = self.records.iter().position(|r| r.chunk_id == record.chunk_id) {
             self.records[pos] = record;
@@ -151,39 +206,62 @@ impl LocalVectorStore {
         }
     }
 
-    /// Searches for top-k records closest to `query_vector` using cosine similarity.
+    /// Searches for top-k records closest to `query_vector` using pre-normalized dot product
+    /// and a bounded BinaryHeap for O(N log k) retrieval.
     pub fn search(&self, query_vector: &[f32], limit: usize) -> Vec<VectorHit> {
         if self.records.is_empty() || limit == 0 {
             return Vec::new();
         }
 
-        let mut scored: Vec<(f32, &VectorRecord)> = self
-            .records
-            .iter()
-            .map(|r| {
-                let score = cosine_similarity(query_vector, &r.vector);
-                (score, r)
-            })
-            .collect();
+        let mut norm_query = query_vector.to_vec();
+        normalize_vector(&mut norm_query);
 
-        // Sort descending by score
-        scored.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
+        // Min-heap bounded at capacity `limit` for O(N log k) top-k selection
+        let mut heap: std::collections::BinaryHeap<HeapCandidate> =
+            std::collections::BinaryHeap::with_capacity(limit + 1);
+
+        for (idx, record) in self.records.iter().enumerate() {
+            let score = dot_product(&norm_query, &record.vector).clamp(-1.0, 1.0);
+            let candidate = HeapCandidate {
+                score,
+                chunk_id: record.chunk_id.clone(),
+                record_idx: idx,
+            };
+
+            if heap.len() < limit {
+                heap.push(candidate);
+            } else if let Some(min_cand) = heap.peek() {
+                // Since heap is configured as a min-heap, min_cand has the lowest score in the top-k.
+                // If candidate has a higher score, evict the minimum and insert the candidate.
+                if score > min_cand.score {
+                    heap.pop();
+                    heap.push(candidate);
+                }
+            }
+        }
+
+        let mut top_k: Vec<HeapCandidate> = heap.into_vec();
+        // Sort descending by score, tie-break by chunk_id ascending
+        top_k.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.chunk_id.cmp(&b.1.chunk_id))
+                .then_with(|| a.chunk_id.cmp(&b.chunk_id))
         });
 
-        scored
+        top_k
             .into_iter()
-            .take(limit)
             .enumerate()
-            .map(|(idx, (score, record))| VectorHit {
-                chunk_id: record.chunk_id.clone(),
-                doc_id: record.doc_id.clone(),
-                text: record.text.clone(),
-                score,
-                rank: idx + 1,
-                metadata: record.metadata.clone(),
+            .map(|(rank_idx, c)| {
+                let record = &self.records[c.record_idx];
+                VectorHit {
+                    chunk_id: record.chunk_id.clone(),
+                    doc_id: record.doc_id.clone(),
+                    text: record.text.clone(),
+                    score: c.score,
+                    rank: rank_idx + 1,
+                    metadata: record.metadata.clone(),
+                }
             })
             .collect()
     }

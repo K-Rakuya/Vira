@@ -1,5 +1,6 @@
 import { VRMViewer } from '../stage/vrm-viewer.js';
 import { TauriBridge } from '../ipc/tauri-bridge.js';
+import { parseKinematicCues } from '../stage/procedural-animator.js';
 
 export interface TutorPreset {
   id: string;
@@ -133,6 +134,9 @@ export class HudController {
       subtitleCard: $('subtitle-card') as HTMLElement,
       subtitleBadge: $('subtitle-badge') as HTMLElement,
       subtitleText: $('subtitle-text') as HTMLElement,
+      thoughtCard: $('thought-card') as HTMLDetailsElement,
+      thoughtBadge: $('thought-badge') as HTMLElement,
+      thoughtText: $('thought-text') as HTMLElement,
       tutorSelect: $('tutor-select') as HTMLSelectElement,
       brandModeLabel: $('brand-mode-label') as HTMLElement,
       btnGestures: $('btn-gestures') as HTMLButtonElement,
@@ -215,11 +219,48 @@ export class HudController {
       if (!payload) return;
       const stateStr = String(payload.state || 'idle').toLowerCase();
       this.updateSubtitle(stateStr, payload.text);
+
+      // Parse implicit kinematic cues and gestures from text
+      if (payload.text) {
+        const cue = parseKinematicCues(payload.text);
+        if (cue.gesture) {
+          this.vrmViewer.playGesture(cue.gesture);
+        }
+        if (cue.emotion) {
+          this.vrmViewer.setEmotion(cue.emotion, 1.0);
+        }
+      }
     });
     this.unlisteners.push(unlistenSubtitle);
 
-    // 3. Audible Speech Synthesis event
+    // 2b. Thought scratchpad event broadcast
+    const unlistenThought = await TauriBridge.listen('thought_event', (payload: any) => {
+      if (!payload) return;
+      if (this.el.thoughtCard) {
+        this.el.thoughtCard.hidden = false;
+        if (!payload.is_done) {
+          this.el.thoughtCard.open = true;
+          if (this.el.thoughtBadge) {
+            this.el.thoughtBadge.textContent = 'Thinking...';
+          }
+        } else {
+          if (this.el.thoughtBadge) {
+            this.el.thoughtBadge.textContent = 'Thought complete';
+          }
+        }
+      }
+      if (this.el.thoughtText && payload.text) {
+        this.el.thoughtText.textContent = (this.el.thoughtText.textContent || '') + payload.text;
+      }
+    });
+    this.unlisteners.push(unlistenThought);
+
+    // 3. Audible Speech Synthesis event (Native Soundcard First + Automatic Fallback)
     const unlistenSpeak = await TauriBridge.listen('speak_sentence', (payload: any) => {
+      // If native CPAL playback is handling audio, suppress browser speech synthesis to eliminate double speech
+      if (payload?.native_audio) {
+        return;
+      }
       if (payload?.text && typeof window !== 'undefined' && 'speechSynthesis' in window) {
         try {
           window.speechSynthesis.cancel();
@@ -564,6 +605,17 @@ export class HudController {
     this.el.chatInput.value = '';
     this.setMicActive(false);
     this.updateSubtitle('thinking', text);
+
+    if (this.el.thoughtText) {
+      this.el.thoughtText.textContent = '';
+    }
+    if (this.el.thoughtBadge) {
+      this.el.thoughtBadge.textContent = 'Thinking...';
+    }
+    if (this.el.thoughtCard) {
+      this.el.thoughtCard.open = false;
+      this.el.thoughtCard.hidden = true;
+    }
 
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.cancel();

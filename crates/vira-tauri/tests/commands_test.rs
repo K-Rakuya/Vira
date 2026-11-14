@@ -9,8 +9,8 @@ use vira_tauri::commands::{
 };
 use vira_tauri::events::{
     AudioStatePayload, EmotionPayload, GesturePayload, MockEventEmitter, SubtitleUpdatePayload,
-    VisemeTickPayload, EVENT_AUDIO_STATE, EVENT_EMOTION, EVENT_GESTURE, EVENT_SUBTITLE_UPDATE,
-    EVENT_VISEME_TICK,
+    VisemeTickPayload, EVENT_AUDIO_STATE, EVENT_EMOTION, EVENT_GESTURE, EVENT_SPEAK_SENTENCE,
+    EVENT_SUBTITLE_UPDATE, EVENT_THOUGHT, EVENT_VISEME_TICK,
 };
 use vira_tauri::spawn_viseme_tick_loop;
 use vira_tauri::state::{AppSettingsPayload, AppState, TutorMode};
@@ -448,6 +448,53 @@ async fn test_viseme_tick_loop_transitions_to_idle_on_playback_completion() {
     assert_eq!(*state.current_subtitle.read().unwrap(), "");
 }
 
+#[tokio::test]
+async fn test_adaptive_viseme_gating_pauses_ticks_when_idle() {
+    let emitter = Arc::new(MockEventEmitter::new());
+    let state = AppState::new_headless_with_emitter(emitter.clone());
+
+    // Initially state is Idle, nothing playing, not generating
+    assert_eq!(state.get_conversation_state(), ConversationState::Idle);
+    assert!(!state.audio_playback.is_playing());
+    assert!(!state.is_generating());
+
+    let cancel = CancellationToken::new();
+    let tick_handle = spawn_viseme_tick_loop(state.clone(), cancel.clone());
+
+    // Allow 40ms to elapse (~2-3 loop intervals) while completely idle
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+    // In adaptive viseme gating, zero ticks should be flooded when initially idle
+    let initial_ticks = emitter.find_events(EVENT_VISEME_TICK);
+    assert_eq!(initial_ticks.len(), 0, "adaptive gating must not flood ticks when already idle");
+
+    // Now start playing speech
+    state.force_state(ConversationState::Speaking);
+    let _ = state.audio_playback.enqueue_samples(&[0.2; 4800]); // 100ms at 48kHz
+    tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+
+    let active_ticks = emitter.find_events(EVENT_VISEME_TICK);
+    assert!(!active_ticks.is_empty(), "viseme ticks must resume immediately when active");
+    let active_count = active_ticks.len();
+
+    // Now drain and transition to idle
+    state.audio_playback.flush().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+    // Must have emitted zero reset tick and then stopped
+    let final_ticks = emitter.find_events(EVENT_VISEME_TICK);
+    assert!(final_ticks.len() > active_count);
+
+    // After idling further, no new ticks should be emitted
+    let count_at_rest = final_ticks.len();
+    tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+    let post_rest_ticks = emitter.find_events(EVENT_VISEME_TICK);
+    assert_eq!(post_rest_ticks.len(), count_at_rest, "ticks must be gated during idle");
+
+    cancel.cancel();
+    let _ = tick_handle.await;
+}
+
 #[test]
 fn test_resample_linear() {
     use vira_tauri::commands::resample_linear;
@@ -467,6 +514,98 @@ fn test_resample_linear() {
     let down_in = vec![0.0f32, 0.5, 1.0, 0.5];
     let downsampled = resample_linear(&down_in, 48000, 24000);
     assert_eq!(downsampled.len(), 2);
+}
+
+#[test]
+fn test_resample_kaiser_sinc_edge_cases() {
+    use vira_tauri::commands::resample_kaiser_sinc;
+
+    // Empty input returns empty
+    assert!(resample_kaiser_sinc(&[], 24000, 48000).is_empty());
+    // Zero sample rates return original
+    assert_eq!(resample_kaiser_sinc(&[1.0, 2.0], 0, 48000), vec![1.0, 2.0]);
+    assert_eq!(resample_kaiser_sinc(&[1.0, 2.0], 48000, 0), vec![1.0, 2.0]);
+    // Equal sample rates return identical slice
+    assert_eq!(resample_kaiser_sinc(&[0.5, -0.5, 1.0], 44100, 44100), vec![0.5, -0.5, 1.0]);
+
+    // Single sample returns correct output length without panic or NaN
+    let single = resample_kaiser_sinc(&[0.8], 24000, 48000);
+    assert_eq!(single.len(), 2);
+    assert!(!single[0].is_nan());
+
+    // DC signal preservation: resampled constant array should retain unity gain (close to constant)
+    let dc_input = vec![0.75f32; 100];
+    let dc_resampled = resample_kaiser_sinc(&dc_input, 24000, 48000);
+    assert_eq!(dc_resampled.len(), 200);
+    for &val in &dc_resampled[20..180] {
+        assert!((val - 0.75).abs() < 0.01, "DC level drifted: {val} vs 0.75");
+    }
+}
+
+#[test]
+fn test_resample_kaiser_sinc_accuracy_and_anti_aliasing() {
+    use vira_tauri::commands::resample_kaiser_sinc;
+
+    // 1. Upsampling a 1 kHz tone from 24 kHz to 48 kHz
+    let from_rate = 24000u32;
+    let to_rate = 48000u32;
+    let duration_secs = 0.05f64;
+    let num_samples = (from_rate as f64 * duration_secs) as usize;
+    let freq = 1000.0f64;
+
+    let mut in_samples = Vec::with_capacity(num_samples);
+    for i in 0..num_samples {
+        let t = i as f64 / from_rate as f64;
+        in_samples.push((2.0 * std::f64::consts::PI * freq * t).sin() as f32);
+    }
+
+    let upsampled = resample_kaiser_sinc(&in_samples, from_rate, to_rate);
+    assert_eq!(upsampled.len(), (num_samples as f64 * 2.0).round() as usize);
+
+    // Verify low distortion / high SNR in the interior (avoiding edge boundaries)
+    let interior_start = 40;
+    let interior_end = upsampled.len() - 40;
+    let mut max_err = 0.0f32;
+    for (idx, &actual) in upsampled[interior_start..interior_end].iter().enumerate() {
+        let i = interior_start + idx;
+        let t = i as f64 / to_rate as f64;
+        let expected = (2.0 * std::f64::consts::PI * freq * t).sin() as f32;
+        let err = (actual - expected).abs();
+        if err > max_err {
+            max_err = err;
+        }
+    }
+    assert!(max_err < 0.02, "Max interpolation error was too high: {max_err}");
+
+    // 2. Anti-aliasing when downsampling 48 kHz -> 24 kHz (Nyquist is 12 kHz)
+    // Compose: 1 kHz (in passband) + 20 kHz (in stopband, above Nyquist)
+    let ds_from_rate = 48000u32;
+    let ds_to_rate = 24000u32;
+    let ds_samples = (ds_from_rate as f64 * duration_secs) as usize;
+    let mut two_tone = Vec::with_capacity(ds_samples);
+    for i in 0..ds_samples {
+        let t = i as f64 / ds_from_rate as f64;
+        let passband = (2.0 * std::f64::consts::PI * 1000.0 * t).sin() as f32;
+        let stopband = (2.0 * std::f64::consts::PI * 20000.0 * t).sin() as f32;
+        two_tone.push(passband + stopband);
+    }
+
+    let downsampled = resample_kaiser_sinc(&two_tone, ds_from_rate, ds_to_rate);
+    assert_eq!(downsampled.len(), (ds_samples as f64 / 2.0).round() as usize);
+
+    // In downsampled output, 20kHz tone should be virtually eliminated by Kaiser filter
+    // Interior samples should match the 1 kHz passband signal closely
+    let ds_start = 30;
+    let ds_end = downsampled.len() - 30;
+    let mut diff_sum = 0.0f32;
+    for (idx, &actual) in downsampled[ds_start..ds_end].iter().enumerate() {
+        let i = ds_start + idx;
+        let t = i as f64 / ds_to_rate as f64;
+        let passband_expected = (2.0 * std::f64::consts::PI * 1000.0 * t).sin() as f32;
+        diff_sum += (actual - passband_expected).abs();
+    }
+    let avg_err = diff_sum / (ds_end - ds_start) as f32;
+    assert!(avg_err < 0.05, "Anti-aliasing failed: average error from passband was {avg_err}");
 }
 
 #[tokio::test]
@@ -646,6 +785,157 @@ async fn test_agent_tool_executor_builtin_math() {
     let res = state.agent.execute_tool(req).await.expect("execute tool");
     assert!(!res.is_error);
     assert!(res.content.contains("130"));
+}
+
+#[test]
+fn test_extract_tool_call_from_text() {
+    use vira_tauri::commands::extract_tool_call_from_text;
+
+    // 1. XML style <tool_call>...</tool_call>
+    let text1 = "Let me calculate: <tool_call>{\"name\": \"calculator\", \"arguments\": {\"expression\": \"5 + 5\"}}</tool_call>";
+    let (name1, args1) = extract_tool_call_from_text(text1).expect("extract tool 1");
+    assert_eq!(name1, "calculator");
+    assert_eq!(args1["expression"], "5 + 5");
+
+    // 2. [tool_call:{"name": ...}]
+    let text2 = "Thinking... [tool_call:{\"name\": \"knowledge_search\", \"arguments\": {\"query\": \"kanji N3\"}}]";
+    let (name2, args2) = extract_tool_call_from_text(text2).expect("extract tool 2");
+    assert_eq!(name2, "knowledge_search");
+    assert_eq!(args2["query"], "kanji N3");
+
+    // 3. [tool:<name> <json>]
+    let text3 = "I need to look this up: [tool:calculator {\"expression\": \"100 / 4\"}]";
+    let (name3, args3) = extract_tool_call_from_text(text3).expect("extract tool 3");
+    assert_eq!(name3, "calculator");
+    assert_eq!(args3["expression"], "100 / 4");
+
+    // 4. Trailing gesture tags after tool_call must not break JSON parsing
+    let text4 = "[tool_call:{\"name\": \"calculator\", \"arguments\": {\"expression\": \"2 + 2\"}}] [gesture:nod]";
+    let (name4, args4) = extract_tool_call_from_text(text4).expect("extract tool 4 with trailing gesture");
+    assert_eq!(name4, "calculator");
+    assert_eq!(args4["expression"], "2 + 2");
+
+    // 5. Zero-argument tool call [tool:get_time]
+    let text5 = "Let me check the time: [tool:get_time]";
+    let (name5, args5) = extract_tool_call_from_text(text5).expect("extract tool 5 zero args");
+    assert_eq!(name5, "get_time");
+    assert_eq!(args5, serde_json::json!({}));
+
+    // 6. Tool call with internal JSON arrays [tool:filter {"items": [1, 2]}]
+    let text6 = "[tool:filter {\"items\": [1, 2]}]";
+    let (name6, args6) = extract_tool_call_from_text(text6).expect("extract tool 6 with array");
+    assert_eq!(name6, "filter");
+    assert_eq!(args6["items"], serde_json::json!([1, 2]));
+
+    // 7. Regular text with no tools
+    assert!(extract_tool_call_from_text("Xin chào, tôi là trợ lý ảo.").is_none());
+}
+
+#[tokio::test]
+async fn test_react_autonomous_loop_executes_tool_and_answers() {
+    use vira_infer::openai_compat::{MockLlmTransport, OpenAiCompatLlmAdapter};
+
+    let emitter = Arc::new(MockEventEmitter::new());
+    let mut state = AppState::new_headless_with_emitter(emitter.clone());
+
+    // Transport script:
+    // Iteration 0: LLM outputs a tool call to calculator
+    // Iteration 1: After tool result is appended, LLM answers with final result
+    let transport = Arc::new(MockLlmTransport::from_script(vec![
+        vec!["<tool_call>{\"name\": \"calculator\", \"arguments\": {\"expression\": \"7 * 8\"}}</tool_call>"],
+        vec!["[happy] Kết quả là 56!"],
+    ]));
+    let llm = Arc::new(
+        OpenAiCompatLlmAdapter::new(
+            "http://127.0.0.1:8080/v1".to_string(),
+            "default".to_string(),
+            None,
+        )
+        .with_transport(transport),
+    );
+    state.llm = llm;
+
+    let res = handle_send_message(
+        SendMessagePayload {
+            text: "7 nhân 8 bằng bao nhiêu?".to_string(),
+        },
+        &state,
+    )
+    .await
+    .expect("turn completes");
+
+    assert_eq!(res.status, "completed");
+
+    // Verify thoughts were emitted for tool invocation
+    let thoughts = emitter.find_events(EVENT_THOUGHT);
+    assert!(!thoughts.is_empty(), "Thought scratchpad events should be emitted during tool calling");
+
+    // Verify final spoken sentence was synthesized
+    let speak_events = emitter.find_events(EVENT_SPEAK_SENTENCE);
+    assert!(!speak_events.is_empty(), "Final answer must be sent to speakable sentence queue");
+    let speak_payload = &speak_events[0];
+    assert!(speak_payload["text"].as_str().unwrap().contains("56"));
+
+    // Verify full conversational audit trail in memory history
+    let history = state.history.read().await;
+    assert_eq!(history.len(), 4, "History must contain user, tool_call, observation, and assistant answer");
+    assert!(history[0].is_user());
+    assert!(history[1].is_assistant());
+    assert!(history[1].raw_content.contains("<tool_call>"));
+    assert!(history[2].is_system());
+    assert!(history[2].raw_content.contains("Observation from tool"));
+    assert!(history[3].is_assistant());
+    assert!(history[3].raw_content.contains("56"));
+
+    // Verify full conversational audit trail persisted in SQLite store
+    let persisted = state.store.get_history("default_session", 10).await.expect("load history");
+    assert!(persisted.len() >= 4, "Persistent store must record tool call and observation steps");
+}
+
+#[tokio::test]
+async fn test_hierarchical_memory_injects_learner_profile() {
+    use vira_infer::openai_compat::{MockLlmTransport, OpenAiCompatLlmAdapter};
+    use vira_ports::store::UserProfile;
+
+    let emitter = Arc::new(MockEventEmitter::new());
+    let mut state = AppState::new_headless_with_emitter(emitter.clone());
+
+    // Save a learner profile to SQLite
+    let profile = UserProfile::new("user_primary", "Learner", "vi", "ja", "B1")
+        .with_preference("weaknesses", "particles ni vs de, kanji stroke order");
+    state.store.save_user_profile(&profile).await.expect("save profile");
+
+    // Verify profile is read from store
+    let retrieved = state.store.get_user_profile("user_primary").await.expect("get profile");
+    assert!(retrieved.is_some());
+    let p = retrieved.unwrap();
+    assert_eq!(p.target_language, "ja");
+    assert_eq!(p.cefr_level, "B1");
+    assert_eq!(p.get_preference("weaknesses").unwrap(), "particles ni vs de, kanji stroke order");
+
+    // Configure mock transport to observe turn execution
+    let transport = Arc::new(MockLlmTransport::from_script(vec![
+        vec!["Chào bạn! Mình sẵn sàng giúp bạn luyện tập tiếng Nhật."],
+    ]));
+    let llm = Arc::new(
+        OpenAiCompatLlmAdapter::new(
+            "http://127.0.0.1:8080/v1".to_string(),
+            "default".to_string(),
+            None,
+        )
+        .with_transport(transport),
+    );
+    state.llm = llm;
+
+    let res = handle_send_message(
+        SendMessagePayload {
+            text: "Hôm nay chúng ta học gì?".to_string(),
+        },
+        &state,
+    )
+    .await
+    .expect("turn succeeds");
+    assert_eq!(res.status, "completed");
 }
 
 

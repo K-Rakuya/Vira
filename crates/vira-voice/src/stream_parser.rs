@@ -8,6 +8,7 @@ use crate::chunker::{ChunkerConfig, SentenceChunker};
 pub const DEFAULT_GESTURES: &[&str] = &[
     "wave", "nod", "think", "idea", "praise", "bow", "clap", "shake", "shrug", "point",
     "salute", "cheer", "laugh", "sigh", "tilt", "wink", "dance", "confused", "idle",
+    "explain", "shy", "encourage", "surprise", "relax",
 ];
 
 /// Events produced during streaming LLM parsing for avatar animation and voice synthesis.
@@ -17,6 +18,9 @@ pub enum ParsedStreamEvent {
     Emotion(String),
     /// Avatar body/hand gesture animation trigger event (e.g. "wave", "nod").
     Gesture(String),
+    /// Internal reasoning scratchpad block (e.g. `<thought>...</thought>` or `<think>...</think>`).
+    /// Strictly stripped from TTS audio.
+    Thought(String),
     /// Grammatically complete, clean sentence or clause chunk ready for TTS audio synthesis.
     SpeakableText(String),
 }
@@ -32,6 +36,11 @@ impl ParsedStreamEvent {
         Self::Gesture(name.into())
     }
 
+    /// Creates a new `ParsedStreamEvent::Thought`.
+    pub fn thought(text: impl Into<String>) -> Self {
+        Self::Thought(text.into())
+    }
+
     /// Creates a new `ParsedStreamEvent::SpeakableText`.
     pub fn speakable(text: impl Into<String>) -> Self {
         Self::SpeakableText(text.into())
@@ -45,6 +54,11 @@ impl ParsedStreamEvent {
     /// Returns true if this event is a gesture animation.
     pub fn is_gesture(&self) -> bool {
         matches!(self, Self::Gesture(_))
+    }
+
+    /// Returns true if this event is a thought scratchpad block.
+    pub fn is_thought(&self) -> bool {
+        matches!(self, Self::Thought(_))
     }
 
     /// Returns true if this event is speakable text for TTS.
@@ -64,6 +78,14 @@ impl ParsedStreamEvent {
     pub fn as_gesture(&self) -> Option<&str> {
         match self {
             Self::Gesture(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Returns the inner string if this is a Thought event.
+    pub fn as_thought(&self) -> Option<&str> {
+        match self {
+            Self::Thought(s) => Some(s.as_str()),
             _ => None,
         }
     }
@@ -97,6 +119,7 @@ pub struct StreamParser {
     last_char: Option<char>,
     tag_just_stripped: bool,
     custom_gestures: HashSet<String>,
+    in_thought: Option<String>,
 }
 
 impl Default for StreamParser {
@@ -114,6 +137,7 @@ impl StreamParser {
             last_char: None,
             tag_just_stripped: false,
             custom_gestures: HashSet::new(),
+            in_thought: None,
         }
     }
 
@@ -125,6 +149,7 @@ impl StreamParser {
             last_char: None,
             tag_just_stripped: false,
             custom_gestures: HashSet::new(),
+            in_thought: None,
         }
     }
 
@@ -154,6 +179,7 @@ impl StreamParser {
         self.chunker.reset();
         self.last_char = None;
         self.tag_just_stripped = false;
+        self.in_thought = None;
     }
 
     fn push_text_to_chunker(&mut self, text: &str, events: &mut Vec<ParsedStreamEvent>) {
@@ -182,8 +208,8 @@ impl StreamParser {
         }
     }
 
-    /// Ingests an incoming token chunk from LLM stream and returns any extracted avatar events
-    /// and complete speakable sentence chunks.
+    /// Ingests an incoming token chunk from LLM stream and returns any extracted avatar events,
+    /// thought scratchpad blocks, and complete speakable sentence chunks.
     pub fn feed(&mut self, text: &str) -> Vec<ParsedStreamEvent> {
         if self.tag_just_stripped {
             if let Some(first_c) = text.chars().next() {
@@ -198,16 +224,105 @@ impl StreamParser {
         let mut events = Vec::new();
 
         loop {
-            let open_idx = self.pending_raw.find('[');
-            match open_idx {
-                None => {
-                    // No open brackets present; the entire pending string is speakable text
+            // 1. If currently inside a thought or tool block, wait for matching closing tag
+            if let Some(ref tag_name) = self.in_thought.clone() {
+                let lower = self.pending_raw.to_ascii_lowercase();
+                let close_tag = format!("</{}>", tag_name);
+                if let Some(close_idx) = lower.find(&close_tag) {
+                    let thought_content = self.pending_raw[..close_idx].trim().to_string();
+                    self.pending_raw.drain(..close_idx + close_tag.len());
+                    self.in_thought = None;
+                    if !thought_content.is_empty() {
+                        events.push(ParsedStreamEvent::Thought(thought_content));
+                    }
+                    continue;
+                } else {
+                    // Still inside thought block, waiting for closing tag
+                    break;
+                }
+            }
+
+            // 2. Locate potential tags: [ for gestures/emotions and <thought> / <think>
+            let bracket_open = self.pending_raw.find('[');
+            let lower_raw = self.pending_raw.to_ascii_lowercase();
+            let thought_open = lower_raw.find("<thought>").map(|idx| (idx, "thought", 9));
+            let think_open = lower_raw.find("<think>").map(|idx| (idx, "think", 7));
+
+            // Select earliest matching complete tag
+            let earliest_thought = match (thought_open, think_open) {
+                (Some(a), Some(b)) => if a.0 <= b.0 { Some(a) } else { Some(b) },
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+
+            // 3. Check for incomplete '<' opening tag fragment at or near end of pending_raw
+            let incomplete_lt = lower_raw.rfind('<').and_then(|lt_idx| {
+                let tail = &lower_raw[lt_idx..];
+                let is_prefix = "<thought>".starts_with(tail) || "<think>".starts_with(tail);
+                if is_prefix && earliest_thought.is_none_or(|(t_idx, _, _)| lt_idx < t_idx) {
+                    Some(lt_idx)
+                } else {
+                    None
+                }
+            });
+
+            if let Some(lt_idx) = incomplete_lt {
+                // Bracket tag before incomplete tag?
+                if let Some(b_idx) = bracket_open {
+                    if b_idx < lt_idx {
+                        // Bracket tag is earlier, handle it below
+                    } else {
+                        // Flush text before incomplete '<' tag and wait for tag completion
+                        if lt_idx > 0 {
+                            let text_before = self.pending_raw[..lt_idx].to_string();
+                            self.push_text_to_chunker(&text_before, &mut events);
+                            self.pending_raw.drain(..lt_idx);
+                        }
+                        break;
+                    }
+                } else {
+                    // Flush text before incomplete '<' tag and wait for tag completion
+                    if lt_idx > 0 {
+                        let text_before = self.pending_raw[..lt_idx].to_string();
+                        self.push_text_to_chunker(&text_before, &mut events);
+                        self.pending_raw.drain(..lt_idx);
+                    }
+                    break;
+                }
+            }
+
+            match (bracket_open, earliest_thought) {
+                (None, None) => {
+                    // No open brackets or thought tags present; entire pending text is speakable
                     let text = std::mem::take(&mut self.pending_raw);
                     self.push_text_to_chunker(&text, &mut events);
                     break;
                 }
-                Some(idx) => {
-                    // If there is text before the opening bracket, feed it to the sentence chunker
+                (Some(b_idx), Some((t_idx, tag_name, tag_len))) if t_idx < b_idx => {
+                    // Thought opening tag appears before bracket tag
+                    if t_idx > 0 {
+                        let text_before = self.pending_raw[..t_idx].to_string();
+                        self.push_text_to_chunker(&text_before, &mut events);
+                        self.pending_raw.drain(..t_idx);
+                    }
+                    self.pending_raw.drain(..tag_len);
+                    self.in_thought = Some(tag_name.to_string());
+                    continue;
+                }
+                (None, Some((t_idx, tag_name, tag_len))) => {
+                    // Thought opening tag present with no bracket
+                    if t_idx > 0 {
+                        let text_before = self.pending_raw[..t_idx].to_string();
+                        self.push_text_to_chunker(&text_before, &mut events);
+                        self.pending_raw.drain(..t_idx);
+                    }
+                    self.pending_raw.drain(..tag_len);
+                    self.in_thought = Some(tag_name.to_string());
+                    continue;
+                }
+                (Some(idx), _) => {
+                    // Bracket tag appears first
                     if idx > 0 {
                         let text_before = self.pending_raw[..idx].to_string();
                         self.push_text_to_chunker(&text_before, &mut events);
@@ -284,11 +399,17 @@ impl StreamParser {
         events
     }
 
-    /// Concludes the stream, flushing any trailing bracket fragments and pending sentence chunks.
+    /// Concludes the stream, flushing any trailing bracket fragments, thoughts, and pending sentence chunks.
     pub fn finish(&mut self) -> Vec<ParsedStreamEvent> {
         let mut events = Vec::new();
 
-        if !self.pending_raw.is_empty() {
+        if let Some(_tag_name) = self.in_thought.take() {
+            let thought_leftover = std::mem::take(&mut self.pending_raw);
+            let trimmed = thought_leftover.trim();
+            if !trimmed.is_empty() {
+                events.push(ParsedStreamEvent::Thought(trimmed.to_string()));
+            }
+        } else if !self.pending_raw.is_empty() {
             let leftover = std::mem::take(&mut self.pending_raw);
             let chunks = self.chunker.feed(&leftover);
             for chunk in chunks {
