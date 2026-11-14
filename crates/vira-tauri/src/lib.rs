@@ -50,7 +50,7 @@ pub fn run() {
 
             // Native playback engine with virtual fallback for headless/container environments
             let playback = PlaybackEngine::new_native(PlaybackConfig::default()).unwrap_or_else(|_| {
-                let (virtual_pb, _) = PlaybackEngine::new_virtual(48000, 720000);
+                let (virtual_pb, _) = PlaybackEngine::new_virtual(48000, 2880000);
                 virtual_pb
             });
             let clock = playback.clock().clone();

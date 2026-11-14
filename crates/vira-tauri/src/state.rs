@@ -388,7 +388,7 @@ impl AppState {
 
     /// Creates a headless `AppState` configured with a specific event emitter.
     pub fn new_headless_with_emitter(emitter: Arc<dyn AppEventEmitter>) -> Self {
-        let (playback, _) = PlaybackEngine::new_virtual(48000, 720000);
+        let (playback, _) = PlaybackEngine::new_virtual(48000, 2880000);
         let clock = playback.clock().clone();
         let pb_sample_rate = playback.sample_rate();
         let (capture, _) = CaptureEngine::new_virtual(16000, 512);

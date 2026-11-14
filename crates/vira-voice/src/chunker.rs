@@ -21,7 +21,7 @@ pub struct ChunkerConfig {
     pub min_clause_chars: usize,
 
     /// Maximum character limit before forcing a boundary on the last word break.
-    /// Default: 160
+    /// Default: 500
     pub max_chunk_chars: usize,
 
     /// Common abbreviations that should NOT trigger a sentence split on period.
@@ -35,7 +35,7 @@ impl Default for ChunkerConfig {
             clause_delimiters: vec![',', ';', ':', '—'],
             split_on_clauses: false,
             min_clause_chars: 12,
-            max_chunk_chars: 160,
+            max_chunk_chars: 500,
             abbreviations: vec![
                 "mr".to_string(),
                 "mrs".to_string(),

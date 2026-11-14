@@ -511,14 +511,16 @@ fn extract_semantic_triggers_internal(
 }
 
 pub const ACTION_KEYWORDS: &[&str] = &[
-    "cuoi", "nhin", "noi", "tho", "im lang", "buoc", "ngap ngung",
-    "hit", "ngam", "chay", "dung", "ngoi", "nam", "quay", "nhay",
-    "lui", "tien", "dua", "dat", "cam", "lay", "mo", "dong", "gat", "lac",
-    "xoa", "day", "che", "chong", "om", "khoanh", "cui", "ngua", "nghieng", "nhun",
-    "mim", "suy nghi", "suy ngam", "tram ngam", "ngac nhien", "bat ngo", "giat minh",
-    "hoang hot", "boi roi", "lung tung", "ngai ngung", "nguong", "do mat", "gai dau",
-    "cau may", "nhiu may", "chop mat", "nham mat", "tho dai", "tho phao",
-    "tan cong", "tien den", "lui ve", "nhin quanh", "nhin sang", "dao mat",
+    "cuoi", "mim cuoi", "cuoi tuoi", "nhin quanh", "nhin sang", "dao mat",
+    "gat dau", "lac dau", "nhun vai", "nghieng dau", "cui dau", "ngua dau",
+    "vay tay", "khoanh tay", "gio tay", "chap tay", "xua tay",
+    "chong cam", "xoa cam", "che mieng", "xoa dau", "gai dau", "xoa tran", "day thai duong",
+    "om nguc", "dat tay", "tho dai", "tho phao", "chop mat", "nham mat", "cau may", "nhiu may",
+    "buoc toi", "buoc lui", "lui lai", "lui ve", "tien den", "tien lai",
+    "dung day", "ngoi xuong", "ngoi yen", "tan cong",
+    "im lang", "ngap ngung", "suy nghi", "suy ngam", "tram ngam",
+    "ngac nhien", "bat ngo", "giat minh", "hoang hot", "boi roi", "lung tung",
+    "ngai ngung", "nguong ngung", "do mat",
     "whisper", "sigh", "pause", "gasp", "look", "turn", "step", "walk",
     "stand", "sit", "lie", "blink", "murmur", "mutter",
     "smile", "laugh", "chuckle", "giggle", "frown", "nod", "shake", "wave", "point",
@@ -1243,10 +1245,10 @@ impl StreamParser {
                             let close_stars_count = trimmed_after_paren.chars().take_while(|&c| c == '*').count();
                             if close_stars_count > 0 {
                                 let total_end = asterisks_open_count + open_trimmed_offset + close_paren_idx + 1 + close_stars_offset + close_stars_count - 1;
-                                Some((total_end, inner, true))
+                                Some((total_end, inner.to_string(), true))
                             } else if !trimmed_after_paren.is_empty() {
                                 let total_end = asterisks_open_count + open_trimmed_offset + close_paren_idx;
-                                Some((total_end, inner, true))
+                                Some((total_end, inner.to_string(), true))
                             } else {
                                 None
                             }
@@ -1264,10 +1266,10 @@ impl StreamParser {
                             let close_stars_count = trimmed_after_bracket.chars().take_while(|&c| c == '*').count();
                             if close_stars_count > 0 {
                                 let total_end = asterisks_open_count + open_trimmed_offset + close_bracket_idx + 1 + close_stars_offset + close_stars_count - 1;
-                                Some((total_end, inner, true))
+                                Some((total_end, inner.to_string(), true))
                             } else if !trimmed_after_bracket.is_empty() {
                                 let total_end = asterisks_open_count + open_trimmed_offset + close_bracket_idx;
-                                Some((total_end, inner, true))
+                                Some((total_end, inner.to_string(), true))
                             } else {
                                 None
                             }
@@ -1282,16 +1284,18 @@ impl StreamParser {
                                 let rest_slice = &after_open[c_off..];
                                 let asterisks_close_count = rest_slice.chars().take_while(|&c| c == '*').count();
                                 let total_end = asterisks_open_count + c_off + asterisks_close_count - 1;
-                                Some((total_end, inner, false))
+                                Some((total_end, inner.to_string(), false))
                             }
                             None => None,
                         }
                     };
 
                     match match_res {
-                        Some((total_end_idx, inner_slice, is_composite)) => {
-                            let is_multiline = inner_slice.contains('\n') || inner_slice.contains('\r');
-                            let is_stage_dir = is_composite || is_stage_direction_content(inner_slice, &self.custom_gestures);
+                        Some((total_end_idx, inner_str, is_composite)) => {
+                            let is_multiline = inner_str.contains('\n') || inner_str.contains('\r');
+                            let is_markdown_emphasis = asterisks_open_count >= 2;
+                            let is_stage_dir = is_composite
+                                || (!is_markdown_emphasis && is_stage_direction_content(&inner_str, &self.custom_gestures));
 
                             if is_multiline && !is_stage_dir {
                                 let non_tag = self.pending_raw[..asterisks_open_count].to_string();
@@ -1300,10 +1304,19 @@ impl StreamParser {
                                 continue;
                             }
 
-                            let inner = inner_slice.trim();
-                            if !inner.is_empty() {
-                                let triggers = extract_semantic_triggers_internal(inner, Some(&self.custom_gestures));
+                            let inner = inner_str.trim().to_string();
+                            if is_stage_dir {
+                                if !inner.is_empty() {
+                                    let triggers = extract_semantic_triggers_internal(&inner, Some(&self.custom_gestures));
+                                    events.extend(triggers);
+                                }
+                            } else {
+                                // Markdown bold/italic or emphasis: speak the inner text!
+                                let triggers = extract_semantic_triggers_internal(&inner, Some(&self.custom_gestures));
                                 events.extend(triggers);
+                                if !inner.is_empty() {
+                                    self.push_text_to_chunker(&inner, &mut events);
+                                }
                             }
                             self.on_tag_removed(total_end_idx);
                             continue;

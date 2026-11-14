@@ -843,3 +843,43 @@ fn test_stream_parser_secondary_safety_filter_direct() {
     );
 }
 
+#[test]
+fn test_stream_parser_streaming_markdown_bold_and_long_sentence() {
+    let mut parser = StreamParser::new();
+    let text = "Nếu chúng ta nói về **ứng dụng**, thì đây là **vận hành thực tế** của toàn bộ hệ thống.";
+    let events = parser.feed(text);
+    let flushed = parser.finish();
+    let all = [events, flushed].concat();
+    let speakable: Vec<_> = all
+        .into_iter()
+        .filter_map(|e| match e {
+            ParsedStreamEvent::SpeakableText(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        speakable.join(" "),
+        "Nếu chúng ta nói về ứng dụng, thì đây là vận hành thực tế của toàn bộ hệ thống."
+    );
+}
+
+#[test]
+fn test_stream_parser_long_sentence_not_split_before_period() {
+    let mut parser = StreamParser::new();
+    let text = "Động cơ nhiệt Carnot là một chu trình nhiệt động lực học lý tưởng được đề xuất bởi Nicolas Léonard Sadi Carnot vào năm 1824, giúp chúng ta xác định giới hạn hiệu suất tối đa.";
+    let events = parser.feed(text);
+    let flushed = parser.finish();
+    let all = [events, flushed].concat();
+    let speakable: Vec<_> = all
+        .into_iter()
+        .filter_map(|e| match e {
+            ParsedStreamEvent::SpeakableText(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    // Must be exactly 1 complete sentence, NOT split into 2 chunks!
+    assert_eq!(speakable.len(), 1, "Sentence should not be chopped in half! Chunks: {:?}", speakable);
+}
+
+
+

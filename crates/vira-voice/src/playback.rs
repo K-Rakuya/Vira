@@ -13,7 +13,7 @@ pub struct PlaybackConfig {
     pub sample_rate: u32,
     /// Channel count (default: 2 for stereo).
     pub channels: u16,
-    /// Ring buffer capacity in samples (default: 720000, 15.0 seconds at 48kHz).
+    /// Ring buffer capacity in samples (default: 2880000, 60.0 seconds at 48kHz).
     pub buffer_capacity: usize,
     /// Specific output audio device name, or `None` for default.
     pub device_name: Option<String>,
@@ -24,7 +24,7 @@ impl Default for PlaybackConfig {
         Self {
             sample_rate: 48000,
             channels: 2,
-            buffer_capacity: 720000,
+            buffer_capacity: 2880000,
             device_name: None,
         }
     }
