@@ -4,6 +4,7 @@ use vira_domain::state::ConversationState;
 use vira_domain::viseme::VisemeWeights;
 
 pub const EVENT_VISEME_TICK: &str = "viseme_tick";
+pub const EVENT_BINARY_VISEME_TICK: &str = "binary_viseme_tick";
 pub const EVENT_SUBTITLE_UPDATE: &str = "subtitle_update";
 pub const EVENT_AUDIO_STATE: &str = "audio_state";
 pub const EVENT_GESTURE: &str = "gesture_event";
@@ -71,6 +72,69 @@ impl VisemeTickPayload {
             timestamp_ms,
             is_speaking,
         }
+    }
+}
+
+/// Packed 40-byte binary frame for zero-copy high-frequency (60Hz) Viseme IPC streaming.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BinaryVisemeFrame {
+    pub aa: f32,
+    pub ih: f32,
+    pub ou: f32,
+    pub ee: f32,
+    pub oh: f32,
+    pub is_speaking: u8,
+    pub _pad: [u8; 3],
+    pub sample_clock: u64,
+    pub timestamp_ms: u64,
+}
+
+impl BinaryVisemeFrame {
+    pub const FRAME_SIZE: usize = 40;
+
+    pub fn new(
+        weights: VisemeWeights,
+        sample_clock: u64,
+        timestamp_ms: u64,
+        is_speaking: bool,
+    ) -> Self {
+        Self {
+            aa: weights.aa,
+            ih: weights.ih,
+            ou: weights.ou,
+            ee: weights.ee,
+            oh: weights.oh,
+            is_speaking: if is_speaking { 1 } else { 0 },
+            _pad: [0; 3],
+            sample_clock,
+            timestamp_ms,
+        }
+    }
+
+    pub fn weights(&self) -> VisemeWeights {
+        VisemeWeights::new(self.aa, self.ih, self.ou, self.ee, self.oh)
+    }
+
+    #[inline(always)]
+    pub fn as_bytes(&self) -> &[u8; 40] {
+        unsafe { &*(self as *const Self as *const [u8; 40]) }
+    }
+
+    #[inline(always)]
+    pub fn to_bytes(&self) -> [u8; 40] {
+        *self.as_bytes()
+    }
+
+    #[inline(always)]
+    pub fn from_bytes(bytes: &[u8; 40]) -> Self {
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const Self) }
+    }
+}
+
+impl Default for BinaryVisemeFrame {
+    fn default() -> Self {
+        Self::new(VisemeWeights::zero(), 0, 0, false)
     }
 }
 
@@ -236,5 +300,30 @@ mod tests {
         let parsed: SubtitleUpdatePayload = serde_json::from_value(subs[0].clone()).unwrap();
         assert_eq!(parsed.text, "hello");
         assert_eq!(parsed.state, ConversationState::Speaking);
+    }
+
+    #[test]
+    fn test_binary_viseme_frame_layout_and_conversion() {
+        assert_eq!(std::mem::size_of::<BinaryVisemeFrame>(), 40);
+        assert_eq!(std::mem::align_of::<BinaryVisemeFrame>(), 8);
+
+        let weights = VisemeWeights::new(0.85, 0.12, 0.05, 0.0, 0.0);
+        let frame = BinaryVisemeFrame::new(weights, 96000, 2000, true);
+
+        assert_eq!(frame.aa, 0.85);
+        assert_eq!(frame.ih, 0.12);
+        assert_eq!(frame.ou, 0.05);
+        assert_eq!(frame.ee, 0.0);
+        assert_eq!(frame.oh, 0.0);
+        assert_eq!(frame.is_speaking, 1);
+        assert_eq!(frame.sample_clock, 96000);
+        assert_eq!(frame.timestamp_ms, 2000);
+
+        let bytes = frame.to_bytes();
+        assert_eq!(bytes.len(), 40);
+
+        let decoded = BinaryVisemeFrame::from_bytes(&bytes);
+        assert_eq!(frame, decoded);
+        assert_eq!(decoded.weights(), weights);
     }
 }

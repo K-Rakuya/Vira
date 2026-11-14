@@ -65,6 +65,20 @@ export class ExpressionController {
     return Boolean(manager.getExpression?.(name));
   }
 
+  private _pushExpression(manager: any, name: string, weight: number): void {
+    if (weight <= 0) return;
+    if (this.has(manager, name)) {
+      this.targets.set(name, clamp((this.targets.get(name) || 0) + weight, 0, 1));
+    } else {
+      const fb = FALLBACKS[name];
+      if (fb) {
+        for (const k in fb) {
+          this.targets.set(k, clamp((this.targets.get(k) || 0) + fb[k], 0, 1));
+        }
+      }
+    }
+  }
+
   public update(vrm: VRM, dt: number): void {
     const manager = vrm?.expressionManager;
     if (!manager) return;
@@ -77,19 +91,11 @@ export class ExpressionController {
     }
 
     this.targets.clear();
-    const push = (name: string, weight: number) => {
-      if (weight <= 0) return;
-      const resolved = this.has(manager, name) ? { [name]: weight } : FALLBACKS[name] || {};
-      for (const [k, v] of Object.entries(resolved)) {
-        this.targets.set(k, clamp((this.targets.get(k) || 0) + v, 0, 1));
-      }
-    };
-
     if (this.emotion !== 'neutral') {
-      push(this.emotion, this.emotionWeight * (EMOTION_GAIN[this.emotion] ?? 0.8));
+      this._pushExpression(manager, this.emotion, this.emotionWeight * (EMOTION_GAIN[this.emotion] ?? 0.8));
     }
-    for (const [name, w] of Object.entries(this.gestureHint)) {
-      push(name, w);
+    for (const name in this.gestureHint) {
+      this._pushExpression(manager, name, this.gestureHint[name]);
     }
 
     const k = 1 - Math.exp(-9 * dt);

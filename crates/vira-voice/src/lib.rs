@@ -15,14 +15,14 @@ pub use capture::{
 pub use chunker::{ChunkerConfig, SentenceChunker};
 pub use clock::MasterAudioClock;
 pub use gop::{
-    phoneme_to_viseme, phoneme_to_vrm_preset, split_phoneme_base_and_tag, AccuracyLevel,
-    GopConfig, GopEvaluator, PhonemeResult, PhonemeScore, PronunciationAssessment,
-    PronunciationScore,
+    dtw_distance_rolling, phoneme_to_viseme, phoneme_to_vrm_preset, split_phoneme_base_and_tag,
+    AccuracyLevel, DtwMatrix, GopConfig, GopEvaluator, PhonemeResult, PhonemeScore,
+    PronunciationAssessment, PronunciationScore,
 };
 pub use phoneme_aligner::{
     AlignmentError, AlignmentMatch, CtcAligner, DtwAligner, DtwResult, G2pConverter, MatchStatus,
     PhonemeAligner, PhonemeFrameAlignment, PhonemeLanguage,
 };
 pub use playback::{PlaybackConfig, PlaybackEngine};
-pub use ring_buffer::{AudioConsumer, AudioProducer, AudioRingBuffer};
+pub use ring_buffer::{AlignedRingState, AudioConsumer, AudioProducer, AudioRingBuffer, CachePadded};
 pub use stream_parser::{ParsedStreamEvent, StreamParser};

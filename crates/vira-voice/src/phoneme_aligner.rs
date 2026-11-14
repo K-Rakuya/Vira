@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vira_domain::viseme::VisemeWeights;
 use vira_ports::tts::TimedViseme;
-use crate::gop::split_phoneme_base_and_tag;
+use crate::gop::{dtw_distance_rolling, split_phoneme_base_and_tag, DtwMatrix};
 
 /// Supported languages for G2P phonetic transcription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -396,23 +396,23 @@ impl DtwAligner {
         }
 
         const INDEL_COST: f32 = 1.0;
-        let mut dp = vec![vec![0.0f32; n + 1]; m + 1];
+        let mut dp = DtwMatrix::new(m + 1, n + 1);
 
-        for (i, row) in dp.iter_mut().enumerate().take(m + 1).skip(1) {
-            row[0] = (i as f32) * INDEL_COST;
+        for i in 1..=m {
+            dp.set(i, 0, (i as f32) * INDEL_COST);
         }
-        for (j, cell) in dp[0].iter_mut().enumerate().take(n + 1).skip(1) {
-            *cell = (j as f32) * INDEL_COST;
+        for j in 1..=n {
+            dp.set(0, j, (j as f32) * INDEL_COST);
         }
 
         for i in 1..=m {
             for j in 1..=n {
                 let dist = Self::phoneme_distance(&expected[i - 1], &recognized[j - 1]);
-                let match_cost = dp[i - 1][j - 1] + dist;
-                let del_cost = dp[i - 1][j] + INDEL_COST;
-                let ins_cost = dp[i][j - 1] + INDEL_COST;
+                let match_cost = dp.get(i - 1, j - 1) + dist;
+                let del_cost = dp.get(i - 1, j) + INDEL_COST;
+                let ins_cost = dp.get(i, j - 1) + INDEL_COST;
 
-                dp[i][j] = match_cost.min(del_cost).min(ins_cost);
+                dp.set(i, j, match_cost.min(del_cost).min(ins_cost));
             }
         }
 
@@ -424,10 +424,10 @@ impl DtwAligner {
         while i > 0 || j > 0 {
             if i > 0 && j > 0 {
                 let dist = Self::phoneme_distance(&expected[i - 1], &recognized[j - 1]);
-                let match_cost = dp[i - 1][j - 1] + dist;
-                let del_cost = dp[i - 1][j] + INDEL_COST;
+                let match_cost = dp.get(i - 1, j - 1) + dist;
+                let del_cost = dp.get(i - 1, j) + INDEL_COST;
 
-                let min_val = dp[i][j];
+                let min_val = dp.get(i, j);
                 if (min_val - match_cost).abs() < 1e-4 {
                     let status = if dist == 0.0 {
                         MatchStatus::ExactMatch
@@ -483,7 +483,7 @@ impl DtwAligner {
 
         matches.reverse();
 
-        let total_cost = dp[m][n];
+        let total_cost = dp.get(m, n);
         let max_len = m.max(n) as f32;
         let normalized_distance = if max_len > 0.0 {
             (total_cost / max_len).clamp(0.0, 1.0)
@@ -505,7 +505,7 @@ impl DtwAligner {
             }
         }
 
-        let accuracy_percent = ((1.0 - normalized_distance) * 100.0).clamp(0.0, 100.0);
+        let accuracy_percent = ((1.0f32 - normalized_distance) * 100.0f32).clamp(0.0f32, 100.0f32);
 
         DtwResult {
             matches,
@@ -517,6 +517,14 @@ impl DtwAligner {
             insertions_count,
             deletions_count,
         }
+    }
+
+    /// Computes total DTW alignment cost using a rolling 2-row cache with O(N) memory
+    /// to eliminate L1 cache thrashing.
+    pub fn align_distance_rolling(&self, expected: &[String], recognized: &[String]) -> f32 {
+        dtw_distance_rolling(expected.len(), recognized.len(), |i, j| {
+            Self::phoneme_distance(&expected[i], &recognized[j])
+        })
     }
 }
 

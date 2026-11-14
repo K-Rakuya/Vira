@@ -1,5 +1,5 @@
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -23,9 +23,9 @@ use vira_voice::clock::MasterAudioClock;
 use vira_voice::playback::PlaybackEngine;
 
 use crate::events::{
-    AppEventEmitter, AudioStatePayload, MockEventEmitter, NullEventEmitter, SubtitleUpdatePayload,
-    VisemeTickPayload, EVENT_AUDIO_STATE, EVENT_STATE_CHANGE, EVENT_SUBTITLE_UPDATE,
-    EVENT_VISEME_TICK,
+    AppEventEmitter, AudioStatePayload, BinaryVisemeFrame, MockEventEmitter, NullEventEmitter,
+    SubtitleUpdatePayload, VisemeTickPayload, EVENT_AUDIO_STATE, EVENT_STATE_CHANGE,
+    EVENT_SUBTITLE_UPDATE, EVENT_VISEME_TICK,
 };
 
 /// Language tutor modes supported by Vira.
@@ -122,6 +122,114 @@ pub struct GetAppStateResponse {
     pub current_time_ms: u64,
 }
 
+/// Lock-free atomic conversation state wrapper using `AtomicU8` with CAS transitions.
+#[derive(Debug)]
+pub struct AtomicConversationState {
+    pub inner: AtomicU8,
+}
+
+impl AtomicConversationState {
+    pub const fn new(initial: ConversationState) -> Self {
+        Self {
+            inner: AtomicU8::new(Self::to_u8(initial)),
+        }
+    }
+
+    pub const fn to_u8(state: ConversationState) -> u8 {
+        match state {
+            ConversationState::Idle => 0,
+            ConversationState::Listening => 1,
+            ConversationState::Thinking => 2,
+            ConversationState::Speaking => 3,
+            ConversationState::Interrupted => 4,
+        }
+    }
+
+    pub const fn from_u8(val: u8) -> ConversationState {
+        match val {
+            0 => ConversationState::Idle,
+            1 => ConversationState::Listening,
+            2 => ConversationState::Thinking,
+            3 => ConversationState::Speaking,
+            4 => ConversationState::Interrupted,
+            _ => ConversationState::Idle,
+        }
+    }
+
+    #[inline(always)]
+    pub fn get(&self) -> ConversationState {
+        Self::from_u8(self.inner.load(Ordering::Acquire))
+    }
+
+    #[inline(always)]
+    pub fn set(&self, state: ConversationState) {
+        self.inner.store(Self::to_u8(state), Ordering::Release);
+    }
+
+    /// Compare-and-swap state transition conforming to domain state machine rules.
+    /// Returns `(previous_state, next_state)` on success.
+    pub fn transition_to(
+        &self,
+        target: ConversationState,
+    ) -> Result<(ConversationState, ConversationState), StateTransitionError> {
+        let mut current_raw = self.inner.load(Ordering::Acquire);
+        loop {
+            let current = Self::from_u8(current_raw);
+            if current == target {
+                return Ok((current, current));
+            }
+            let next = current.transition_to(target)?;
+
+            match self.inner.compare_exchange_weak(
+                current_raw,
+                Self::to_u8(next),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok((current, next)),
+                Err(actual) => current_raw = actual,
+            }
+        }
+    }
+
+    /// Performs an explicit atomic compare-and-swap operation.
+    pub fn compare_exchange(
+        &self,
+        current: ConversationState,
+        new: ConversationState,
+    ) -> Result<ConversationState, ConversationState> {
+        self.inner
+            .compare_exchange(
+                Self::to_u8(current),
+                Self::to_u8(new),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(Self::from_u8)
+            .map_err(Self::from_u8)
+    }
+
+    #[inline(always)]
+    pub fn as_atomic(&self) -> &AtomicU8 {
+        &self.inner
+    }
+}
+
+impl Default for AtomicConversationState {
+    fn default() -> Self {
+        Self::new(ConversationState::Idle)
+    }
+}
+
+impl std::ops::Deref for AtomicConversationState {
+    type Target = AtomicU8;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 /// Core application state managed by Tauri and accessed across IPC command threads.
 #[derive(Clone)]
 pub struct AppState {
@@ -138,7 +246,8 @@ pub struct AppState {
     pub learn: Arc<SpacedRepetitionService>,
     pub agent: Arc<ToolCallExecutor>,
     pub clock: MasterAudioClock,
-    pub conversation_state: Arc<RwLock<ConversationState>>,
+    pub conversation_state: Arc<AtomicConversationState>,
+    pub turn_epoch: Arc<AtomicU64>,
     pub emotion: Arc<RwLock<(String, f32)>>,
     pub tutor_mode: Arc<RwLock<TutorMode>>,
     pub mic_active: Arc<AtomicBool>,
@@ -184,7 +293,8 @@ impl AppState {
             learn,
             agent,
             clock,
-            conversation_state: Arc::new(RwLock::new(ConversationState::Idle)),
+            conversation_state: Arc::new(AtomicConversationState::new(ConversationState::Idle)),
+            turn_epoch: Arc::new(AtomicU64::new(0)),
             emotion: Arc::new(RwLock::new(("neutral".to_string(), 1.0))),
             tutor_mode: Arc::new(RwLock::new(TutorMode::GeneralAssistant)),
             mic_active: Arc::new(AtomicBool::new(false)),
@@ -332,36 +442,33 @@ impl AppState {
         self.is_generating.store(val, Ordering::Release);
     }
 
-    /// Read the current conversation state.
+    /// Read the current conversation state via wait-free atomic load.
+    #[inline(always)]
     pub fn get_conversation_state(&self) -> ConversationState {
-        *self.conversation_state.read().unwrap()
+        self.conversation_state.get()
     }
 
-    /// Transition to target state, validating against domain rules and emitting a transition event.
+    /// Transition to target state, validating against domain rules via atomic CAS and emitting a transition event.
     pub fn transition_state(
         &self,
         target: ConversationState,
     ) -> Result<ConversationState, StateTransitionError> {
-        let mut state_guard = self.conversation_state.write().unwrap();
-        let current = *state_guard;
-        let next = current.transition_to(target)?;
-        *state_guard = next;
-        drop(state_guard);
+        let (current, next) = self.conversation_state.transition_to(target)?;
 
-        let _ = self.emitter.emit(
-            EVENT_STATE_CHANGE,
-            serde_json::to_value(StateTransitionEvent::new(current, next)).unwrap_or_default(),
-        );
+        if current != next {
+            let _ = self.emitter.emit(
+                EVENT_STATE_CHANGE,
+                serde_json::to_value(StateTransitionEvent::new(current, next)).unwrap_or_default(),
+            );
+        }
 
         Ok(next)
     }
 
     /// Forcibly sets conversation state without transition checks (e.g. error resets).
     pub fn force_state(&self, state: ConversationState) {
-        let mut state_guard = self.conversation_state.write().unwrap();
-        let current = *state_guard;
-        *state_guard = state;
-        drop(state_guard);
+        let current = self.get_conversation_state();
+        self.conversation_state.set(state);
 
         let _ = self.emitter.emit(
             EVENT_STATE_CHANGE,
@@ -369,8 +476,10 @@ impl AppState {
         );
     }
 
-    /// Cancels active LLM generation, flushes audio output buffers, and resets lip-sync timeline and clock.
+    /// Cancels active LLM generation, flushes audio output buffers, resets lip-sync timeline and clock,
+    /// and increments turn_epoch for O(1) instant barge-in cancellation.
     pub fn cancel_active_speech(&self) {
+        self.turn_epoch.fetch_add(1, Ordering::SeqCst);
         if let Some(token) = self.active_cancellation.lock().unwrap().take() {
             token.cancel();
         }
@@ -378,6 +487,34 @@ impl AppState {
         let _ = self.audio_playback.reset_sample_clock();
         self.clock.reset();
         *self.active_visemes.write().unwrap() = Vec::new();
+    }
+
+    /// Obtains the current conversational turn epoch.
+    #[inline(always)]
+    pub fn current_turn_epoch(&self) -> u64 {
+        self.turn_epoch.load(Ordering::Acquire)
+    }
+
+    /// Advances the turn epoch to start a new conversational turn and returns the new epoch value.
+    #[inline(always)]
+    pub fn start_new_turn(&self) -> u64 {
+        self.turn_epoch.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Returns true if the specified epoch matches the active conversational turn epoch.
+    #[inline(always)]
+    pub fn is_current_turn(&self, epoch: u64) -> bool {
+        self.turn_epoch.load(Ordering::Acquire) == epoch
+    }
+
+    /// Creates a packed 40-byte `BinaryVisemeFrame` for the given weights and playback state.
+    pub fn create_binary_viseme_frame(&self, weights: VisemeWeights, is_speaking: bool) -> BinaryVisemeFrame {
+        BinaryVisemeFrame::new(
+            weights,
+            self.clock.current_sample(),
+            self.clock.current_time_ms(),
+            is_speaking,
+        )
     }
 
     /// Emits a subtitle update event and caches the active subtitle string.
@@ -506,5 +643,48 @@ mod tests {
 
         let events = emitter.find_events(EVENT_STATE_CHANGE);
         assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn test_atomic_conversation_state_cas_transitions() {
+        let atomic_state = AtomicConversationState::new(ConversationState::Idle);
+        assert_eq!(atomic_state.get(), ConversationState::Idle);
+
+        // Valid CAS transition
+        let res = atomic_state.transition_to(ConversationState::Listening);
+        assert_eq!(res, Ok((ConversationState::Idle, ConversationState::Listening)));
+        assert_eq!(atomic_state.get(), ConversationState::Listening);
+
+        // Invalid CAS transition (Listening -> Speaking directly)
+        let err = atomic_state.transition_to(ConversationState::Speaking);
+        assert!(err.is_err());
+        assert_eq!(atomic_state.get(), ConversationState::Listening);
+
+        // Explicit compare_exchange
+        let cas_ok = atomic_state.compare_exchange(ConversationState::Listening, ConversationState::Thinking);
+        assert_eq!(cas_ok, Ok(ConversationState::Listening));
+        assert_eq!(atomic_state.get(), ConversationState::Thinking);
+
+        // Mismatched expected state
+        let cas_err = atomic_state.compare_exchange(ConversationState::Idle, ConversationState::Speaking);
+        assert_eq!(cas_err, Err(ConversationState::Thinking));
+    }
+
+    #[test]
+    fn test_turn_epoch_instant_barge_in() {
+        let state = AppState::new_headless();
+        let epoch0 = state.current_turn_epoch();
+        assert_eq!(epoch0, 0);
+
+        let epoch1 = state.start_new_turn();
+        assert_eq!(epoch1, 1);
+        assert!(state.is_current_turn(1));
+        assert!(!state.is_current_turn(0));
+
+        // Barge-in cancels active speech and advances epoch
+        state.cancel_active_speech();
+        let epoch2 = state.current_turn_epoch();
+        assert!(epoch2 > epoch1);
+        assert!(!state.is_current_turn(epoch1));
     }
 }

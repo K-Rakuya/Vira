@@ -151,11 +151,12 @@ async fn process_speakable_sentence(
     clean: &str,
     state: &AppState,
     cancel: &CancellationToken,
+    turn_epoch: u64,
     full_assistant_text: &mut String,
     cumulative_duration_ms: &mut u64,
     chunks_synthesized: &mut usize,
 ) -> bool {
-    if cancel.is_cancelled() {
+    if cancel.is_cancelled() || !state.is_current_turn(turn_epoch) {
         return false;
     }
 
@@ -169,7 +170,7 @@ async fn process_speakable_sentence(
         Err(_) => return true,
     };
 
-    if cancel.is_cancelled() {
+    if cancel.is_cancelled() || !state.is_current_turn(turn_epoch) {
         return false;
     }
 
@@ -181,7 +182,7 @@ async fn process_speakable_sentence(
             tts_out.samples
         };
 
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || !state.is_current_turn(turn_epoch) {
             return false;
         }
 
@@ -203,7 +204,7 @@ async fn process_speakable_sentence(
             .unwrap_or(0);
         let chunk_dur = chunk_dur_from_samples.max(chunk_dur_from_visemes);
 
-        state.force_state(ConversationState::Speaking);
+        let _ = state.transition_state(ConversationState::Speaking);
         state.emit_subtitle(clean, ConversationState::Speaking);
 
         let enqueue_res = state.audio_playback.enqueue_samples(&samples);
@@ -311,13 +312,19 @@ pub async fn execute_conversation_turn(
     // 1. Cancel previous speech turn (if any), flush audio, and reset clock
     state.cancel_active_speech();
 
-    // 2. Set new cancellation token
+    // 2. Start a new turn epoch for O(1) instant barge-in tracking
+    let turn_epoch = state.start_new_turn();
+
+    // 3. Set new cancellation token
     let cancel = CancellationToken::new();
     *state.active_cancellation.lock().unwrap() = Some(cancel.clone());
     state.set_generating(true);
 
-    // 3. Move state to Thinking
-    state.force_state(ConversationState::Thinking);
+    // 4. Move state to Thinking via atomic state machine
+    if state.get_conversation_state() == ConversationState::Speaking {
+        let _ = state.transition_state(ConversationState::Interrupted);
+    }
+    let _ = state.transition_state(ConversationState::Thinking);
 
     // 4. Record user message in history and persistent store
     let user_msg = Message::user(trimmed);
@@ -387,7 +394,7 @@ pub async fn execute_conversation_turn(
     let mut last_llm_res = None;
 
     for iteration in 0..max_iterations {
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || !state.is_current_turn(turn_epoch) {
             break;
         }
 
@@ -404,13 +411,13 @@ pub async fn execute_conversation_turn(
         let mut detected_tool_call: Option<(String, serde_json::Value)> = None;
 
         while let Some(chunk) = rx.recv().await {
-            if cancel.is_cancelled() {
+            if cancel.is_cancelled() || !state.is_current_turn(turn_epoch) {
                 break;
             }
 
             // Streamed thought reasoning block
             if let Some(ref th) = chunk.thought {
-                state.force_state(ConversationState::Thinking);
+                let _ = state.transition_state(ConversationState::Thinking);
                 if let Ok(v) = serde_json::to_value(ThoughtPayload::new(th, false)) {
                     let _ = state.emitter.emit(EVENT_THOUGHT, v);
                 }
@@ -455,7 +462,7 @@ pub async fn execute_conversation_turn(
                 if !is_tool_call_candidate {
                     let events = parser.feed(&chunk.delta);
                     for event in events {
-                        if cancel.is_cancelled() {
+                        if cancel.is_cancelled() || !state.is_current_turn(turn_epoch) {
                             break;
                         }
                         match event {
@@ -477,7 +484,7 @@ pub async fn execute_conversation_turn(
                                 }
                             }
                             ParsedStreamEvent::Thought(thought) => {
-                                state.force_state(ConversationState::Thinking);
+                                let _ = state.transition_state(ConversationState::Thinking);
                                 if let Ok(v) =
                                     serde_json::to_value(ThoughtPayload::new(thought, false))
                                 {
@@ -493,6 +500,7 @@ pub async fn execute_conversation_turn(
                                     clean,
                                     state,
                                     &cancel,
+                                    turn_epoch,
                                     &mut full_assistant_text,
                                     &mut cumulative_duration_ms,
                                     &mut chunks_synthesized,
@@ -511,7 +519,7 @@ pub async fn execute_conversation_turn(
         let llm_res = llm_handle.await;
         last_llm_res = Some(llm_res);
 
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || !state.is_current_turn(turn_epoch) {
             break;
         }
 
@@ -522,7 +530,7 @@ pub async fn execute_conversation_turn(
 
         if let Some((tool_name, tool_args)) = detected_tool_call {
             parser.reset();
-            state.force_state(ConversationState::Thinking);
+            let _ = state.transition_state(ConversationState::Thinking);
             if let Ok(v) = serde_json::to_value(ThoughtPayload::new(
                 format!("Calling tool `{tool_name}` with arguments: {tool_args}"),
                 false,
@@ -563,7 +571,7 @@ pub async fn execute_conversation_turn(
         // Flush remaining text from parser
         let flushed = parser.finish();
         for event in flushed {
-            if cancel.is_cancelled() {
+            if cancel.is_cancelled() || !state.is_current_turn(turn_epoch) {
                 break;
             }
             match event {
@@ -585,7 +593,7 @@ pub async fn execute_conversation_turn(
                     }
                 }
                 ParsedStreamEvent::Thought(thought) => {
-                    state.force_state(ConversationState::Thinking);
+                    let _ = state.transition_state(ConversationState::Thinking);
                     if let Ok(v) = serde_json::to_value(ThoughtPayload::new(thought, false)) {
                         let _ = state.emitter.emit(EVENT_THOUGHT, v);
                     }
@@ -599,6 +607,7 @@ pub async fn execute_conversation_turn(
                         clean,
                         state,
                         &cancel,
+                        turn_epoch,
                         &mut full_assistant_text,
                         &mut cumulative_duration_ms,
                         &mut chunks_synthesized,
@@ -616,13 +625,13 @@ pub async fn execute_conversation_turn(
             match last_llm_res.as_ref() {
                 Some(Ok(Err(llm_err))) => {
                     state.set_generating(false);
-                    state.force_state(ConversationState::Idle);
+                    let _ = state.transition_state(ConversationState::Idle);
                     state.emit_subtitle("", ConversationState::Idle);
                     return Err(format!("LLM inference failed: {llm_err}"));
                 }
                 Some(Err(join_err)) => {
                     state.set_generating(false);
-                    state.force_state(ConversationState::Idle);
+                    let _ = state.transition_state(ConversationState::Idle);
                     state.emit_subtitle("", ConversationState::Idle);
                     return Err(format!("LLM task panicked: {join_err}"));
                 }
@@ -642,8 +651,8 @@ pub async fn execute_conversation_turn(
     // Generation is done
     state.set_generating(false);
 
-    // Check cancellation
-    if cancel.is_cancelled() {
+    // Check cancellation or turn epoch mismatch (O(1) instant barge-in)
+    if cancel.is_cancelled() || !state.is_current_turn(turn_epoch) {
         return Ok(SendMessageResponse {
             message_id,
             status: "interrupted".to_string(),
@@ -652,7 +661,7 @@ pub async fn execute_conversation_turn(
 
     // If no text was produced, check if LLM stream failed with an error
     if chunks_synthesized == 0 && full_assistant_text.is_empty() {
-        state.force_state(ConversationState::Idle);
+        let _ = state.transition_state(ConversationState::Idle);
         state.emit_subtitle("", ConversationState::Idle);
 
         match last_llm_res {
@@ -679,7 +688,7 @@ pub async fn execute_conversation_turn(
     }
 
     if chunks_synthesized == 0 {
-        state.force_state(ConversationState::Idle);
+        let _ = state.transition_state(ConversationState::Idle);
         state.emit_subtitle("", ConversationState::Idle);
     }
 
@@ -840,7 +849,7 @@ pub async fn handle_toggle_mic(
                                 // Transition: user started talking!
                                 // Trigger barge-in: cancel any active avatar speech
                                 state_clone.cancel_active_speech();
-                                state_clone.force_state(ConversationState::Listening);
+                                let _ = state_clone.transition_state(ConversationState::Listening);
                                 state_clone.emit_audio_state(rms, true);
 
                                 in_speech = true;
@@ -885,10 +894,15 @@ pub async fn handle_toggle_mic(
                                         16000
                                     };
 
+                                    let dispatch_epoch = state_clone.current_turn_epoch();
+
                                     tokio::spawn(async move {
                                         if let Ok(stt_event) =
                                             stt.transcribe_slice(&speech_to_transcribe, s_rate).await
                                         {
+                                            if !state_task.is_current_turn(dispatch_epoch) {
+                                                return;
+                                            }
                                             let transcribed = stt_event.text.trim();
                                             if !transcribed.is_empty()
                                                 && transcribed != "[speech detected]"
@@ -921,10 +935,10 @@ pub async fn handle_toggle_mic(
         let can_barge_in = state.get_conversation_state().can_barge_in();
         if can_barge_in {
             state.cancel_active_speech();
-            state.force_state(ConversationState::Listening);
+            let _ = state.transition_state(ConversationState::Listening);
             state.emit_audio_state(0.0, true);
         } else {
-            state.force_state(ConversationState::Listening);
+            let _ = state.transition_state(ConversationState::Listening);
         }
     } else {
         if let Some(cancel) = state.mic_task_cancel.lock().unwrap().take() {
@@ -940,15 +954,19 @@ pub async fn handle_toggle_mic(
         let sample_rate = state.audio_capture.sample_rate();
 
         if state.get_conversation_state() == ConversationState::Listening {
-            state.force_state(ConversationState::Idle);
+            let _ = state.transition_state(ConversationState::Idle);
         }
 
         // Transcribe voice input if enough audio was recorded (>= 100ms)
         if sample_rate > 0 && samples.len() >= (sample_rate as usize / 10) {
             let stt = state.get_stt();
             let state_clone = state.clone();
+            let dispatch_epoch = state.current_turn_epoch();
             tokio::spawn(async move {
                 if let Ok(stt_event) = stt.transcribe_slice(&samples, sample_rate).await {
+                    if !state_clone.is_current_turn(dispatch_epoch) {
+                        return;
+                    }
                     let transcribed = stt_event.text.trim();
                     if !transcribed.is_empty() && transcribed != "[speech detected]" {
                         let _ = execute_conversation_turn(transcribed, &state_clone).await;

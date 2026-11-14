@@ -67,6 +67,8 @@ export function lowerArmQuat(
 /**
  * Maps a unit quaternion q in SO(3) to its Lie algebra vector in so(3) ~= R^3.
  * theta_vec = Log(q)
+ * Uses Padé/Taylor polynomial small-angle approximation for theta < 0.4 rad (~23°),
+ * falling back to exact trig (atan2) for larger angles.
  */
 export function so3Log(q: THREE.Quaternion, out = new THREE.Vector3()): THREE.Vector3 {
   let w = clamp(q.w, -1, 1);
@@ -79,27 +81,46 @@ export function so3Log(q: THREE.Quaternion, out = new THREE.Vector3()): THREE.Ve
     y = -y;
     z = -z;
   }
-  const vLen = Math.hypot(x, y, z);
-  if (vLen < 1e-7) {
-    return out.set(2 * x, 2 * y, 2 * z);
+  const s = x * x + y * y + z * z;
+  let factor: number;
+  if (s < 1e-12) {
+    factor = 2.0;
+  } else if (s < 0.04) {
+    // Padé / Taylor series for (2 * arcsin(sqrt(s))) / sqrt(s)
+    // 2 * (1 + (1/6)*s + (3/40)*s^2 + (5/112)*s^3)
+    // For theta < 0.4 rad (~23 deg), absolute difference is < 1.6e-7 rad (< 32-bit float epsilon)
+    // Completely eliminates Math.atan2, Math.hypot, and division.
+    factor = 2.0 * (1.0 + s * (0.16666666666666666 + s * (0.075 + s * 0.04464285714285714)));
+  } else {
+    const vLen = Math.sqrt(s);
+    factor = (2.0 * Math.atan2(vLen, w)) / vLen;
   }
-  const angle = 2 * Math.atan2(vLen, w);
-  const factor = angle / vLen;
   return out.set(x * factor, y * factor, z * factor);
 }
 
 /**
  * Maps a Lie algebra vector in so(3) ~= R^3 to its unit quaternion in SO(3).
  * q = Exp(v)
+ * Uses Taylor polynomial small-angle approximation for theta < 0.2 rad,
+ * falling back to exact trig for larger angles.
  */
 export function so3Exp(v: THREE.Vector3, out = new THREE.Quaternion()): THREE.Quaternion {
-  const theta = v.length();
-  if (theta < 1e-7) {
+  const thetaSq = v.x * v.x + v.y * v.y + v.z * v.z;
+  if (thetaSq < 1e-12) {
     return out.set(0, 0, 0, 1);
   }
-  const half = theta * 0.5;
-  const factor = Math.sin(half) / theta;
-  return out.set(v.x * factor, v.y * factor, v.z * factor, Math.cos(half)).normalize();
+  let factor: number;
+  let w: number;
+  if (thetaSq < 0.04) {
+    factor = 0.5 - thetaSq * 0.020833333333333332;
+    w = 1.0 - thetaSq * 0.125;
+  } else {
+    const theta = Math.sqrt(thetaSq);
+    const half = theta * 0.5;
+    factor = Math.sin(half) / theta;
+    w = Math.cos(half);
+  }
+  return out.set(v.x * factor, v.y * factor, v.z * factor, w).normalize();
 }
 
 /**
@@ -160,6 +181,104 @@ export class GeodesicSpringDamper {
   }
 }
 
+/**
+ * Packed Struct-of-Arrays (SoA) Vectorized Spring Damper Batch on SO(3).
+ * 16 floats (64 bytes = 1 L1 cache line) per joint.
+ */
+export class VectorizedSpringDamperBatch {
+  public readonly count: number;
+  public readonly buffer: Float32Array;
+
+  constructor(count: number) {
+    this.count = count;
+    this.buffer = new Float32Array(count * 16);
+    for (let i = 0; i < count; i++) {
+      const b = i * 16;
+      this.buffer[b + 3] = 1.0;  // curr_q.w
+      this.buffer[b + 11] = 1.0; // targ_q.w
+      const omegaN = 14;
+      const zeta = 0.85;
+      this.buffer[b + 12] = omegaN * omegaN;      // kSpring
+      this.buffer[b + 13] = 2.0 * zeta * omegaN; // kDamp
+    }
+  }
+
+  public stepAll(dt: number): void {
+    const buf = this.buffer;
+    const count = this.count;
+    const clampedDt = dt > 0.05 ? 0.05 : dt;
+
+    for (let i = 0; i < count; i++) {
+      const b = i * 16;
+      let cx = buf[b], cy = buf[b + 1], cz = buf[b + 2], cw = buf[b + 3];
+      const tx = buf[b + 8], ty = buf[b + 9], tz = buf[b + 10], tw = buf[b + 11];
+
+      // q_rel = q_curr^-1 * q_targ = (-cx, -cy, -cz, cw) * (tx, ty, tz, tw)
+      let rx =  cw * tx - cz * ty + cy * tz - cx * tw;
+      let ry =  cz * tx + cw * ty - cx * tz - cy * tw;
+      let rz = -cy * tx + cx * ty + cw * tz - cz * tw;
+      let rw =  cx * tx + cy * ty + cz * tz + cw * tw;
+
+      if (rw < 0) { rx = -rx; ry = -ry; rz = -rz; rw = -rw; }
+
+      // Polynomial so3Log
+      const s = rx * rx + ry * ry + rz * rz;
+      let logFactor: number;
+      if (s < 1e-12) {
+        logFactor = 2.0;
+      } else if (s < 0.04) {
+        logFactor = 2.0 * (1.0 + s * (0.16666666666666666 + s * (0.075 + s * 0.04464285714285714)));
+      } else {
+        const vLen = Math.sqrt(s);
+        logFactor = (2.0 * Math.atan2(vLen, rw)) / vLen;
+      }
+
+      const ex = rx * logFactor;
+      const ey = ry * logFactor;
+      const ez = rz * logFactor;
+
+      // Dynamics
+      const kSpring = buf[b + 12];
+      const kDamp = buf[b + 13];
+      let vx = buf[b + 4] + (ex * kSpring - buf[b + 4] * kDamp) * clampedDt;
+      let vy = buf[b + 5] + (ey * kSpring - buf[b + 5] * kDamp) * clampedDt;
+      let vz = buf[b + 6] + (ez * kSpring - buf[b + 6] * kDamp) * clampedDt;
+
+      buf[b + 4] = vx; buf[b + 5] = vy; buf[b + 6] = vz;
+
+      // Polynomial so3Exp
+      const drx = vx * clampedDt, dry = vy * clampedDt, drz = vz * clampedDt;
+      const thetaSq = drx * drx + dry * dry + drz * drz;
+      let expFactor: number, expW: number;
+      if (thetaSq < 1e-12) {
+        expFactor = 0.5; expW = 1.0;
+      } else if (thetaSq < 0.04) {
+        expFactor = 0.5 - thetaSq * 0.020833333333333332;
+        expW = 1.0 - thetaSq * 0.125;
+      } else {
+        const theta = Math.sqrt(thetaSq);
+        const half = theta * 0.5;
+        expFactor = Math.sin(half) / theta;
+        expW = Math.cos(half);
+      }
+
+      const dqx = drx * expFactor, dqy = dry * expFactor, dqz = drz * expFactor, dqw = expW;
+
+      // q_new = q_curr * dq
+      let nx = cw * dqx + cx * dqw + cy * dqz - cz * dqy;
+      let ny = cw * dqy - cx * dqz + cy * dqw + cz * dqx;
+      let nz = cw * dqz + cx * dqy - cy * dqx + cz * dqw;
+      let nw = cw * dqw - cx * dqx - cy * dqy - cz * dqz;
+
+      const normInv = 1.0 / Math.sqrt(nx * nx + ny * ny + nz * nz + nw * nw);
+      buf[b] = nx * normInv;
+      buf[b + 1] = ny * normInv;
+      buf[b + 2] = nz * normInv;
+      buf[b + 3] = nw * normInv;
+    }
+  }
+}
+
 const FINGERS = ['Index', 'Middle', 'Ring', 'Little'] as const;
 
 export interface FingerCurls {
@@ -172,58 +291,230 @@ export interface FingerCurls {
   rest?: number;
 }
 
+export const MAX_BONES = 128;
+
+export const BONE_NAMES = [
+  'hips',
+  'spine',
+  'chest',
+  'upperChest',
+  'neck',
+  'head',
+  'leftEye',
+  'rightEye',
+  'jaw',
+  'leftShoulder',
+  'leftUpperArm',
+  'leftLowerArm',
+  'leftHand',
+  'rightShoulder',
+  'rightUpperArm',
+  'rightLowerArm',
+  'rightHand',
+  'leftUpperLeg',
+  'leftLowerLeg',
+  'leftFoot',
+  'leftToes',
+  'rightUpperLeg',
+  'rightLowerLeg',
+  'rightFoot',
+  'rightToes',
+  // Left fingers
+  'leftThumbProximal',
+  'leftThumbIntermediate',
+  'leftThumbDistal',
+  'leftIndexProximal',
+  'leftIndexIntermediate',
+  'leftIndexDistal',
+  'leftMiddleProximal',
+  'leftMiddleIntermediate',
+  'leftMiddleDistal',
+  'leftRingProximal',
+  'leftRingIntermediate',
+  'leftRingDistal',
+  'leftLittleProximal',
+  'leftLittleIntermediate',
+  'leftLittleDistal',
+  // Right fingers
+  'rightThumbProximal',
+  'rightThumbIntermediate',
+  'rightThumbDistal',
+  'rightIndexProximal',
+  'rightIndexIntermediate',
+  'rightIndexDistal',
+  'rightMiddleProximal',
+  'rightMiddleIntermediate',
+  'rightMiddleDistal',
+  'rightRingProximal',
+  'rightRingIntermediate',
+  'rightRingDistal',
+  'rightLittleProximal',
+  'rightLittleIntermediate',
+  'rightLittleDistal',
+] as const;
+
 export class PoseBuffer {
   public rot = new Map<string, THREE.Quaternion>();
   public pos = new Map<string, [number, number, number]>();
   public smoothed = new Map<string, THREE.Quaternion>();
   public smoothedPos = new Map<string, [number, number, number]>();
 
-  private _rotPool: THREE.Quaternion[] = [];
-  private _posPool: [number, number, number][] = [];
+  // Preallocated contiguous Float32Array buffers for zero-allocation 60fps render loop
+  public readonly rotBuffer = new Float32Array(MAX_BONES * 4);
+  public readonly posBuffer = new Float32Array(MAX_BONES * 3);
+  public readonly smoothedRotBuffer = new Float32Array(MAX_BONES * 4);
+  public readonly smoothedPosBuffer = new Float32Array(MAX_BONES * 3);
+
+  private _boneNameToId = new Map<string, number>();
+  private _idToBoneName: string[] = [];
+  private _boneCount = 0;
+
+  private _rotObjects: THREE.Quaternion[] = [];
+  private _posObjects: [number, number, number][] = [];
+  private _smoothedRotObjects: THREE.Quaternion[] = [];
+  private _smoothedPosObjects: [number, number, number][] = [];
+
+  private _activeRotFlags = new Uint8Array(MAX_BONES);
+  private _activeRotIds = new Int32Array(MAX_BONES);
+  private _activeRotCount = 0;
+
+  private _activePosFlags = new Uint8Array(MAX_BONES);
+  private _activePosIds = new Int32Array(MAX_BONES);
+  private _activePosCount = 0;
+
+  private _hasSmoothedRot = new Uint8Array(MAX_BONES);
+  private _allSmoothedRotIds = new Int32Array(MAX_BONES);
+  private _allSmoothedRotCount = 0;
+
+  private _hasSmoothedPos = new Uint8Array(MAX_BONES);
+  private _allSmoothedPosIds = new Int32Array(MAX_BONES);
+  private _allSmoothedPosCount = 0;
+
+  private _boneNodeCache: (THREE.Object3D | null | undefined)[] = new Array(MAX_BONES);
+  private _nodeCacheHumanoid: any = null;
+
+  constructor() {
+    for (let i = 0; i < MAX_BONES; i++) {
+      this._rotObjects[i] = new THREE.Quaternion();
+      this._posObjects[i] = [0, 0, 0];
+      this._smoothedRotObjects[i] = new THREE.Quaternion();
+      this._smoothedPosObjects[i] = [0, 0, 0];
+    }
+    for (let i = 0; i < BONE_NAMES.length; i++) {
+      this._registerBone(BONE_NAMES[i]);
+    }
+  }
+
+  private _registerBone(name: string): number {
+    let id = this._boneNameToId.get(name);
+    if (id !== undefined) return id;
+    if (this._boneCount >= MAX_BONES) {
+      return 0;
+    }
+    id = this._boneCount++;
+    this._boneNameToId.set(name, id);
+    this._idToBoneName[id] = name;
+    return id;
+  }
+
+  private _getBoneId(name: string): number {
+    let id = this._boneNameToId.get(name);
+    if (id === undefined) {
+      id = this._registerBone(name);
+    }
+    return id;
+  }
+
+  private _getCachedBoneNode(humanoid: any, id: number, boneName: string): any {
+    if (this._nodeCacheHumanoid !== humanoid) {
+      this._nodeCacheHumanoid = humanoid;
+      this._boneNodeCache.fill(undefined);
+    }
+    let node = this._boneNodeCache[id];
+    if (node === undefined) {
+      node = humanoid.getNormalizedBoneNode?.(boneName as VRMHumanBoneName) ?? null;
+      this._boneNodeCache[id] = node;
+    }
+    return node;
+  }
 
   public reset(): void {
-    for (const q of this.rot.values()) {
-      this._rotPool.push(q);
-    }
     this.rot.clear();
-    for (const p of this.pos.values()) {
-      this._posPool.push(p);
-    }
     this.pos.clear();
+    this._activeRotFlags.fill(0);
+    this._activePosFlags.fill(0);
+    this._activeRotCount = 0;
+    this._activePosCount = 0;
   }
 
   public clearSmoothing(): void {
     this.smoothed.clear();
     this.smoothedPos.clear();
+    this._hasSmoothedRot.fill(0);
+    this._hasSmoothedPos.fill(0);
+    this._allSmoothedRotCount = 0;
+    this._allSmoothedPosCount = 0;
+    this._nodeCacheHumanoid = null;
+    this._boneNodeCache.fill(undefined);
   }
 
   public get(bone: string): THREE.Quaternion {
-    let q = this.rot.get(bone);
-    if (!q) {
-      q = this._rotPool.pop() || new THREE.Quaternion();
+    const id = this._getBoneId(bone);
+    const q = this._rotObjects[id];
+    if (!this._activeRotFlags[id]) {
+      this._activeRotFlags[id] = 1;
+      this._activeRotIds[this._activeRotCount++] = id;
       q.identity();
       this.rot.set(bone, q);
+      const b = id * 4;
+      this.rotBuffer[b] = 0;
+      this.rotBuffer[b + 1] = 0;
+      this.rotBuffer[b + 2] = 0;
+      this.rotBuffer[b + 3] = 1;
     }
     return q;
   }
 
   public set(bone: string, q: THREE.Quaternion): void {
-    this.get(bone).copy(q);
+    const target = this.get(bone);
+    target.copy(q);
+    const id = this._getBoneId(bone);
+    const b = id * 4;
+    this.rotBuffer[b] = target.x;
+    this.rotBuffer[b + 1] = target.y;
+    this.rotBuffer[b + 2] = target.z;
+    this.rotBuffer[b + 3] = target.w;
   }
 
   public add(bone: string, x: number, y: number, z: number): void {
-    this.get(bone).multiply(eq(x, y, z, _qb));
+    const target = this.get(bone);
+    target.multiply(eq(x, y, z, _qb));
+    const id = this._getBoneId(bone);
+    const b = id * 4;
+    this.rotBuffer[b] = target.x;
+    this.rotBuffer[b + 1] = target.y;
+    this.rotBuffer[b + 2] = target.z;
+    this.rotBuffer[b + 3] = target.w;
   }
 
   public blend(bone: string, q: THREE.Quaternion, w: number): void {
     if (w <= 0) return;
-    this.get(bone).slerp(q, clamp(w, 0, 1));
+    const target = this.get(bone);
+    target.slerp(q, clamp(w, 0, 1));
+    const id = this._getBoneId(bone);
+    const b = id * 4;
+    this.rotBuffer[b] = target.x;
+    this.rotBuffer[b + 1] = target.y;
+    this.rotBuffer[b + 2] = target.z;
+    this.rotBuffer[b + 3] = target.w;
   }
 
   public offsetPos(bone: string, x: number, y: number, z: number): void {
-    let p = this.pos.get(bone);
-    if (!p) {
-      p = this._posPool.pop() || [0, 0, 0];
+    const id = this._getBoneId(bone);
+    const p = this._posObjects[id];
+    if (!this._activePosFlags[id]) {
+      this._activePosFlags[id] = 1;
+      this._activePosIds[this._activePosCount++] = id;
       p[0] = 0;
       p[1] = 0;
       p[2] = 0;
@@ -232,6 +523,10 @@ export class PoseBuffer {
     p[0] += x;
     p[1] += y;
     p[2] += z;
+    const b = id * 3;
+    this.posBuffer[b] = p[0];
+    this.posBuffer[b + 1] = p[1];
+    this.posBuffer[b + 2] = p[2];
   }
 
   public setFingers(side: Side, curls: FingerCurls): void {
@@ -242,12 +537,37 @@ export class PoseBuffer {
       const key = name.toLowerCase() as keyof FingerCurls;
       const c = curls[key] ?? curls.all ?? 0;
       for (let j = 0; j < JOINTS.length; j++) {
-        this.get(`${prefix}${name}${JOINTS[j]}`).copy(eq(0, 0, -s * c * GAINS[j], _qb));
+        const boneName = `${prefix}${name}${JOINTS[j]}`;
+        const target = this.get(boneName);
+        eq(0, 0, -s * c * GAINS[j], target);
+        const id = this._getBoneId(boneName);
+        const b = id * 4;
+        this.rotBuffer[b] = target.x;
+        this.rotBuffer[b + 1] = target.y;
+        this.rotBuffer[b + 2] = target.z;
+        this.rotBuffer[b + 3] = target.w;
       }
     }
     const t = curls.thumb ?? (curls.all ?? 0) * 0.5;
-    this.get(`${prefix}ThumbProximal`).copy(eq(0, s * t * 0.35, -s * t * 0.2, _qb));
-    this.get(`${prefix}ThumbDistal`).copy(eq(0, 0, -s * t * 0.5, _qb));
+    const thumbProx = `${prefix}ThumbProximal`;
+    const qProx = this.get(thumbProx);
+    eq(0, s * t * 0.35, -s * t * 0.2, qProx);
+    let id = this._getBoneId(thumbProx);
+    let b = id * 4;
+    this.rotBuffer[b] = qProx.x;
+    this.rotBuffer[b + 1] = qProx.y;
+    this.rotBuffer[b + 2] = qProx.z;
+    this.rotBuffer[b + 3] = qProx.w;
+
+    const thumbDist = `${prefix}ThumbDistal`;
+    const qDist = this.get(thumbDist);
+    eq(0, 0, -s * t * 0.5, qDist);
+    id = this._getBoneId(thumbDist);
+    b = id * 4;
+    this.rotBuffer[b] = qDist.x;
+    this.rotBuffer[b + 1] = qDist.y;
+    this.rotBuffer[b + 2] = qDist.z;
+    this.rotBuffer[b + 3] = qDist.w;
   }
 
   public apply(vrm: VRM, dt = 0.016, smoothing = 14): void {
@@ -258,16 +578,56 @@ export class PoseBuffer {
     const safeDt = typeof dt === 'number' && !isNaN(dt) ? Math.max(dt, 0) : 0.016;
     const k = 1 - Math.exp(-smoothing * safeDt);
 
-    for (const [bone, target] of this.rot) {
-      if (!this.smoothed.has(bone)) {
-        const sq = new THREE.Quaternion().copy(target);
-        this.smoothed.set(bone, sq);
+    // Sync from Map if external caller modified rot map directly
+    if (this.rot.size > this._activeRotCount) {
+      for (const bone of this.rot.keys()) {
+        const id = this._getBoneId(bone);
+        if (!this._activeRotFlags[id]) {
+          this._activeRotFlags[id] = 1;
+          this._activeRotIds[this._activeRotCount++] = id;
+          const q = this.rot.get(bone)!;
+          this._rotObjects[id].copy(q);
+        }
       }
     }
-    for (const [bone, current] of this.smoothed) {
-      const target = this.rot.get(bone) || IDENTITY;
+
+    // 1. Sync rotBuffer and initialize newly active smoothed bones
+    for (let i = 0; i < this._activeRotCount; i++) {
+      const id = this._activeRotIds[i];
+      const q = this._rotObjects[id];
+      const b4 = id * 4;
+      this.rotBuffer[b4] = q.x;
+      this.rotBuffer[b4 + 1] = q.y;
+      this.rotBuffer[b4 + 2] = q.z;
+      this.rotBuffer[b4 + 3] = q.w;
+
+      if (!this._hasSmoothedRot[id]) {
+        this._hasSmoothedRot[id] = 1;
+        this._allSmoothedRotIds[this._allSmoothedRotCount++] = id;
+        this.smoothedRotBuffer[b4] = q.x;
+        this.smoothedRotBuffer[b4 + 1] = q.y;
+        this.smoothedRotBuffer[b4 + 2] = q.z;
+        this.smoothedRotBuffer[b4 + 3] = q.w;
+        this._smoothedRotObjects[id].copy(q);
+        this.smoothed.set(this._idToBoneName[id], this._smoothedRotObjects[id]);
+      }
+    }
+
+    // 2. Step smoothed rotations: indexed loop eliminates iterator and [k, v] tuple allocations
+    for (let i = 0; i < this._allSmoothedRotCount; i++) {
+      const id = this._allSmoothedRotIds[i];
+      const boneName = this._idToBoneName[id];
+      const current = this._smoothedRotObjects[id];
+      const target = this._activeRotFlags[id] ? this._rotObjects[id] : IDENTITY;
       current.slerp(target, k);
-      const boneNode = humanoid.getNormalizedBoneNode(bone as VRMHumanBoneName);
+
+      const b4 = id * 4;
+      this.smoothedRotBuffer[b4] = current.x;
+      this.smoothedRotBuffer[b4 + 1] = current.y;
+      this.smoothedRotBuffer[b4 + 2] = current.z;
+      this.smoothedRotBuffer[b4 + 3] = current.w;
+
+      const boneNode = this._getCachedBoneNode(humanoid, id, boneName);
       if (boneNode) {
         if (flip) {
           _scratchQuat.set(-current.x, current.y, -current.z, current.w);
@@ -278,17 +638,62 @@ export class PoseBuffer {
       }
     }
 
-    for (const [bone, target] of this.pos) {
-      if (!this.smoothedPos.has(bone)) {
-        this.smoothedPos.set(bone, [target[0], target[1], target[2]]);
+    // Sync from Map if external caller modified pos map directly
+    if (this.pos.size > this._activePosCount) {
+      for (const bone of this.pos.keys()) {
+        const id = this._getBoneId(bone);
+        if (!this._activePosFlags[id]) {
+          this._activePosFlags[id] = 1;
+          this._activePosIds[this._activePosCount++] = id;
+          const p = this.pos.get(bone)!;
+          const po = this._posObjects[id];
+          po[0] = p[0];
+          po[1] = p[1];
+          po[2] = p[2];
+        }
       }
     }
-    for (const [bone, current] of this.smoothedPos) {
-      const target = this.pos.get(bone) || _zeroPos;
+
+    // 3. Sync posBuffer and initialize newly active smoothed positions
+    for (let i = 0; i < this._activePosCount; i++) {
+      const id = this._activePosIds[i];
+      const p = this._posObjects[id];
+      const b3 = id * 3;
+      this.posBuffer[b3] = p[0];
+      this.posBuffer[b3 + 1] = p[1];
+      this.posBuffer[b3 + 2] = p[2];
+
+      if (!this._hasSmoothedPos[id]) {
+        this._hasSmoothedPos[id] = 1;
+        this._allSmoothedPosIds[this._allSmoothedPosCount++] = id;
+        this.smoothedPosBuffer[b3] = p[0];
+        this.smoothedPosBuffer[b3 + 1] = p[1];
+        this.smoothedPosBuffer[b3 + 2] = p[2];
+        const sp = this._smoothedPosObjects[id];
+        sp[0] = p[0];
+        sp[1] = p[1];
+        sp[2] = p[2];
+        this.smoothedPos.set(this._idToBoneName[id], sp);
+      }
+    }
+
+    // 4. Step smoothed positions: indexed loop eliminates iterator and [k, v] tuple allocations
+    for (let i = 0; i < this._allSmoothedPosCount; i++) {
+      const id = this._allSmoothedPosIds[i];
+      const boneName = this._idToBoneName[id];
+      const current = this._smoothedPosObjects[id];
+      const target = this._activePosFlags[id] ? this._posObjects[id] : _zeroPos;
+
       current[0] += (target[0] - current[0]) * k;
       current[1] += (target[1] - current[1]) * k;
       current[2] += (target[2] - current[2]) * k;
-      const boneNode = humanoid.getNormalizedBoneNode(bone as VRMHumanBoneName);
+
+      const b3 = id * 3;
+      this.smoothedPosBuffer[b3] = current[0];
+      this.smoothedPosBuffer[b3 + 1] = current[1];
+      this.smoothedPosBuffer[b3 + 2] = current[2];
+
+      const boneNode = this._getCachedBoneNode(humanoid, id, boneName);
       if (boneNode) {
         if (flip) {
           boneNode.position.set(-current[0], current[1], -current[2]);

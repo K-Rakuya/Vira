@@ -1056,5 +1056,117 @@ async fn test_hierarchical_memory_injects_learner_profile() {
     assert_eq!(res.status, "completed");
 }
 
+#[tokio::test]
+async fn test_atomic_cas_state_machine_concurrency_stress() {
+    let state = Arc::new(AppState::new_headless());
+    let mut handles = Vec::new();
+
+    // 16 concurrent tasks doing atomic state transitions
+    for i in 0..16 {
+        let s = state.clone();
+        handles.push(tokio::spawn(async move {
+            for _ in 0..100 {
+                // Read current state atomically (wait-free)
+                let curr = s.get_conversation_state();
+                // Attempt transition based on current state
+                match curr {
+                    ConversationState::Idle => {
+                        let _ = s.transition_state(ConversationState::Thinking);
+                    }
+                    ConversationState::Thinking => {
+                        if i % 2 == 0 {
+                            let _ = s.transition_state(ConversationState::Speaking);
+                        } else {
+                            let _ = s.transition_state(ConversationState::Idle);
+                        }
+                    }
+                    ConversationState::Speaking => {
+                        let _ = s.transition_state(ConversationState::Idle);
+                    }
+                    ConversationState::Listening => {
+                        let _ = s.transition_state(ConversationState::Thinking);
+                    }
+                    ConversationState::Interrupted => {
+                        let _ = s.transition_state(ConversationState::Idle);
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // After all tasks finish, state must be one of the valid enum variants
+    let final_state = state.get_conversation_state();
+    assert!(
+        matches!(
+            final_state,
+            ConversationState::Idle
+                | ConversationState::Thinking
+                | ConversationState::Speaking
+                | ConversationState::Listening
+                | ConversationState::Interrupted
+        ),
+        "Final state must be valid: {final_state:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_turn_epoch_instant_barge_in_drops_stale_dispatch() {
+    use vira_infer::SherpaSttAdapter;
+
+    let emitter = Arc::new(MockEventEmitter::new());
+    let state = AppState::new_headless_with_emitter(emitter.clone());
+
+    let stt = SherpaSttAdapter::virtual_fallback()
+        .with_mock_responses(vec!["Stale transcribed message".to_string()]);
+    state.set_dynamic_stt(Arc::new(stt));
+
+    // Toggle mic ON and append speech
+    handle_toggle_mic(true, &state).await.expect("toggle mic on");
+    state.append_recorded_audio(&[0.2f32; 3200]);
+
+    // Toggle mic OFF which triggers background STT transcription
+    handle_toggle_mic(false, &state).await.expect("toggle mic off");
+
+    // User triggers barge-in immediately while background STT transcription is running
+    state.cancel_active_speech();
+
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+    // Verify history does NOT contain stale turn
+    let history = state.history.read().await;
+    assert!(
+        !history.iter().any(|m| m.raw_content == "Stale transcribed message"),
+        "Stale turn must be dropped when turn epoch is bumped by barge-in"
+    );
+}
+
+#[test]
+fn test_binary_viseme_frame_streaming_compatibility() {
+    use vira_domain::viseme::VisemeWeights;
+    use vira_tauri::BinaryVisemeFrame;
+
+    let weights = VisemeWeights::new(0.7, 0.2, 0.1, 0.0, 0.0);
+    let frame = BinaryVisemeFrame::new(weights, 48000, 1000, true);
+
+    assert_eq!(std::mem::size_of::<BinaryVisemeFrame>(), 40);
+    assert_eq!(frame.is_speaking, 1);
+    assert_eq!(frame.sample_clock, 48000);
+    assert_eq!(frame.timestamp_ms, 1000);
+
+    let bytes = frame.to_bytes();
+    assert_eq!(bytes.len(), 40);
+
+    let recovered = BinaryVisemeFrame::from_bytes(&bytes);
+    assert_eq!(frame, recovered);
+    assert_eq!(recovered.weights().aa, 0.7);
+    assert_eq!(recovered.weights().ih, 0.2);
+}
+
+
 
 

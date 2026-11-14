@@ -13,6 +13,9 @@ interface ArmSpec {
   fingers?: FingerCurls;
 }
 
+const FINGER_KEYS = ['thumb', 'index', 'middle', 'ring', 'little', 'all'] as const;
+const _mergedCurls: FingerCurls = {};
+
 const arm = (buf: PoseBuffer, side: Side, w: number, spec: ArmSpec) => {
   const { raise = 0.3, fwd = 0.1, twist = 0, flex = 0.2, ftwist = 0, hand, fingers } = spec;
   const prefix = side;
@@ -20,19 +23,25 @@ const arm = (buf: PoseBuffer, side: Side, w: number, spec: ArmSpec) => {
   buf.blend(`${prefix}LowerArm`, lowerArmQuat(side, flex, ftwist, _q), w);
   if (hand) buf.blend(`${prefix}Hand`, eq(hand[0], hand[1], hand[2], _q), w);
   if (fingers) {
-    const merged: FingerCurls = {};
-    for (const [k, v] of Object.entries(fingers)) {
+    const rest = fingers.rest ?? 0.25;
+    for (let i = 0; i < FINGER_KEYS.length; i++) {
+      const k = FINGER_KEYS[i];
+      const v = fingers[k];
       if (typeof v === 'number') {
-        merged[k as keyof FingerCurls] = v * w + (1 - w) * (fingers.rest ?? 0.25);
+        _mergedCurls[k] = v * w + (1 - w) * rest;
+      } else {
+        delete _mergedCurls[k];
       }
     }
-    buf.setFingers(side, merged);
+    _mergedCurls.rest = rest;
+    buf.setFingers(side, _mergedCurls);
   }
 };
 
 const addAll = (buf: PoseBuffer, w: number, map: Record<string, [number, number, number]>) => {
-  for (const [bone, [x, y, z]] of Object.entries(map)) {
-    buf.add(bone, x * w, y * w, z * w);
+  for (const bone in map) {
+    const coords = map[bone];
+    buf.add(bone, coords[0] * w, coords[1] * w, coords[2] * w);
   }
 };
 
@@ -281,13 +290,25 @@ export class GestureController {
 
   public update(dt: number): Array<{ key: string; def: GestureDef; w: number; t: number }> {
     const states: Array<{ key: string; def: GestureDef; w: number; t: number }> = [];
-    for (const lane of Object.values(this.lanes)) {
-      for (const g of lane.active) {
+    const laneValues = [this.lanes.head, this.lanes.body];
+    for (let l = 0; l < laneValues.length; l++) {
+      const lane = laneValues[l];
+      for (let i = 0; i < lane.active.length; i++) {
+        const g = lane.active[i];
         g.time += dt;
         const w = Math.min(smoothstep(g.time / this.attack), smoothstep((g.duration - g.time) / this.release));
         states.push({ key: g.key, def: g.def, w, t: g.time });
       }
-      lane.active = lane.active.filter((g) => g.time < g.duration);
+
+      // In-place two-pointer compaction to eliminate filter() array allocation
+      let writeIdx = 0;
+      for (let readIdx = 0; readIdx < lane.active.length; readIdx++) {
+        const g = lane.active[readIdx];
+        if (g.time < g.duration) {
+          lane.active[writeIdx++] = g;
+        }
+      }
+      lane.active.length = writeIdx;
 
       const newest = lane.active[lane.active.length - 1];
       if (lane.queue.length && (!newest || newest.time >= newest.duration - this.release)) {
@@ -299,10 +320,14 @@ export class GestureController {
 
   public apply(buf: PoseBuffer, states: Array<{ key: string; def: GestureDef; w: number; t: number }>): Record<string, number> {
     const hint: Record<string, number> = {};
-    for (const state of states || []) {
+    for (let i = 0; i < states.length; i++) {
+      const state = states[i];
       state.def.apply(buf, state);
-      for (const [k, v] of Object.entries(state.def.expr || {})) {
-        hint[k] = Math.max(hint[k] || 0, v * state.w);
+      const expr = state.def.expr;
+      if (expr) {
+        for (const k in expr) {
+          hint[k] = Math.max(hint[k] || 0, expr[k] * state.w);
+        }
       }
     }
     return hint;

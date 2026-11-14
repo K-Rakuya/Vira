@@ -2,6 +2,97 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use vira_ports::audio::AudioError;
 
+/// 64-byte cache-line aligned wrapper that prevents false sharing across CPU cores.
+///
+/// In SMP systems with MESI cache coherency protocols, variables that reside on the same
+/// 64-byte L1 cache line cause frequent bus invalidation cycles when updated from different
+/// CPU threads (e.g. background worker pushing audio vs hardware audio callback consuming audio).
+/// Wrapping hot atomics in `CachePadded` guarantees that each atomic occupies its own dedicated
+/// cache line.
+#[repr(align(64))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CachePadded<T>(pub T);
+
+impl<T> CachePadded<T> {
+    /// Creates a new cache-padded value.
+    pub const fn new(value: T) -> Self {
+        Self(value)
+    }
+
+    /// Unwraps the inner value.
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for CachePadded<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T> AsRef<T> for CachePadded<T> {
+    #[inline]
+    fn as_ref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> AsMut<T> for CachePadded<T> {
+    #[inline]
+    fn as_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+impl<T> From<T> for CachePadded<T> {
+    #[inline]
+    fn from(value: T) -> Self {
+        Self(value)
+    }
+}
+
+/// Unified 64-byte aligned state structure for SPSC ring buffer accounting.
+///
+/// Ensures `total_written`, `total_read`, and `discard_target` occupy separate
+/// 64-byte L1 cache lines (192 bytes total), completely eliminating MESI ping-pong
+/// between producer and consumer threads.
+#[repr(C)]
+pub struct AlignedRingState {
+    /// Write counter modified only by the producer.
+    pub total_written: CachePadded<AtomicU64>,
+    /// Read counter modified only by the consumer.
+    pub total_read: CachePadded<AtomicU64>,
+    /// Discard target counter modified by flush operations.
+    pub discard_target: CachePadded<AtomicU64>,
+}
+
+impl AlignedRingState {
+    /// Initializes zeroed ring buffer state with isolated cache lines.
+    pub fn new() -> Self {
+        Self {
+            total_written: CachePadded::new(AtomicU64::new(0)),
+            total_read: CachePadded::new(AtomicU64::new(0)),
+            discard_target: CachePadded::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl Default for AlignedRingState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Real-time SPSC Audio Ring Buffer built on top of `rtrb::RingBuffer`.
 ///
 /// Provides zero-allocation, lock-free communication between background async tasks (producer)
@@ -15,22 +106,17 @@ impl AudioRingBuffer {
     /// Creates a lock-free SPSC ring buffer pair with the specified sample capacity.
     pub fn create(capacity: usize) -> (AudioProducer, AudioConsumer) {
         let (producer, consumer) = rtrb::RingBuffer::<f32>::new(capacity);
-        let total_written = Arc::new(AtomicU64::new(0));
-        let total_read = Arc::new(AtomicU64::new(0));
-        let discard_target = Arc::new(AtomicU64::new(0));
+        let state = Arc::new(AlignedRingState::new());
 
         let p = AudioProducer {
             inner: producer,
-            total_written: total_written.clone(),
-            total_read: total_read.clone(),
-            discard_target: discard_target.clone(),
+            state: state.clone(),
             capacity,
         };
 
         let c = AudioConsumer {
             inner: consumer,
-            total_read,
-            discard_target,
+            state,
             capacity,
         };
 
@@ -43,9 +129,7 @@ impl AudioRingBuffer {
 /// Thread-safe for writing from worker or async threads.
 pub struct AudioProducer {
     inner: rtrb::Producer<f32>,
-    total_written: Arc<AtomicU64>,
-    total_read: Arc<AtomicU64>,
-    discard_target: Arc<AtomicU64>,
+    state: Arc<AlignedRingState>,
     capacity: usize,
 }
 
@@ -72,9 +156,9 @@ impl AudioProducer {
     /// Excludes flushed / discarded samples even before the consumer runs.
     #[inline]
     pub fn buffered_samples(&self) -> usize {
-        let written = self.total_written.load(Ordering::Acquire);
-        let discard = self.discard_target.load(Ordering::Acquire);
-        let read = self.total_read.load(Ordering::Acquire);
+        let written = self.state.total_written.load(Ordering::Acquire);
+        let discard = self.state.discard_target.load(Ordering::Acquire);
+        let read = self.state.total_read.load(Ordering::Acquire);
         let effective_read = discard.max(read);
         written.saturating_sub(effective_read) as usize
     }
@@ -82,7 +166,7 @@ impl AudioProducer {
     /// Monotonic count of total samples pushed by this producer.
     #[inline]
     pub fn total_written(&self) -> u64 {
-        self.total_written.load(Ordering::Acquire)
+        self.state.total_written.load(Ordering::Acquire)
     }
 
     /// Pushes an exact slice of PCM 32-bit float samples into the ring buffer.
@@ -104,7 +188,8 @@ impl AudioProducer {
                 available: self.inner.slots(),
             })?;
 
-        self.total_written
+        self.state
+            .total_written
             .fetch_add(samples.len() as u64, Ordering::Release);
         Ok(())
     }
@@ -116,7 +201,8 @@ impl AudioProducer {
         let (written, _) = self.inner.push_partial_slice(samples);
         let count = written.len();
         if count > 0 {
-            self.total_written
+            self.state
+                .total_written
                 .fetch_add(count as u64, Ordering::Release);
         }
         Ok(count)
@@ -128,7 +214,7 @@ impl AudioProducer {
             requested: 1,
             available: self.inner.slots(),
         })?;
-        self.total_written.fetch_add(1, Ordering::Release);
+        self.state.total_written.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -137,8 +223,9 @@ impl AudioProducer {
     /// Any audio pushed AFTER this flush call will be preserved and played normally.
     #[inline]
     pub fn flush(&mut self) {
-        let current_written = self.total_written.load(Ordering::Acquire);
-        self.discard_target
+        let current_written = self.state.total_written.load(Ordering::Acquire);
+        self.state
+            .discard_target
             .fetch_max(current_written, Ordering::SeqCst);
     }
 }
@@ -152,8 +239,7 @@ unsafe impl Send for AudioProducer {}
 /// Completely lock-free and wait-free without heap allocations.
 pub struct AudioConsumer {
     inner: rtrb::Consumer<f32>,
-    total_read: Arc<AtomicU64>,
-    discard_target: Arc<AtomicU64>,
+    state: Arc<AlignedRingState>,
     capacity: usize,
 }
 
@@ -161,8 +247,8 @@ impl AudioConsumer {
     /// Internal helper to drain samples marked for discard during barge-in.
     #[inline]
     fn apply_discard(&mut self) {
-        let discard_target = self.discard_target.load(Ordering::Acquire);
-        let current_read = self.total_read.load(Ordering::Acquire);
+        let discard_target = self.state.discard_target.load(Ordering::Acquire);
+        let current_read = self.state.total_read.load(Ordering::Acquire);
 
         if discard_target > current_read {
             let needed = (discard_target - current_read) as usize;
@@ -172,7 +258,8 @@ impl AudioConsumer {
             if to_discard > 0 {
                 if let Ok(chunk) = self.inner.read_chunk(to_discard) {
                     chunk.commit_all();
-                    self.total_read
+                    self.state
+                        .total_read
                         .fetch_add(to_discard as u64, Ordering::Release);
                 }
             }
@@ -200,14 +287,14 @@ impl AudioConsumer {
     /// Monotonic count of total samples read or discarded by this consumer.
     #[inline]
     pub fn total_read(&self) -> u64 {
-        self.total_read.load(Ordering::Acquire)
+        self.state.total_read.load(Ordering::Acquire)
     }
 
     /// Pops a single sample if available. Returns None if empty or flushed.
     pub fn pop(&mut self) -> Option<f32> {
         self.apply_discard();
         if let Ok(sample) = self.inner.pop() {
-            self.total_read.fetch_add(1, Ordering::Release);
+            self.state.total_read.fetch_add(1, Ordering::Release);
             Some(sample)
         } else {
             None
@@ -225,7 +312,7 @@ impl AudioConsumer {
         let count = read_slice.len();
 
         if count > 0 {
-            self.total_read.fetch_add(count as u64, Ordering::Release);
+            self.state.total_read.fetch_add(count as u64, Ordering::Release);
         }
 
         // Fill remainder with silence
@@ -327,5 +414,22 @@ mod tests {
         producer.flush();
         assert_eq!(producer.buffered_samples(), 0);
         assert_eq!(consumer.slots(), 0);
+    }
+
+    #[test]
+    fn test_cache_padded_alignment_and_state_size() {
+        assert_eq!(std::mem::align_of::<CachePadded<AtomicU64>>(), 64);
+        assert_eq!(std::mem::size_of::<CachePadded<AtomicU64>>(), 64);
+        assert_eq!(std::mem::align_of::<AlignedRingState>(), 64);
+        assert_eq!(std::mem::size_of::<AlignedRingState>(), 192);
+
+        let state = AlignedRingState::new();
+        state.total_written.store(42, Ordering::Release);
+        state.total_read.store(10, Ordering::Release);
+        state.discard_target.store(20, Ordering::Release);
+
+        assert_eq!(state.total_written.load(Ordering::Acquire), 42);
+        assert_eq!(state.total_read.load(Ordering::Acquire), 10);
+        assert_eq!(state.discard_target.load(Ordering::Acquire), 20);
     }
 }

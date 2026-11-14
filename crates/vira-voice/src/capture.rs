@@ -8,7 +8,7 @@ use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use vira_ports::audio::{AudioCapturePort, AudioError};
 
-use crate::ring_buffer::AudioRingBuffer;
+use crate::ring_buffer::{AudioRingBuffer, CachePadded};
 
 /// Configuration parameters for microphone audio capture.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +67,8 @@ impl LinearResampler {
     /// Resamples an input slice of mono PCM samples into an existing stack or heap buffer `output`.
     /// Returns the number of resampled samples written into `output`.
     ///
+    /// Optimized with loop bounds partitioning: partitions the loop into a head prologue,
+    /// an interior branchless block with unchecked indexing, and an epilogue tail.
     /// Real-time safe: zero heap allocations, zero locks.
     pub fn resample_into_slice(&mut self, input: &[f32], output: &mut [f32]) -> usize {
         if input.is_empty() || self.ratio <= 0.0 {
@@ -86,27 +88,52 @@ impl LinearResampler {
         }
 
         let in_len = input.len();
+        let out_cap = output.len();
         let mut t = self.phase;
         let mut out_idx = 0;
 
-        while t < in_len as f64 && out_idx < output.len() {
-            let idx0 = t.floor() as isize;
+        // Partition 1: Head / Prologue (t < 0.0)
+        // Interpolate between the retained last sample from previous chunk and input[0].
+        while t < 0.0 && out_idx < out_cap {
             let frac = (t - t.floor()) as f32;
-
-            let (s0, s1) = if idx0 < 0 {
-                (self.last_sample, input[0])
-            } else if (idx0 as usize + 1) < in_len {
-                (input[idx0 as usize], input[idx0 as usize + 1])
-            } else if idx0 as usize == in_len - 1 && frac < 1e-6 {
-                (input[idx0 as usize], input[idx0 as usize])
-            } else {
-                // Next sample is in the upcoming chunk; break and retain phase
-                break;
-            };
-
+            let s0 = self.last_sample;
+            let s1 = input[0];
             output[out_idx] = s0 + frac * (s1 - s0);
             out_idx += 1;
             t += self.ratio;
+        }
+
+        // Partition 2: Interior (0.0 <= t < (in_len - 1) as f64)
+        // Both idx0 and idx0 + 1 are strictly within bounds [0, in_len), completely branchless.
+        let max_interior_t = if in_len > 1 { (in_len - 1) as f64 } else { 0.0 };
+        while t < max_interior_t && out_idx < out_cap {
+            let idx0 = t as usize;
+            let frac = (t - idx0 as f64) as f32;
+            let s0 = input[idx0];
+            let s1 = input[idx0 + 1];
+            output[out_idx] = s0 + frac * (s1 - s0);
+            out_idx += 1;
+            t += self.ratio;
+        }
+
+        // Partition 3: Tail / Epilogue (t >= in_len - 1 and t < in_len)
+        while t < in_len as f64 && out_idx < out_cap {
+            let idx0 = t.floor() as usize;
+            let frac = (t - idx0 as f64) as f32;
+            if (idx0 + 1) < in_len {
+                let s0 = input[idx0];
+                let s1 = input[idx0 + 1];
+                output[out_idx] = s0 + frac * (s1 - s0);
+                out_idx += 1;
+                t += self.ratio;
+            } else if idx0 == in_len - 1 && frac < 1e-6 {
+                output[out_idx] = input[idx0];
+                out_idx += 1;
+                t += self.ratio;
+            } else {
+                // Next sample is in the upcoming chunk; break and retain phase
+                break;
+            }
         }
 
         self.phase = t - in_len as f64;
@@ -115,6 +142,8 @@ impl LinearResampler {
     }
 
     /// Resamples an input slice of mono PCM samples, appending resampled samples into `output`.
+    ///
+    /// Optimized with loop bounds partitioning for branchless processing.
     pub fn resample_chunk(&mut self, input: &[f32], output: &mut Vec<f32>) {
         if input.is_empty() || self.ratio <= 0.0 {
             return;
@@ -134,23 +163,41 @@ impl LinearResampler {
         let in_len = input.len();
         let mut t = self.phase;
 
-        while t < in_len as f64 {
-            let idx0 = t.floor() as isize;
+        // Partition 1: Head / Prologue (t < 0.0)
+        while t < 0.0 {
             let frac = (t - t.floor()) as f32;
-
-            let (s0, s1) = if idx0 < 0 {
-                (self.last_sample, input[0])
-            } else if (idx0 as usize + 1) < in_len {
-                (input[idx0 as usize], input[idx0 as usize + 1])
-            } else if idx0 as usize == in_len - 1 && frac < 1e-6 {
-                (input[idx0 as usize], input[idx0 as usize])
-            } else {
-                // Next sample is in the upcoming chunk; break and retain phase
-                break;
-            };
-
+            let s0 = self.last_sample;
+            let s1 = input[0];
             output.push(s0 + frac * (s1 - s0));
             t += self.ratio;
+        }
+
+        // Partition 2: Interior (0.0 <= t < (in_len - 1) as f64)
+        let max_interior_t = if in_len > 1 { (in_len - 1) as f64 } else { 0.0 };
+        while t < max_interior_t {
+            let idx0 = t as usize;
+            let frac = (t - idx0 as f64) as f32;
+            let s0 = input[idx0];
+            let s1 = input[idx0 + 1];
+            output.push(s0 + frac * (s1 - s0));
+            t += self.ratio;
+        }
+
+        // Partition 3: Tail / Epilogue
+        while t < in_len as f64 {
+            let idx0 = t.floor() as usize;
+            let frac = (t - idx0 as f64) as f32;
+            if (idx0 + 1) < in_len {
+                let s0 = input[idx0];
+                let s1 = input[idx0 + 1];
+                output.push(s0 + frac * (s1 - s0));
+                t += self.ratio;
+            } else if idx0 == in_len - 1 && frac < 1e-6 {
+                output.push(input[idx0]);
+                t += self.ratio;
+            } else {
+                break;
+            }
         }
 
         self.phase = t - in_len as f64;
@@ -158,15 +205,40 @@ impl LinearResampler {
     }
 }
 
-/// One-shot linear interpolation resampler.
+/// One-shot linear interpolation resampler optimized with loop bounds partitioning.
 pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate || samples.is_empty() || from_rate == 0 || to_rate == 0 {
         return samples.to_vec();
     }
+    let in_len = samples.len();
     let ratio = to_rate as f64 / from_rate as f64;
-    let out_len = (samples.len() as f64 * ratio).round() as usize;
+    let out_len = (in_len as f64 * ratio).round() as usize;
+    if out_len == 0 {
+        return Vec::new();
+    }
+    if in_len == 1 {
+        return vec![samples[0]; out_len];
+    }
+
     let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
+
+    // Loop bounds partitioning:
+    // Determine the interior limit where idx0 + 1 < in_len is guaranteed without bounds checks.
+    let interior_end = ((in_len - 1) as f64 * ratio).floor() as usize;
+    let interior_len = interior_end.min(out_len);
+
+    // Branchless interior
+    for i in 0..interior_len {
+        let src_idx = i as f64 / ratio;
+        let idx0 = src_idx as usize;
+        let frac = (src_idx - idx0 as f64) as f32;
+        let s0 = samples[idx0];
+        let s1 = samples[idx0 + 1];
+        out.push(s0 + frac * (s1 - s0));
+    }
+
+    // Epilogue tail
+    for i in interior_len..out_len {
         let src_idx = i as f64 / ratio;
         let idx0 = src_idx.floor() as usize;
         let frac = (src_idx - idx0 as f64) as f32;
@@ -174,6 +246,7 @@ pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32
         let s1 = samples.get(idx0 + 1).copied().unwrap_or(s0);
         out.push(s0 + frac * (s1 - s0));
     }
+
     out
 }
 
@@ -202,7 +275,7 @@ unsafe impl Sync for StreamHandle {}
 pub struct CaptureEngine {
     sample_rate: u32,
     chunk_size: usize,
-    is_capturing: Arc<AtomicBool>,
+    is_capturing: Arc<CachePadded<AtomicBool>>,
     broadcast_tx: broadcast::Sender<Vec<f32>>,
     _stream: Option<StreamHandle>,
     _worker_cancel: Option<CancellationToken>,
@@ -221,7 +294,7 @@ impl CaptureEngine {
         let engine = Self {
             sample_rate,
             chunk_size,
-            is_capturing: Arc::new(AtomicBool::new(true)),
+            is_capturing: Arc::new(CachePadded::new(AtomicBool::new(true))),
             broadcast_tx,
             _stream: None,
             _worker_cancel: None,
@@ -271,11 +344,9 @@ impl CaptureEngine {
         let (mut producer, mut consumer) = AudioRingBuffer::create(ring_capacity);
 
         let (broadcast_tx, _) = broadcast::channel(128);
-        let is_capturing = Arc::new(AtomicBool::new(true));
+        let is_capturing = Arc::new(CachePadded::new(AtomicBool::new(true)));
         let is_capturing_clone = is_capturing.clone();
 
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let notify_audio = notify.clone();
         let channels = native_channels as usize;
         let target_sample_rate = config.sample_rate;
 
@@ -334,7 +405,6 @@ impl CaptureEngine {
                                 }
                             }
                         }
-                        notify_audio.notify_one();
                     },
                     err_callback,
                     None,
@@ -387,7 +457,6 @@ impl CaptureEngine {
                                 }
                             }
                         }
-                        notify_audio.notify_one();
                     },
                     err_callback,
                     None,
@@ -418,7 +487,6 @@ impl CaptureEngine {
                 } else {
                     tokio::select! {
                         _ = worker_cancel_task.cancelled() => break,
-                        _ = notify.notified() => {},
                         _ = tokio::time::sleep(tokio::time::Duration::from_millis(5)) => {},
                     }
                 }

@@ -352,6 +352,7 @@ fn test_dtw_sequence_alignment() {
     assert_eq!(res_exact.substitutions_count, 0);
     assert_eq!(res_exact.insertions_count, 0);
     assert_eq!(res_exact.deletions_count, 0);
+    assert_eq!(dtw.align_distance_rolling(&target, &target), res_exact.total_cost);
 
     // ARPAbet stress variation: AA vs AA1 is not penalized as substitution
     let dist_stress = DtwAligner::phoneme_distance("AA", "AA1");
@@ -367,11 +368,13 @@ fn test_dtw_sequence_alignment() {
     assert_eq!(res_sub.correct_count, 3);
     assert_eq!(res_sub.substitutions_count, 1);
     assert!(res_sub.accuracy_percent > 85.0);
+    assert!((dtw.align_distance_rolling(&target, &rec_sub) - res_sub.total_cost).abs() < 1e-4);
 
     // 3. Deletion ("L" dropped)
     let rec_del = vec!["HH".to_string(), "EH".to_string(), "OW".to_string()];
     let res_del = dtw.align(&target, &rec_del);
     assert_eq!(res_del.deletions_count, 1);
+    assert!((dtw.align_distance_rolling(&target, &rec_del) - res_del.total_cost).abs() < 1e-4);
 
     // 4. Insertion (extra sound "S" inserted at end)
     let rec_ins = vec![
@@ -383,10 +386,12 @@ fn test_dtw_sequence_alignment() {
     ];
     let res_ins = dtw.align(&target, &rec_ins);
     assert_eq!(res_ins.insertions_count, 1);
+    assert!((dtw.align_distance_rolling(&target, &rec_ins) - res_ins.total_cost).abs() < 1e-4);
 
     // 5. Empty inputs
     let res_empty = dtw.align(&[], &[]);
     assert_eq!(res_empty.accuracy_percent, 100.0);
+    assert_eq!(dtw.align_distance_rolling(&[], &[]), 0.0);
 }
 
 #[test]

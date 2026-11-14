@@ -12,7 +12,13 @@ import {
   so3Log,
   so3Exp,
   GeodesicSpringDamper,
+  VectorizedSpringDamperBatch,
 } from '../src/stage/pose-utils';
+import {
+  so3Log as rendererSo3Log,
+  PoseBuffer as RendererPoseBuffer,
+} from '../src/renderer/pose-utils';
+import { SceneManager, VRMViewer } from '../src/renderer/scene-manager';
 import { parseKinematicCues } from '../src/stage/procedural-animator';
 
 describe('pose-utils math helpers', () => {
@@ -108,6 +114,65 @@ describe('SO(3) Lie Group / Lie Algebra operations', () => {
     const dot = Math.abs(damper.current.dot(target));
     expect(dot).toBeGreaterThan(0.95);
   });
+
+  it('so3Log uses Padé/Taylor approximation for theta < 0.4 rad and exact trig for theta >= 0.4 rad', () => {
+    // Exact trigonometric reference function
+    const exactLog = (q: THREE.Quaternion) => {
+      let w = clamp(q.w, -1, 1);
+      let x = q.x, y = q.y, z = q.z;
+      if (w < 0) { w = -w; x = -x; y = -y; z = -z; }
+      const vLen = Math.hypot(x, y, z);
+      if (vLen < 1e-7) return new THREE.Vector3(2 * x, 2 * y, 2 * z);
+      const factor = (2 * Math.atan2(vLen, w)) / vLen;
+      return new THREE.Vector3(x * factor, y * factor, z * factor);
+    };
+
+    const axis = new THREE.Vector3(1, 2, 3).normalize();
+
+    // Small angles (< 0.4 rad) evaluated with polynomial
+    for (const theta of [0.0001, 0.01, 0.05, 0.2, 0.35, 0.395]) {
+      const q = new THREE.Quaternion().setFromAxisAngle(axis, theta);
+      const approx = so3Log(q);
+      const exact = exactLog(q);
+      expect(Math.abs(approx.x - exact.x)).toBeLessThan(1e-6);
+      expect(Math.abs(approx.y - exact.y)).toBeLessThan(1e-6);
+      expect(Math.abs(approx.z - exact.z)).toBeLessThan(1e-6);
+      expect(approx.length()).toBeCloseTo(theta, 5);
+    }
+
+    // Larger angles (>= 0.4 rad) falling back to exact trig
+    for (const theta of [0.45, 0.8, 1.5, 2.8]) {
+      const q = new THREE.Quaternion().setFromAxisAngle(axis, theta);
+      const res = so3Log(q);
+      const exact = exactLog(q);
+      expect(Math.abs(res.x - exact.x)).toBeLessThan(1e-6);
+      expect(Math.abs(res.y - exact.y)).toBeLessThan(1e-6);
+      expect(Math.abs(res.z - exact.z)).toBeLessThan(1e-6);
+      expect(res.length()).toBeCloseTo(theta, 4);
+    }
+  });
+
+  it('VectorizedSpringDamperBatch integrates joints with Float32Array SoA', () => {
+    const batch = new VectorizedSpringDamperBatch(2);
+    expect(batch.count).toBe(2);
+    expect(batch.buffer.length).toBe(32);
+
+    // Target for joint 0: 0.3 rad around Y
+    const targetQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), 0.3);
+    batch.buffer[8] = targetQ.x;
+    batch.buffer[9] = targetQ.y;
+    batch.buffer[10] = targetQ.z;
+    batch.buffer[11] = targetQ.w;
+
+    for (let step = 0; step < 60; step++) {
+      batch.stepAll(1 / 60);
+    }
+
+    // Joint 0 should have converged toward target
+    const currentQ = new THREE.Quaternion(batch.buffer[0], batch.buffer[1], batch.buffer[2], batch.buffer[3]);
+    const dot = Math.abs(currentQ.dot(targetQ));
+    expect(dot).toBeGreaterThan(0.98);
+  });
 });
 
 describe('PoseBuffer', () => {
@@ -166,6 +231,54 @@ describe('PoseBuffer', () => {
     expect(mockHipsNode.position.x).toBeCloseTo(0.01, 4);
     expect(mockHipsNode.position.y).toBeCloseTo(0.02, 4);
     expect(mockHipsNode.position.z).toBeCloseTo(0.03, 4);
+  });
+
+  it('preallocates Float32Array buffers for zero-allocation bone transforms', () => {
+    const buf = new PoseBuffer();
+    expect(buf.rotBuffer).toBeInstanceOf(Float32Array);
+    expect(buf.posBuffer).toBeInstanceOf(Float32Array);
+    expect(buf.smoothedRotBuffer).toBeInstanceOf(Float32Array);
+    expect(buf.smoothedPosBuffer).toBeInstanceOf(Float32Array);
+
+    const rot = eq(0.1, 0.2, 0.3);
+    buf.set('head', rot);
+    buf.offsetPos('hips', 0.05, 0.1, 0.15);
+
+    // Check that rotBuffer contains head rotation (head index = 5)
+    expect(buf.rotBuffer[5 * 4 + 0]).toBeCloseTo(rot.x, 5);
+    expect(buf.rotBuffer[5 * 4 + 1]).toBeCloseTo(rot.y, 5);
+    expect(buf.rotBuffer[5 * 4 + 2]).toBeCloseTo(rot.z, 5);
+    expect(buf.rotBuffer[5 * 4 + 3]).toBeCloseTo(rot.w, 5);
+
+    // Check that posBuffer contains hips translation (hips index = 0)
+    expect(buf.posBuffer[0 * 3 + 0]).toBeCloseTo(0.05, 5);
+    expect(buf.posBuffer[0 * 3 + 1]).toBeCloseTo(0.1, 5);
+    expect(buf.posBuffer[0 * 3 + 2]).toBeCloseTo(0.15, 5);
+
+    // Simulate 60fps render loop apply calls
+    const mockVRM = {
+      humanoid: {
+        getNormalizedBoneNode: () => new THREE.Object3D(),
+      },
+    };
+    for (let f = 0; f < 10; f++) {
+      buf.apply(mockVRM as any, 1 / 60, 14);
+    }
+
+    // smoothed buffers should be updated
+    expect(buf.smoothedRotBuffer[5 * 4 + 3]).toBeGreaterThan(0);
+    expect(buf.smoothedPosBuffer[0 * 3 + 1]).toBeGreaterThan(0);
+  });
+
+  it('renderer module exports pose-utils and scene-manager seamlessly', () => {
+    expect(rendererSo3Log).toBe(so3Log);
+    const rBuf = new RendererPoseBuffer();
+    expect(rBuf.rotBuffer).toBeInstanceOf(Float32Array);
+
+    expect(SceneManager).toBe(VRMViewer);
+    const viewer = new SceneManager();
+    expect(viewer.boneRotBuffer).toBeInstanceOf(Float32Array);
+    expect(viewer.bonePosBuffer).toBeInstanceOf(Float32Array);
   });
 });
 

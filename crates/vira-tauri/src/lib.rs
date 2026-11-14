@@ -6,6 +6,9 @@ pub mod commands;
 pub mod events;
 pub mod state;
 
+pub use events::BinaryVisemeFrame;
+pub use state::AtomicConversationState;
+
 use std::sync::Arc;
 use tauri::Manager;
 use tokio_util::sync::CancellationToken;
@@ -45,7 +48,7 @@ pub fn spawn_viseme_tick_loop(
             // Detect speech completion: audio buffer drained, no active LLM/TTS generation,
             // and state is still in Speaking.
             if current_conv_state == vira_domain::state::ConversationState::Speaking && !is_playing && !is_gen {
-                state.force_state(vira_domain::state::ConversationState::Idle);
+                let _ = state.transition_state(vira_domain::state::ConversationState::Idle);
                 state.emit_subtitle("", vira_domain::state::ConversationState::Idle);
                 *state.active_visemes.write().unwrap() = Vec::new();
                 state.emit_viseme_tick(VisemeWeights::zero(), false);

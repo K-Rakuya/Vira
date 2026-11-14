@@ -20,6 +20,12 @@ export class VRMViewer {
   public proceduralAnimator = new ProceduralAnimator();
   public lipSyncAnimator = new LipSyncAnimator();
 
+  // Preallocated contiguous Float32Array buffers for zero-allocation 60fps bone transform streaming
+  public readonly boneRotBuffer: Float32Array;
+  public readonly bonePosBuffer: Float32Array;
+  public readonly smoothedRotBuffer: Float32Array;
+  public readonly smoothedPosBuffer: Float32Array;
+
   public state = 'idle';
   private userMovedCamera = false;
   private time = 0;
@@ -31,6 +37,14 @@ export class VRMViewer {
 
   private onContextLost = (e: Event) => e.preventDefault();
   private onContextRestored = () => this.handleResize();
+
+  constructor() {
+    this.animate = this.animate.bind(this);
+    this.boneRotBuffer = this.proceduralAnimator.pose.rotBuffer;
+    this.bonePosBuffer = this.proceduralAnimator.pose.posBuffer;
+    this.smoothedRotBuffer = this.proceduralAnimator.pose.smoothedRotBuffer;
+    this.smoothedPosBuffer = this.proceduralAnimator.pose.smoothedPosBuffer;
+  }
 
   public async init(containerElement: HTMLElement): Promise<void> {
     this.container = containerElement;
@@ -305,7 +319,7 @@ export class VRMViewer {
   }
 
   public animate(): void {
-    this.animationFrameId = requestAnimationFrame(() => this.animate());
+    this.animationFrameId = requestAnimationFrame(this.animate);
 
     const now = performance.now();
     const dt = Math.min((now - this.lastFrame) / 1000, MAX_DELTA);
@@ -343,3 +357,5 @@ export class VRMViewer {
     }
   }
 }
+
+export { VRMViewer as SceneManager };
