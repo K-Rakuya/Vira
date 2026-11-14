@@ -6,9 +6,23 @@ const _qa = new THREE.Quaternion();
 const _qb = new THREE.Quaternion();
 const _va = new THREE.Vector3();
 const _vb = new THREE.Vector3();
+const _vc = new THREE.Vector3();
 const _scratchQuat = new THREE.Quaternion();
 const _zeroPos: [number, number, number] = [0, 0, 0];
 const IDENTITY = new THREE.Quaternion();
+
+// Preallocated scratch vectors and quaternions for Inverse Kinematics & Scapulohumeral Rhythm
+const _ikTargetDir = new THREE.Vector3();
+const _ikPole = new THREE.Vector3();
+const _ikPolePerp = new THREE.Vector3();
+const _ikElbow = new THREE.Vector3();
+const _ikUpperDir = new THREE.Vector3();
+const _ikBendDir = new THREE.Vector3();
+const _ikCurZ = new THREE.Vector3();
+const _ikCrossZ = new THREE.Vector3();
+const _ikTwistQ = new THREE.Quaternion();
+const _vArmRest = new THREE.Vector3();
+const _vArmCurrent = new THREE.Vector3();
 
 const JOINTS = ['Proximal', 'Intermediate', 'Distal'] as const;
 const GAINS = [1.1, 1.3, 0.8] as const;
@@ -62,6 +76,281 @@ export function lowerArmQuat(
   out.setFromEuler(_e);
   if (twist) out.multiply(_qa.setFromAxisAngle(_vb.set(1, 0, 0), -twist * s));
   return out;
+}
+
+/**
+ * Analytical 2-Bone Arm Inverse Kinematics (IK) Solver.
+ * Computes upperArm and lowerArm quaternions in VRM humanoid space to reach any 3D spatial target
+ * with a natural physiological elbow swivel plane.
+ * Guarantees zero heap allocations when outUpper and outLower are supplied.
+ */
+export function solveTwoBoneArmIK(
+  side: Side,
+  target: THREE.Vector3,
+  outUpper = new THREE.Quaternion(),
+  outLower = new THREE.Quaternion(),
+  l1 = 0.25,
+  l2 = 0.22,
+  pole?: THREE.Vector3
+): { upper: THREE.Quaternion; lower: THREE.Quaternion } {
+  const s = sideSign(side);
+  const d = target.length();
+  const dMin = Math.abs(l1 - l2) + 0.005;
+  const dMax = (l1 + l2) * 0.999;
+  const dEff = clamp(d, dMin, dMax);
+
+  if (d > 1e-6) {
+    _ikTargetDir.copy(target).multiplyScalar(1 / d);
+  } else {
+    _ikTargetDir.set(0, -1, 0);
+  }
+
+  // Elbow flexion angle beta via law of cosines
+  const cosElbow = clamp((l1 * l1 + l2 * l2 - dEff * dEff) / (2 * l1 * l2), -1, 1);
+  const beta = Math.PI - Math.acos(cosElbow);
+
+  // Shoulder angle gamma
+  const cosGamma = clamp((l1 * l1 + dEff * dEff - l2 * l2) / (2 * l1 * dEff), -1, 1);
+  const gamma = Math.acos(cosGamma);
+
+  // Swivel pole vector
+  if (pole) {
+    _ikPole.copy(pole);
+  } else {
+    _ikPole.set(s * 0.2, -0.9, -0.2);
+  }
+
+  // Perpendicular component of pole relative to target line
+  const proj = _ikPole.dot(_ikTargetDir);
+  _ikPolePerp.copy(_ikPole).addScaledVector(_ikTargetDir, -proj);
+  if (_ikPolePerp.lengthSq() < 1e-6) {
+    _ikPolePerp.set(0, 0, 1).cross(_ikTargetDir);
+    if (_ikPolePerp.lengthSq() < 1e-6) {
+      _ikPolePerp.set(1, 0, 0).cross(_ikTargetDir);
+    }
+  }
+  _ikPolePerp.normalize();
+
+  // Elbow position vector in shoulder space
+  _ikElbow.copy(_ikTargetDir).multiplyScalar(Math.cos(gamma) * l1)
+    .addScaledVector(_ikPolePerp, Math.sin(gamma) * l1);
+
+  _ikUpperDir.copy(_ikElbow).normalize();
+
+  // Upper arm quaternion: rotate from rest vector (s, 0, 0) to _ikUpperDir
+  _va.set(s, 0, 0);
+  outUpper.setFromUnitVectors(_va, _ikUpperDir);
+
+  // Bend direction in shoulder space
+  _ikBendDir.copy(_ikTargetDir).addScaledVector(_ikUpperDir, -_ikTargetDir.dot(_ikUpperDir));
+  if (_ikBendDir.lengthSq() < 1e-6) {
+    _ikBendDir.copy(_ikPolePerp).negate();
+  } else {
+    _ikBendDir.normalize();
+  }
+
+  // Current local Z axis of upper arm transformed to shoulder space
+  _ikCurZ.set(0, 0, 1).applyQuaternion(outUpper);
+
+  const dotZ = clamp(_ikCurZ.dot(_ikBendDir), -1, 1);
+  _ikCrossZ.crossVectors(_ikCurZ, _ikBendDir);
+  const twistSign = _ikCrossZ.dot(_ikUpperDir) >= 0 ? 1 : -1;
+  const twist = Math.acos(dotZ) * twistSign;
+
+  if (Math.abs(twist) > 1e-4) {
+    _ikTwistQ.setFromAxisAngle(_ikUpperDir, twist);
+    outUpper.premultiply(_ikTwistQ);
+  }
+
+  // Lower arm (forearm) bends around Y axis by -s * beta
+  _e.set(0, -s * beta, 0, 'XYZ');
+  outLower.setFromEuler(_e);
+
+  return { upper: outUpper, lower: outLower };
+}
+
+export interface SpatialAnchorDef {
+  x: number;
+  y: number;
+  z: number;
+  poleX: number;
+  poleY: number;
+  poleZ: number;
+  fingers?: FingerCurls;
+}
+
+/**
+ * Spatial Anatomical Anchors for Natural Human Actions.
+ * Coordinates in shoulder-local space.
+ */
+export const SPATIAL_ANCHORS: Record<string, (side: Side) => SpatialAnchorDef> = {
+  chin: (side) => {
+    const s = sideSign(side);
+    return {
+      x: -s * 0.10,
+      y: 0.08,
+      z: 0.17,
+      poleX: s * 0.3,
+      poleY: -0.85,
+      poleZ: -0.2,
+      fingers: { all: 0.75, index: 0.3, thumb: 0.4 },
+    };
+  },
+  cheek: (side) => {
+    const s = sideSign(side);
+    return {
+      x: s * 0.05,
+      y: 0.16,
+      z: 0.15,
+      poleX: s * 0.5,
+      poleY: -0.7,
+      poleZ: -0.1,
+      fingers: { all: 0.25, thumb: 0.2 },
+    };
+  },
+  mouth: (side) => {
+    const s = sideSign(side);
+    return {
+      x: -s * 0.06,
+      y: 0.10,
+      z: 0.18,
+      poleX: s * 0.2,
+      poleY: -0.9,
+      poleZ: -0.1,
+      fingers: { all: 0.2, thumb: 0.15 },
+    };
+  },
+  chestHeart: (side) => {
+    const s = sideSign(side);
+    return {
+      x: side === 'right' ? 0.08 : 0.06,
+      y: -0.12,
+      z: 0.17,
+      poleX: s * 0.2,
+      poleY: -0.95,
+      poleZ: -0.1,
+      fingers: { all: 0.15, thumb: 0.1 },
+    };
+  },
+  chestCenter: (side) => {
+    const s = sideSign(side);
+    return {
+      x: -s * 0.02,
+      y: -0.14,
+      z: 0.18,
+      poleX: s * 0.3,
+      poleY: -0.9,
+      poleZ: -0.1,
+      fingers: { all: 0.08, thumb: 0.08 },
+    };
+  },
+  forehead: (side) => {
+    const s = sideSign(side);
+    return {
+      x: s * 0.07,
+      y: 0.26,
+      z: 0.14,
+      poleX: s * 0.6,
+      poleY: -0.6,
+      poleZ: -0.2,
+      fingers: { all: 0.85, index: 0.15, thumb: 0.4 },
+    };
+  },
+  temple: (side) => {
+    const s = sideSign(side);
+    return {
+      x: s * 0.11,
+      y: 0.23,
+      z: 0.11,
+      poleX: s * 0.7,
+      poleY: -0.5,
+      poleZ: -0.1,
+      fingers: { all: 0.8, index: 0.2, middle: 0.2, thumb: 0.35 },
+    };
+  },
+  openEmbrace: (side) => {
+    const s = sideSign(side);
+    return {
+      x: s * 0.22,
+      y: -0.06,
+      z: 0.36,
+      poleX: s * 0.4,
+      poleY: -0.8,
+      poleZ: -0.3,
+      fingers: { all: 0.15, thumb: 0.15 },
+    };
+  },
+  lap: (side) => {
+    const s = sideSign(side);
+    return {
+      x: s * 0.10,
+      y: -0.36,
+      z: 0.22,
+      poleX: s * 0.2,
+      poleY: -0.95,
+      poleZ: -0.1,
+      fingers: { all: 0.3, thumb: 0.2 },
+    };
+  },
+};
+
+export function getSpatialAnchor(
+  name: string,
+  side: Side,
+  outTarget: THREE.Vector3,
+  outPole: THREE.Vector3
+): FingerCurls | undefined {
+  const factory = SPATIAL_ANCHORS[name];
+  if (!factory) return undefined;
+  const def = factory(side);
+  outTarget.set(def.x, def.y, def.z);
+  outPole.set(def.poleX, def.poleY, def.poleZ);
+  return def.fingers;
+}
+
+/**
+ * Couples clavicle (shoulder) elevation and retraction to upper arm elevation.
+ * Ratio: approx 1 degree clavicle per 3 degrees upper arm abduction/flexion (1:3 ratio).
+ * Eliminates broken/detached shoulder syndrome during arm gestures.
+ */
+export function applyScapulohumeralRhythm(buf: PoseBuffer): void {
+  for (let i = 0; i < 2; i++) {
+    const side: Side = i === 0 ? 'left' : 'right';
+    const s = sideSign(side);
+    const armQuat = buf.get(`${side}UpperArm`);
+
+    // Direction of upper arm from rest T-pose vector (s, 0, 0)
+    _vArmRest.set(s, 0, 0);
+    _vArmCurrent.copy(_vArmRest).applyQuaternion(armQuat);
+
+    // Angle relative to vertical downward direction (0, -1, 0)
+    const cosAngleFromDown = clamp(-_vArmCurrent.y, -1, 1);
+    const angleFromDown = Math.acos(cosAngleFromDown);
+
+    // Resting hang angle is ~0.34 rad. Elevation above rest:
+    const elev = Math.max(0, angleFromDown - 0.34);
+    if (elev < 1e-4) continue;
+
+    // Lateral abduction component (in coronal plane)
+    const abd = Math.max(0, Math.atan2(Math.max(0, _vArmCurrent.x * s), Math.max(0.01, -_vArmCurrent.y)) - 0.32);
+
+    // Forward flexion component (in sagittal plane)
+    const flex = Math.max(0, Math.atan2(_vArmCurrent.z, Math.max(0.01, -_vArmCurrent.y)) - 0.14);
+
+    // 1:3 ratio (0.333) for clavicle elevation
+    const clavicleElevation = (abd + 0.75 * flex) * 0.333;
+
+    // Clavicle retraction (backward) / protraction (forward)
+    const clavicleRetraction = (abd * 0.25 - flex * 0.35) * 0.333;
+
+    // Clavicle axial roll
+    const clavicleRoll = (flex * 0.2) * 0.333;
+
+    // Add to shoulder bone:
+    // Left: +Z is elevation, +Y is retraction.
+    // Right: -Z is elevation, -Y is retraction.
+    buf.add(`${side}Shoulder`, clavicleRoll, s * clavicleRetraction, s * clavicleElevation);
+  }
 }
 
 /**

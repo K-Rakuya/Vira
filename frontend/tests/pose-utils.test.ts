@@ -13,6 +13,10 @@ import {
   so3Exp,
   GeodesicSpringDamper,
   VectorizedSpringDamperBatch,
+  solveTwoBoneArmIK,
+  SPATIAL_ANCHORS,
+  getSpatialAnchor,
+  applyScapulohumeralRhythm,
 } from '../src/stage/pose-utils';
 import {
   so3Log as rendererSo3Log,
@@ -279,6 +283,85 @@ describe('PoseBuffer', () => {
     const viewer = new SceneManager();
     expect(viewer.boneRotBuffer).toBeInstanceOf(Float32Array);
     expect(viewer.bonePosBuffer).toBeInstanceOf(Float32Array);
+  });
+});
+
+describe('Analytical 2-Bone Arm IK & Spatial Anchors', () => {
+  it('solves analytical 2-bone IK reaching 3D spatial targets with high precision', () => {
+    const l1 = 0.25;
+    const l2 = 0.22;
+    const targets = [
+      new THREE.Vector3(0.12, -0.08, 0.28),
+      new THREE.Vector3(-0.06, 0.12, 0.18),
+      new THREE.Vector3(0.05, -0.25, 0.30),
+    ];
+
+    const outUpper = new THREE.Quaternion();
+    const outLower = new THREE.Quaternion();
+
+    for (const target of targets) {
+      // Left arm (s = 1)
+      solveTwoBoneArmIK('left', target, outUpper, outLower, l1, l2);
+      const b1 = new THREE.Vector3(l1, 0, 0).applyQuaternion(outUpper);
+      const b2 = new THREE.Vector3(l2, 0, 0).applyQuaternion(outLower).applyQuaternion(outUpper);
+      const handLeft = b1.clone().add(b2);
+      expect(handLeft.distanceTo(target)).toBeLessThan(1e-4);
+
+      // Right arm (s = -1)
+      const rightTarget = new THREE.Vector3(-target.x, target.y, target.z);
+      solveTwoBoneArmIK('right', rightTarget, outUpper, outLower, l1, l2);
+      const rb1 = new THREE.Vector3(-l1, 0, 0).applyQuaternion(outUpper);
+      const rb2 = new THREE.Vector3(-l2, 0, 0).applyQuaternion(outLower).applyQuaternion(outUpper);
+      const handRight = rb1.clone().add(rb2);
+      expect(handRight.distanceTo(rightTarget)).toBeLessThan(1e-4);
+    }
+  });
+
+  it('retrieves all canonical spatial anchors with zero heap allocation target buffers', () => {
+    const target = new THREE.Vector3();
+    const pole = new THREE.Vector3();
+    const anchors = ['chin', 'cheek', 'mouth', 'chestHeart', 'chestCenter', 'forehead', 'temple', 'openEmbrace', 'lap'];
+
+    for (const name of anchors) {
+      const fingersLeft = getSpatialAnchor(name, 'left', target, pole);
+      expect(target.length()).toBeGreaterThan(0.1);
+      expect(pole.length()).toBeGreaterThan(0.5);
+      expect(fingersLeft).toBeDefined();
+
+      const fingersRight = getSpatialAnchor(name, 'right', target, pole);
+      expect(target.length()).toBeGreaterThan(0.1);
+      expect(pole.length()).toBeGreaterThan(0.5);
+      expect(fingersRight).toBeDefined();
+    }
+  });
+
+  it('couples clavicle elevation and retraction to arm elevation (Scapulohumeral Rhythm)', () => {
+    const buf = new PoseBuffer();
+    // 1. Arm at rest hang angle (raise = 0.3 rad) -> no clavicle elevation
+    buf.set('leftUpperArm', upperArmQuat('left', 0.3, 0.1, 0));
+    buf.set('rightUpperArm', upperArmQuat('right', 0.3, 0.1, 0));
+    applyScapulohumeralRhythm(buf);
+
+    const leftShRest = buf.get('leftShoulder');
+    expect(Math.abs(leftShRest.z)).toBeLessThan(0.01);
+
+    // 2. Abduct left arm to horizontal (~1.57 rad)
+    buf.reset();
+    buf.set('leftUpperArm', upperArmQuat('left', 1.57, 0, 0));
+    buf.set('rightUpperArm', upperArmQuat('right', 0.3, 0.1, 0));
+    applyScapulohumeralRhythm(buf);
+
+    const leftShElev = buf.get('leftShoulder');
+    // Elevation in VRM for leftShoulder is positive Z
+    expect(leftShElev.z).toBeGreaterThan(0.15); // significant elevation
+    expect(leftShElev.z).toBeLessThan(0.50);
+
+    // 3. Right arm elevated abducts with opposite sign (-Z)
+    buf.reset();
+    buf.set('rightUpperArm', upperArmQuat('right', 1.57, 0, 0));
+    applyScapulohumeralRhythm(buf);
+    const rightShElev = buf.get('rightShoulder');
+    expect(rightShElev.z).toBeLessThan(-0.15);
   });
 });
 
