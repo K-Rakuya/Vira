@@ -26,7 +26,7 @@ describe('HudController tutor presets and normalization', () => {
     expect(normalizeTutorMode('unknown_mode')).toBe('general_assistant');
   });
 
-  it('exposes valid tutor presets for all canonical modes with direct and concise prompts', () => {
+  it('exposes valid tutor presets for all canonical modes with natural and friendly prompts', () => {
     const modes = ['vietnamese', 'english', 'japanese', 'general_assistant'];
     for (const m of modes) {
       const preset = TUTOR_PRESETS[m];
@@ -34,13 +34,8 @@ describe('HudController tutor presets and normalization', () => {
       expect(preset.id).toBe(m);
       expect(preset.name.length).toBeGreaterThan(0);
       expect(preset.systemPrompt.length).toBeGreaterThan(0);
+      expect(preset.systemPrompt).toContain('Vira');
     }
-    // Direct and concise instructions
-    expect(TUTOR_PRESETS.vietnamese.systemPrompt).toContain('Trả lời thẳng vào trọng tâm câu hỏi của người dùng');
-    expect(TUTOR_PRESETS.vietnamese.systemPrompt).toContain('Không nói lan man vòng vo ngoài lề');
-    expect(TUTOR_PRESETS.general_assistant.systemPrompt).toContain('Trả lời thẳng vào trọng tâm câu hỏi của người dùng');
-    expect(TUTOR_PRESETS.english.systemPrompt).toContain('Answer directly to the core of user questions');
-    expect(TUTOR_PRESETS.japanese.systemPrompt).toContain('質問の核心に直接');
   });
 
   it('verifies settings saving sends only canonical keys without duplicate aliases', async () => {

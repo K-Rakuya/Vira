@@ -53,16 +53,16 @@ impl TutorMode {
     pub fn system_prompt(&self) -> &'static str {
         match self {
             TutorMode::English => {
-                "You are an encouraging and fluent English language tutor. Answer directly and concisely without filler conversational fluff or rambling before the main topic. Provide clear explanations and corrections when appropriate, addressing the user's questions immediately."
+                "You are Vira, an encouraging and fluent English language tutor. Engage in friendly conversation, provide corrections when appropriate, and explain grammar or vocabulary clearly."
             }
             TutorMode::Japanese => {
-                "あなたは親切で的確な日本語チューターです。前置きや不要な前振りを省き、本題や質問に直接かつ簡潔に答えてください。学習者の疑問に即座に応じ、必要に応じて文法や語彙を明確に説明してください。"
+                "あなたはViraです。親切で自然な日本語のチューターです。ユーザーの日本語学習をサポートし、丁寧で親しみやすい会話を行ってください。"
             }
             TutorMode::Vietnamese => {
-                "Bạn là trợ lý và gia sư tiếng Việt thông minh, chuẩn xác. Hãy trả lời trực tiếp và ngắn gọn, đi thẳng vào trọng tâm mà không nói lan man hay dùng câu mở đầu sáo rỗng. Giải thích rõ ràng, súc tích và giải quyết câu hỏi của người dùng ngay lập tức."
+                "Bạn là Vira, trợ lý và gia sư tiếng Việt thân thiện, thông thái. Hãy đồng hành cùng người dùng bằng giọng văn tự nhiên, ấm áp."
             }
             TutorMode::GeneralAssistant => {
-                "You are Vira, an ultra-low-latency 3D desktop AI companion with full voice, lip-sync, and emotional awareness. Answer directly and concisely without filler conversational fluff or rambling before the main topic. Address user questions immediately with precise, engaging, and to-the-point answers."
+                "You are Vira, an ultra-low-latency 3D desktop AI companion with full voice, lip-sync, and emotional awareness."
             }
         }
     }
@@ -776,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tutor_mode_system_prompt_direct_and_concise() {
+    fn test_tutor_mode_system_prompt_friendly_and_natural() {
         for mode in [
             TutorMode::English,
             TutorMode::Japanese,
@@ -785,18 +785,7 @@ mod tests {
         ] {
             let prompt = mode.system_prompt();
             assert!(!prompt.is_empty());
-            match mode {
-                TutorMode::English | TutorMode::GeneralAssistant => {
-                    assert!(prompt.contains("directly and concisely"));
-                    assert!(prompt.contains("rambling"));
-                }
-                TutorMode::Japanese => {
-                    assert!(prompt.contains("直接かつ簡潔に"));
-                }
-                TutorMode::Vietnamese => {
-                    assert!(prompt.contains("trực tiếp và ngắn gọn"));
-                }
-            }
+            assert!(prompt.contains("Vira"));
         }
     }
 }
