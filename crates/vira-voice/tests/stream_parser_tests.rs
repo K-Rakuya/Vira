@@ -1,5 +1,8 @@
+use std::collections::HashSet;
 use vira_voice::chunker::{ChunkerConfig, SentenceChunker};
-use vira_voice::stream_parser::{ParsedStreamEvent, StreamParser};
+use vira_voice::stream_parser::{
+    sanitize_speakable_text, ParsedStreamEvent, StreamParser, MAX_TAG_LOOKAHEAD,
+};
 
 #[test]
 fn test_stream_parser_extracts_tags_and_sentences() {
@@ -614,5 +617,217 @@ fn test_stream_parser_generative_anatomical_anchors() {
     assert!(gestures.contains(&"mouth_cover"));
     assert!(gestures.contains(&"hand_on_heart"));
     assert!(gestures.contains(&"temple_rub"));
+}
+
+#[test]
+fn test_stream_parser_long_roleplay_action_over_120_bytes() {
+    assert_eq!(MAX_TAG_LOOKAHEAD, 2048);
+
+    let roleplay_text = "*(Vira hơi lùi lại một chút, vẻ mặt lộ rõ sự ngạc nhiên vì cậu đang \"tấn công\" dồn dập bằng những cái tên chuyên sâu...)* Cậu học ở đâu thế?";
+    assert!(
+        roleplay_text.len() > 120,
+        "Test text must exceed old 120-byte limit (actual len: {})",
+        roleplay_text.len()
+    );
+
+    let mut parser = StreamParser::new();
+    let mut all_events = Vec::new();
+
+    // Stream in small 7-byte chunks to strictly verify lookahead does not abort at 120 bytes
+    let chars: Vec<char> = roleplay_text.chars().collect();
+    let mut pos = 0;
+    while pos < chars.len() {
+        let end = (pos + 7).min(chars.len());
+        let chunk: String = chars[pos..end].iter().collect();
+        all_events.extend(parser.feed(&chunk));
+        pos = end;
+    }
+    all_events.extend(parser.finish());
+
+    let gestures: Vec<_> = all_events.iter().filter_map(|e| e.as_gesture()).collect();
+    let emotions: Vec<_> = all_events.iter().filter_map(|e| e.as_emotion()).collect();
+    let speakable: Vec<_> = all_events.iter().filter_map(|e| e.as_speakable()).collect();
+
+    assert!(gestures.contains(&"lean_back"), "Should trigger lean_back gesture from 'hơi lùi lại'");
+    assert!(emotions.contains(&"surprised"), "Should trigger surprised emotion from 'ngạc nhiên'");
+
+    // Speakable text must contain ONLY the spoken dialogue
+    assert_eq!(speakable, vec!["Cậu học ở đâu thế?"]);
+
+    for text in &speakable {
+        assert!(!text.contains('*'), "Speakable text must not contain asterisks: {text}");
+        assert!(!text.contains("Vira"), "Speakable text must not leak roleplay text: {text}");
+        assert!(!text.contains("lùi lại"), "Speakable text must not leak action: {text}");
+        assert!(!text.contains("ngạc nhiên"), "Speakable text must not leak action: {text}");
+        assert!(!text.contains("tấn công"), "Speakable text must not leak action: {text}");
+    }
+}
+
+#[test]
+fn test_stream_parser_multiline_stage_directions_no_abort_on_newlines() {
+    let text = "*(Vira hơi lùi lại một chút,\nvẻ mặt lộ rõ sự ngạc nhiên vì cậu đang \"tấn công\" dồn dập...)* Cậu biết nhiều thật đấy!\n*(mỉm cười nhẹ nhàng)* Cảm ơn cậu nhé.";
+
+    let mut parser = StreamParser::new();
+    let mut all_events = Vec::new();
+
+    // Stream across newlines in small chunks (4 chars)
+    let chars: Vec<char> = text.chars().collect();
+    let mut pos = 0;
+    while pos < chars.len() {
+        let end = (pos + 4).min(chars.len());
+        let chunk: String = chars[pos..end].iter().collect();
+        all_events.extend(parser.feed(&chunk));
+        pos = end;
+    }
+    all_events.extend(parser.finish());
+
+    let gestures: Vec<_> = all_events.iter().filter_map(|e| e.as_gesture()).collect();
+    let emotions: Vec<_> = all_events.iter().filter_map(|e| e.as_emotion()).collect();
+    let speakable: Vec<_> = all_events.iter().filter_map(|e| e.as_speakable()).collect();
+
+    assert!(gestures.contains(&"lean_back"));
+    assert!(emotions.contains(&"surprised"));
+    assert!(emotions.contains(&"happy"));
+
+    for s in &speakable {
+        assert!(!s.contains('*'), "Speakable text must not contain asterisks: {s}");
+        assert!(!s.contains("lùi lại"), "No action leakage in TTS: {s}");
+        assert!(!s.contains("mỉm cười"), "No action leakage in TTS: {s}");
+    }
+    assert!(speakable.iter().any(|s| s.contains("Cậu biết nhiều thật đấy!")));
+    assert!(speakable.iter().any(|s| s.contains("Cảm ơn cậu nhé.")));
+}
+
+#[test]
+fn test_stream_parser_composite_patterns_seamless() {
+    let mut parser = StreamParser::new();
+
+    // 1. *(...)*
+    let e1 = parser.feed("*(cười tươi, vẫy tay chào)* Xin chào bạn!");
+    assert!(e1.contains(&ParsedStreamEvent::Emotion("happy".to_string())));
+    assert!(e1.contains(&ParsedStreamEvent::Gesture("wave".to_string())));
+    assert!(e1.contains(&ParsedStreamEvent::SpeakableText("Xin chào bạn!".to_string())));
+
+    // 2. (...)*
+    let e2 = parser.feed("(nghiêng đầu)* Bạn có khỏe không?");
+    assert!(e2.contains(&ParsedStreamEvent::Gesture("tilt".to_string())));
+    assert!(e2.contains(&ParsedStreamEvent::SpeakableText("Bạn có khỏe không?".to_string())));
+
+    // 3. *[...]*
+    let e3 = parser.feed("*[gật đầu, cười nhẹ]* Tôi rất khỏe.");
+    assert!(e3.contains(&ParsedStreamEvent::Gesture("nod".to_string())));
+    assert!(e3.contains(&ParsedStreamEvent::Emotion("happy".to_string())));
+    assert!(e3.contains(&ParsedStreamEvent::SpeakableText("Tôi rất khỏe.".to_string())));
+
+    // 4. *[wave]* shortened gesture tag in asterisks
+    let e4 = parser.feed("*[wave]* Chúc một ngày tốt lành.");
+    assert!(e4.contains(&ParsedStreamEvent::Gesture("wave".to_string())));
+    assert!(e4.contains(&ParsedStreamEvent::SpeakableText("Chúc một ngày tốt lành.".to_string())));
+
+    // 5. *[emotion:happy]* shortened emotion tag in asterisks
+    let e5 = parser.feed("*[emotion:happy]* Thật tuyệt vời!");
+    assert!(e5.contains(&ParsedStreamEvent::Emotion("happy".to_string())));
+    assert!(e5.contains(&ParsedStreamEvent::SpeakableText("Thật tuyệt vời!".to_string())));
+
+    // 6. *(gesture:nod)* gesture tag in asterisk-parentheses
+    let e6 = parser.feed("*(gesture:nod)* Tôi hiểu rồi.");
+    assert!(e6.contains(&ParsedStreamEvent::Gesture("nod".to_string())));
+    assert!(e6.contains(&ParsedStreamEvent::SpeakableText("Tôi hiểu rồi.".to_string())));
+
+    // 7. Spaced composite patterns * ( ... ) * and * [ ... ] *
+    let e7 = parser.feed("* (vẫy tay) * Chào bạn nhé. * [gật đầu] * Đúng vậy.");
+    assert!(e7.contains(&ParsedStreamEvent::Gesture("wave".to_string())));
+    assert!(e7.contains(&ParsedStreamEvent::Gesture("nod".to_string())));
+    assert!(e7.contains(&ParsedStreamEvent::SpeakableText("Chào bạn nhé.".to_string())));
+    assert!(e7.contains(&ParsedStreamEvent::SpeakableText("Đúng vậy.".to_string())));
+
+    // Strict zero-asterisk verification across all emitted speakable texts
+    for ev in e1.iter().chain(e2.iter()).chain(e3.iter()).chain(e4.iter()).chain(e5.iter()).chain(e6.iter()).chain(e7.iter()) {
+        if let ParsedStreamEvent::SpeakableText(ref text) = ev {
+            assert!(!text.contains('*'), "No asterisks allowed in speakable text: {text}");
+            assert!(!text.contains('['), "No opening bracket allowed: {text}");
+            assert!(!text.contains(']'), "No closing bracket allowed: {text}");
+        }
+    }
+}
+
+#[test]
+fn test_stream_parser_split_composite_pattern_chunk_fragmentation() {
+    let mut parser = StreamParser::new();
+
+    // Stream "*(Vira hơi lùi lại)* Xin chào!" split character by character
+    let stream = "*(Vira hơi lùi lại một chút)* Xin chào!";
+    let mut events = Vec::new();
+    for c in stream.chars() {
+        let chunk = c.to_string();
+        events.extend(parser.feed(&chunk));
+    }
+    events.extend(parser.finish());
+
+    let gestures: Vec<_> = events.iter().filter_map(|e| e.as_gesture()).collect();
+    let speakable: Vec<_> = events.iter().filter_map(|e| e.as_speakable()).collect();
+
+    assert!(gestures.contains(&"lean_back"));
+    assert_eq!(speakable, vec!["Xin chào!"]);
+
+    // Stream "(nghiêng đầu)* Chào bạn." split right at the ')*' boundary
+    let mut parser2 = StreamParser::new();
+    let c1 = parser2.feed("(nghiêng đầu)");
+    assert_eq!(c1, vec![ParsedStreamEvent::Gesture("tilt".to_string())]);
+
+    let c2 = parser2.feed("* Chào bạn.");
+    let c3 = parser2.finish();
+    let all = [c2, c3].concat();
+    assert_eq!(all, vec![ParsedStreamEvent::SpeakableText("Chào bạn.".to_string())]);
+}
+
+#[test]
+fn test_stream_parser_secondary_safety_filter_direct() {
+    let gestures = HashSet::new();
+    let mut events = Vec::new();
+
+    // 1. Residual *(...)* with surrounding text
+    let s1 = sanitize_speakable_text(
+        "Xin chào bạn! *(Vira hơi lùi lại một chút, vẻ mặt ngạc nhiên)* Rất vui được gặp bạn.",
+        &gestures,
+        &mut events,
+    );
+    assert_eq!(s1, "Xin chào bạn! Rất vui được gặp bạn.");
+    assert!(events.contains(&ParsedStreamEvent::Gesture("lean_back".to_string())));
+    assert!(events.contains(&ParsedStreamEvent::Emotion("surprised".to_string())));
+
+    // 2. Residual *...*
+    events.clear();
+    let s2 = sanitize_speakable_text("Chào bạn! *cười tươi* Chúc một ngày tốt lành.", &gestures, &mut events);
+    assert_eq!(s2, "Chào bạn! Chúc một ngày tốt lành.");
+    assert!(events.contains(&ParsedStreamEvent::Emotion("happy".to_string())));
+
+    // 3. Stray lone asterisks stripped
+    events.clear();
+    let s3 = sanitize_speakable_text("* Câu này có dấu sao lạc ở đầu.", &gestures, &mut events);
+    assert_eq!(s3.trim(), "Câu này có dấu sao lạc ở đầu.");
+
+    let s3_end = sanitize_speakable_text("Câu này có dấu sao lạc ở cuối. *", &gestures, &mut events);
+    assert_eq!(s3_end.trim(), "Câu này có dấu sao lạc ở cuối.");
+
+    // 4. Legitimate markdown links and brackets preserved
+    events.clear();
+    let s4 = sanitize_speakable_text(
+        "Xem tại [Rust Lang](https://www.rust-lang.org) và tài liệu [1].",
+        &gestures,
+        &mut events,
+    );
+    assert_eq!(s4, "Xem tại [Rust Lang](https://www.rust-lang.org) và tài liệu [1].");
+
+    // 5. Parenthesized normal numbers / non-actions preserved
+    events.clear();
+    let s5 = sanitize_speakable_text("Giá trị (khoảng 3.14%) rất tốt.", &gestures, &mut events);
+    assert_eq!(s5, "Giá trị (khoảng 3.14%) rất tốt.");
+
+    // 6. Unclosed stage direction at EOF cleanly stripped
+    events.clear();
+    let s6 = sanitize_speakable_text("Đoạn trước. *(Vira hơi lùi lại một chút vì", &gestures, &mut events);
+    assert_eq!(s6.trim(), "Đoạn trước.");
+    assert!(events.contains(&ParsedStreamEvent::Gesture("lean_back".to_string())));
 }
 

@@ -1021,24 +1021,75 @@ pub async fn handle_save_settings(
         }
     }
 
-    // Dynamic reconfiguration of active LLM endpoint
+    // Merge provided settings with existing state settings
+    {
+        let mut cur = state.settings.write().unwrap();
+        if settings.llm_endpoint.is_some() {
+            cur.llm_endpoint = settings.llm_endpoint.clone();
+        }
+        if settings.llm_model.is_some() {
+            cur.llm_model = settings.llm_model.clone();
+        }
+        if settings.llm_api_key.is_some() {
+            cur.llm_api_key = settings.llm_api_key.clone();
+        }
+        if settings.tts_voice.is_some() {
+            cur.tts_voice = settings.tts_voice.clone();
+        }
+        if settings.tts_speed.is_some() {
+            cur.tts_speed = settings.tts_speed;
+        }
+        if settings.stt_model.is_some() {
+            cur.stt_model = settings.stt_model.clone();
+        }
+        if settings.tutor_mode.is_some() {
+            cur.tutor_mode = settings.tutor_mode.clone();
+        }
+        if settings.rag_enabled.is_some() {
+            cur.rag_enabled = settings.rag_enabled;
+        }
+        if settings.system_prompt.is_some() {
+            cur.system_prompt = settings.system_prompt.clone();
+        }
+        if settings.temperature.is_some() {
+            cur.temperature = settings.temperature;
+        }
+        if settings.tts_endpoint.is_some() {
+            cur.tts_endpoint = settings.tts_endpoint.clone();
+        }
+        if settings.stt_endpoint.is_some() {
+            cur.stt_endpoint = settings.stt_endpoint.clone();
+        }
+    }
+
+    let active_settings = state.settings.read().unwrap().clone();
+
+    // Dynamic reconfiguration of active LLM endpoint & sampling parameters
     if settings.llm_endpoint.is_some()
         || settings.llm_model.is_some()
         || settings.llm_api_key.is_some()
+        || settings.temperature.is_some()
+        || settings.system_prompt.is_some()
     {
-        let endpoint = settings
+        let endpoint = active_settings
             .llm_endpoint
             .clone()
             .unwrap_or_else(|| "http://127.0.0.1:8080/v1".to_string());
-        let model = settings
+        let model = active_settings
             .llm_model
             .clone()
             .unwrap_or_else(|| "default".to_string());
-        let api_key = settings.llm_api_key.clone();
-        let new_llm = std::sync::Arc::new(vira_infer::openai_compat::OpenAiCompatLlmAdapter::new(
+        let api_key = active_settings.llm_api_key.clone();
+        let mut new_llm = vira_infer::openai_compat::OpenAiCompatLlmAdapter::new(
             endpoint, model, api_key,
-        ));
-        state.set_dynamic_llm(new_llm);
+        );
+        if let Some(temp) = active_settings.temperature {
+            new_llm = new_llm.with_temperature(temp);
+        }
+        if let Some(ref sp) = active_settings.system_prompt {
+            new_llm = new_llm.with_system_prompt(sp.clone());
+        }
+        state.set_dynamic_llm(std::sync::Arc::new(new_llm));
     }
 
     // Dynamic reconfiguration of active TTS endpoint & voice
@@ -1089,11 +1140,10 @@ pub async fn handle_save_settings(
     }
 
     // Persist to local SQLite store
-    if let Ok(json_str) = serde_json::to_string(&settings) {
+    if let Ok(json_str) = serde_json::to_string(&active_settings) {
         let _ = state.store.set_setting("app_settings", &json_str).await;
     }
 
-    *state.settings.write().unwrap() = settings;
     Ok(())
 }
 

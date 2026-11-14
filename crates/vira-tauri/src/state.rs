@@ -53,16 +53,16 @@ impl TutorMode {
     pub fn system_prompt(&self) -> &'static str {
         match self {
             TutorMode::English => {
-                "You are an encouraging and fluent English language tutor. Engage in friendly conversation, provide corrections when appropriate, and explain grammar or vocabulary clearly."
+                "You are an encouraging and fluent English language tutor. Answer directly and concisely without filler conversational fluff or rambling before the main topic. Provide clear explanations and corrections when appropriate, addressing the user's questions immediately."
             }
             TutorMode::Japanese => {
-                "あなたは親切で自然な日本語のチューターです。ユーザーの日本語学習をサポートし、丁寧で親しみやすい会話を行ってください。"
+                "あなたは親切で的確な日本語チューターです。前置きや不要な前振りを省き、本題や質問に直接かつ簡潔に答えてください。学習者の疑問に即座に応じ、必要に応じて文法や語彙を明確に説明してください。"
             }
             TutorMode::Vietnamese => {
-                "Bạn là trợ lý và gia sư tiếng Việt thân thiện, thông minh. Hãy đồng hành cùng người dùng bằng giọng văn tự nhiên, ấm áp."
+                "Bạn là trợ lý và gia sư tiếng Việt thông minh, chuẩn xác. Hãy trả lời trực tiếp và ngắn gọn, đi thẳng vào trọng tâm mà không nói lan man hay dùng câu mở đầu sáo rỗng. Giải thích rõ ràng, súc tích và giải quyết câu hỏi của người dùng ngay lập tức."
             }
             TutorMode::GeneralAssistant => {
-                "You are Vira, an ultra-low-latency 3D desktop AI companion with full voice, lip-sync, and emotional awareness."
+                "You are Vira, an ultra-low-latency 3D desktop AI companion with full voice, lip-sync, and emotional awareness. Answer directly and concisely without filler conversational fluff or rambling before the main topic. Address user questions immediately with precise, engaging, and to-the-point answers."
             }
         }
     }
@@ -90,15 +90,73 @@ impl FromStr for TutorMode {
     }
 }
 
+#[derive(Deserialize, Default)]
+struct AppSettingsPayloadRaw {
+    #[serde(default)]
+    llm_endpoint: Option<String>,
+    #[serde(default)]
+    llm_base_url: Option<String>,
+    #[serde(default)]
+    llm_model: Option<String>,
+    #[serde(default)]
+    llm_api_key: Option<String>,
+    #[serde(default)]
+    tts_voice: Option<String>,
+    #[serde(default)]
+    tts_speed: Option<f32>,
+    #[serde(default)]
+    speech_rate: Option<f32>,
+    #[serde(default)]
+    stt_model: Option<String>,
+    #[serde(default)]
+    tutor_mode: Option<String>,
+    #[serde(default)]
+    rag_enabled: Option<bool>,
+    #[serde(default)]
+    system_prompt: Option<String>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    tts_endpoint: Option<String>,
+    #[serde(default)]
+    stt_endpoint: Option<String>,
+}
+
+impl From<AppSettingsPayloadRaw> for AppSettingsPayload {
+    fn from(raw: AppSettingsPayloadRaw) -> Self {
+        let llm_endpoint = match (raw.llm_endpoint, raw.llm_base_url) {
+            (Some(ep), _) if !ep.trim().is_empty() => Some(ep),
+            (_, Some(url)) if !url.trim().is_empty() => Some(url),
+            (Some(ep), _) => Some(ep),
+            (None, other) => other,
+        };
+        let tts_speed = raw.tts_speed.or(raw.speech_rate);
+
+        Self {
+            llm_endpoint,
+            llm_model: raw.llm_model,
+            llm_api_key: raw.llm_api_key,
+            tts_voice: raw.tts_voice,
+            tts_speed,
+            stt_model: raw.stt_model,
+            tutor_mode: raw.tutor_mode,
+            rag_enabled: raw.rag_enabled,
+            system_prompt: raw.system_prompt,
+            temperature: raw.temperature,
+            tts_endpoint: raw.tts_endpoint,
+            stt_endpoint: raw.stt_endpoint,
+        }
+    }
+}
+
 /// User application settings payload for persistent configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(from = "AppSettingsPayloadRaw")]
 pub struct AppSettingsPayload {
-    #[serde(alias = "llm_base_url")]
     pub llm_endpoint: Option<String>,
     pub llm_model: Option<String>,
     pub llm_api_key: Option<String>,
     pub tts_voice: Option<String>,
-    #[serde(alias = "speech_rate")]
     pub tts_speed: Option<f32>,
     pub stt_model: Option<String>,
     pub tutor_mode: Option<String>,
@@ -627,6 +685,21 @@ mod tests {
     }
 
     #[test]
+    fn test_app_settings_deserialization_duplicate_aliases_tolerated() {
+        let json = r#"{
+            "llm_endpoint": "http://127.0.0.1:11434/v1",
+            "llm_base_url": "http://127.0.0.1:11434/v1",
+            "llm_model": "llama3.2",
+            "tts_speed": 1.15,
+            "speech_rate": 1.15,
+            "tutor_mode": "vietnamese"
+        }"#;
+        let payload: AppSettingsPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.llm_endpoint.as_deref(), Some("http://127.0.0.1:11434/v1"));
+        assert_eq!(payload.tts_speed, Some(1.15));
+    }
+
+    #[test]
     fn test_app_state_initialization_and_snapshot() {
         let state = AppState::new_headless();
         let snapshot = state.get_snapshot();
@@ -700,5 +773,30 @@ mod tests {
         let epoch2 = state.current_turn_epoch();
         assert!(epoch2 > epoch1);
         assert!(!state.is_current_turn(epoch1));
+    }
+
+    #[test]
+    fn test_tutor_mode_system_prompt_direct_and_concise() {
+        for mode in [
+            TutorMode::English,
+            TutorMode::Japanese,
+            TutorMode::Vietnamese,
+            TutorMode::GeneralAssistant,
+        ] {
+            let prompt = mode.system_prompt();
+            assert!(!prompt.is_empty());
+            match mode {
+                TutorMode::English | TutorMode::GeneralAssistant => {
+                    assert!(prompt.contains("directly and concisely"));
+                    assert!(prompt.contains("rambling"));
+                }
+                TutorMode::Japanese => {
+                    assert!(prompt.contains("直接かつ簡潔に"));
+                }
+                TutorMode::Vietnamese => {
+                    assert!(prompt.contains("trực tiếp và ngắn gọn"));
+                }
+            }
+        }
     }
 }

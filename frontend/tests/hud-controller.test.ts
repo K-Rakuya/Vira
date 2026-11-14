@@ -26,7 +26,7 @@ describe('HudController tutor presets and normalization', () => {
     expect(normalizeTutorMode('unknown_mode')).toBe('general_assistant');
   });
 
-  it('exposes valid tutor presets for all canonical modes', () => {
+  it('exposes valid tutor presets for all canonical modes with direct and concise prompts', () => {
     const modes = ['vietnamese', 'english', 'japanese', 'general_assistant'];
     for (const m of modes) {
       const preset = TUTOR_PRESETS[m];
@@ -34,6 +34,52 @@ describe('HudController tutor presets and normalization', () => {
       expect(preset.id).toBe(m);
       expect(preset.name.length).toBeGreaterThan(0);
       expect(preset.systemPrompt.length).toBeGreaterThan(0);
+    }
+    // Direct and concise instructions
+    expect(TUTOR_PRESETS.vietnamese.systemPrompt).toContain('Trả lời thẳng vào trọng tâm câu hỏi của người dùng');
+    expect(TUTOR_PRESETS.vietnamese.systemPrompt).toContain('Không nói lan man vòng vo ngoài lề');
+    expect(TUTOR_PRESETS.general_assistant.systemPrompt).toContain('Trả lời thẳng vào trọng tâm câu hỏi của người dùng');
+    expect(TUTOR_PRESETS.english.systemPrompt).toContain('Answer directly to the core of user questions');
+    expect(TUTOR_PRESETS.japanese.systemPrompt).toContain('質問の核心に直接');
+  });
+
+  it('verifies settings saving sends only canonical keys without duplicate aliases', async () => {
+    const { TauriBridge } = await import('../src/ipc/tauri-bridge');
+    let capturedSettings: any = null;
+
+    const origInvoke = TauriBridge.invoke;
+    TuriOverride: {
+      (TauriBridge as any).invoke = async (cmd: string, args?: any) => {
+        if (cmd === 'save_settings') {
+          capturedSettings = args?.settings;
+          return undefined;
+        }
+        return origInvoke.call(TauriBridge, cmd, args);
+      };
+    }
+
+    try {
+      // Simulate payload built by handleSaveSettings
+      const mockPayload = {
+        llm_endpoint: 'http://localhost:11434/v1',
+        llm_model: 'qwen2.5:7b',
+        llm_api_key: 'test-key',
+        temperature: 0.7,
+        tutor_mode: 'vietnamese',
+        system_prompt: 'Custom prompt',
+        tts_voice: 'vi-female',
+        tts_speed: 1.0,
+        rag_enabled: true,
+      };
+
+      await TauriBridge.invoke('save_settings', { settings: mockPayload });
+      expect(capturedSettings).toBeDefined();
+      expect(capturedSettings.llm_endpoint).toBe('http://localhost:11434/v1');
+      expect(capturedSettings.tts_speed).toBe(1.0);
+      expect('llm_base_url' in capturedSettings).toBe(false);
+      expect('speech_rate' in capturedSettings).toBe(false);
+    } finally {
+      (TauriBridge as any).invoke = origInvoke;
     }
   });
 

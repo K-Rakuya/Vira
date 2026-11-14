@@ -4,6 +4,9 @@ use vira_domain::CharacterEmotion;
 
 use crate::chunker::{ChunkerConfig, SentenceChunker};
 
+/// Maximum lookahead buffer capacity for tag and stage direction parsing (2048 bytes).
+pub const MAX_TAG_LOOKAHEAD: usize = 2048;
+
 /// Default LangIns avatar gesture identifiers recognized in shortened tag form (e.g. `[wave]`).
 pub const DEFAULT_GESTURES: &[&str] = &[
     "wave", "nod", "think", "idea", "praise", "bow", "clap", "shake", "shrug", "point",
@@ -163,7 +166,10 @@ static GESTURE_PATTERNS: &[GesturePattern] = &[
             "ngả người về phía trước", "nga nguoi ve phia truoc",
             "nghiêng người tới", "nghieng nguoi toi",
             "tiến lại gần", "tien lai gan",
+            "tiến tới", "tien toi",
+            "bước tới", "buoc toi",
             "lean forward", "leaning forward", "leans forward", "lean in",
+            "step forward", "stepping forward",
         ],
     },
     GesturePattern {
@@ -173,7 +179,13 @@ static GESTURE_PATTERNS: &[GesturePattern] = &[
             "tựa lưng ra sau", "tua lung ra sau",
             "dựa lưng", "dua lung",
             "ngả lưng", "nga lung",
+            "lùi lại một chút", "lui lai mot chut",
+            "hơi lùi lại", "hoi lui lai",
+            "lùi lại", "lui lai",
+            "lùi ra sau", "lui ra sau",
+            "lùi bước", "lui buoc",
             "lean back", "leaning back", "leans back",
+            "step back", "stepping back", "steps back",
         ],
     },
     GesturePattern {
@@ -408,6 +420,17 @@ fn extract_semantic_triggers_internal(
     let inner_clean = raw_lower
         .trim_matches(|c: char| c == '*' || c == '(' || c == ')' || c == '[' || c == ']')
         .trim();
+
+    if let Some((kind, val)) = inner_clean.split_once(':') {
+        let kind = kind.trim();
+        let val = val.trim();
+        if kind == "emotion" && !val.is_empty() {
+            return vec![ParsedStreamEvent::Emotion(val.to_string())];
+        } else if kind == "gesture" && !val.is_empty() {
+            return vec![ParsedStreamEvent::Gesture(val.to_string())];
+        }
+    }
+
     if DEFAULT_GESTURES.contains(&inner_clean) || custom.is_some_and(|c| c.contains(inner_clean)) {
         return vec![ParsedStreamEvent::Gesture(inner_clean.to_string())];
     }
@@ -487,7 +510,24 @@ fn extract_semantic_triggers_internal(
     result
 }
 
-fn is_parenthesized_stage_direction(
+pub const ACTION_KEYWORDS: &[&str] = &[
+    "cuoi", "nhin", "noi", "tho", "im lang", "buoc", "ngap ngung",
+    "hit", "ngam", "chay", "dung", "ngoi", "nam", "quay", "nhay",
+    "lui", "tien", "dua", "dat", "cam", "lay", "mo", "dong", "gat", "lac",
+    "xoa", "day", "che", "chong", "om", "khoanh", "cui", "ngua", "nghieng", "nhun",
+    "mim", "suy nghi", "suy ngam", "tram ngam", "ngac nhien", "bat ngo", "giat minh",
+    "hoang hot", "boi roi", "lung tung", "ngai ngung", "nguong", "do mat", "gai dau",
+    "cau may", "nhiu may", "chop mat", "nham mat", "tho dai", "tho phao",
+    "tan cong", "tien den", "lui ve", "nhin quanh", "nhin sang", "dao mat",
+    "whisper", "sigh", "pause", "gasp", "look", "turn", "step", "walk",
+    "stand", "sit", "lie", "blink", "murmur", "mutter",
+    "smile", "laugh", "chuckle", "giggle", "frown", "nod", "shake", "wave", "point",
+    "shrug", "tilt", "blush", "lean", "reach", "cross", "scratch", "rub",
+    "flinch", "yawn", "stretch",
+    "vira",
+];
+
+pub fn is_parenthesized_stage_direction(
     inner: &str,
     last_char: Option<char>,
     custom_gestures: &HashSet<String>,
@@ -530,12 +570,6 @@ fn is_parenthesized_stage_direction(
 
     let lower = trimmed.to_ascii_lowercase();
     let norm = strip_vietnamese_diacritics(&lower);
-    const ACTION_KEYWORDS: &[&str] = &[
-        "cuoi", "nhin", "noi", "tho", "im lang", "buoc", "ngap ngung",
-        "hit", "ngam", "chay", "dung", "ngoi", "nam", "quay", "nhay",
-        "whisper", "sigh", "pause", "gasp", "look", "turn", "step", "walk",
-        "stand", "sit", "lie", "blink", "murmur", "mutter",
-    ];
     for kw in ACTION_KEYWORDS {
         if let Some(pos) = norm.find(kw) {
             if is_word_boundary(&norm, pos, kw.len()) {
@@ -545,6 +579,229 @@ fn is_parenthesized_stage_direction(
     }
 
     false
+}
+
+/// Checks if a prefix or fragment in lookahead buffer is an active stage direction candidate.
+pub fn is_stage_direction_candidate(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with("*(") || trimmed.starts_with("* (") || trimmed.starts_with("*[") || trimmed.starts_with("* [") {
+        return true;
+    }
+    if let Some(stripped) = trimmed.strip_prefix('(') {
+        let inside = stripped.trim();
+        if inside.starts_with("http://") || inside.starts_with("https://") || inside.starts_with('/') || inside.starts_with('#') {
+            return false;
+        }
+        return true;
+    }
+    if trimmed.starts_with('*') {
+        if trimmed.starts_with("* ") && (trimmed.contains("\n* ") || trimmed.contains("\r\n* ")) {
+            return false;
+        }
+        return true;
+    }
+    false
+}
+
+/// Checks whether inner content qualifies as an action or stage direction.
+pub fn is_stage_direction_content(inner: &str, custom_gestures: &HashSet<String>) -> bool {
+    let trimmed = inner.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if (trimmed.starts_with('(') && trimmed.ends_with(')'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    {
+        return true;
+    }
+    if is_parenthesized_stage_direction(trimmed, None, custom_gestures) {
+        return true;
+    }
+    let triggers = extract_semantic_triggers_internal(trimmed, Some(custom_gestures));
+    if !triggers.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let norm = strip_vietnamese_diacritics(&lower);
+    for kw in ACTION_KEYWORDS {
+        if let Some(pos) = norm.find(kw) {
+            if is_word_boundary(&norm, pos, kw.len()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Secondary safety filter: cleanly removes residual `*(...)*`, `*...*`, `(...)*`, `*[...]*`,
+/// or parenthesized action descriptions from speakable text before TTS audio generation.
+/// Also extracts any gestures/emotions from the stripped action descriptions into `events`.
+pub fn sanitize_speakable_text(
+    text: &str,
+    custom_gestures: &HashSet<String>,
+    events: &mut Vec<ParsedStreamEvent>,
+) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        // 1. Check for '*' opening: *(...)*, *[...]*, *...*, or stray '*'
+        if c == '*' {
+            let rest: String = chars[i..].iter().collect();
+            let stars_open = rest.chars().take_while(|&ch| ch == '*').count();
+            let after_open: String = chars[i + stars_open..].iter().collect();
+            let open_trimmed_len = after_open.trim_start().len();
+            let open_trimmed_offset = after_open.len() - open_trimmed_len;
+            let trimmed_open = &after_open[open_trimmed_offset..];
+
+            // Case A: *(...)* or * (...) *
+            if let Some(stripped) = trimmed_open.strip_prefix('(') {
+                if let Some(p_close) = stripped.find(')') {
+                    let close_paren_idx = 1 + p_close;
+                    let inner = &stripped[..p_close];
+                    let after_p = &stripped[p_close + 1..];
+                    let stars_offset = after_p.len() - after_p.trim_start().len();
+                    let trimmed_after_p = &after_p[stars_offset..];
+                    let close_stars = trimmed_after_p.chars().take_while(|&ch| ch == '*').count();
+
+                    let matched_bytes = stars_open + open_trimmed_offset + close_paren_idx + 1 + stars_offset + close_stars;
+                    let matched_chars = rest[..matched_bytes.min(rest.len())].chars().count();
+
+                    let triggers = extract_semantic_triggers_internal(inner, Some(custom_gestures));
+                    events.extend(triggers);
+
+                    if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
+                        out.push(' ');
+                    }
+                    i += matched_chars;
+                    continue;
+                } else {
+                    // Unclosed *(... at end of text: strip and extract triggers
+                    let triggers = extract_semantic_triggers_internal(stripped, Some(custom_gestures));
+                    events.extend(triggers);
+                    break;
+                }
+            }
+
+            // Case B: *[...]* or * [...] *
+            if let Some(stripped) = trimmed_open.strip_prefix('[') {
+                if let Some(b_close) = stripped.find(']') {
+                    let close_bracket_idx = 1 + b_close;
+                    let inner = &stripped[..b_close];
+                    let after_b = &stripped[b_close + 1..];
+                    let stars_offset = after_b.len() - after_b.trim_start().len();
+                    let trimmed_after_b = &after_b[stars_offset..];
+                    let close_stars = trimmed_after_b.chars().take_while(|&ch| ch == '*').count();
+
+                    let matched_bytes = stars_open + open_trimmed_offset + close_bracket_idx + 1 + stars_offset + close_stars;
+                    let matched_chars = rest[..matched_bytes.min(rest.len())].chars().count();
+
+                    let triggers = extract_semantic_triggers_internal(inner, Some(custom_gestures));
+                    events.extend(triggers);
+
+                    if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
+                        out.push(' ');
+                    }
+                    i += matched_chars;
+                    continue;
+                } else {
+                    // Unclosed *[... at end of text: strip and extract triggers
+                    let triggers = extract_semantic_triggers_internal(stripped, Some(custom_gestures));
+                    events.extend(triggers);
+                    break;
+                }
+            }
+
+            // Case C: *...* (residual asterisk action description)
+            if let Some(next_star) = after_open.find('*') {
+                let inner = &after_open[..next_star];
+                let rest_after_star = &after_open[next_star..];
+                let close_stars = rest_after_star.chars().take_while(|&ch| ch == '*').count();
+                let matched_bytes = stars_open + next_star + close_stars;
+                let matched_chars = rest[..matched_bytes.min(rest.len())].chars().count();
+
+                let triggers = extract_semantic_triggers_internal(inner, Some(custom_gestures));
+                events.extend(triggers);
+
+                if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
+                    out.push(' ');
+                }
+                i += matched_chars;
+                continue;
+            }
+
+            // Case D: Lone / stray '*'
+            i += 1;
+            continue;
+        }
+
+        // 2. Check for '(' opening: (...)* or parenthesized stage direction
+        if c == '(' {
+            let rest: String = chars[i..].iter().collect();
+            if let Some(p_close) = rest[1..].find(')') {
+                let close_paren_idx = 1 + p_close;
+                let inner = &rest[1..close_paren_idx];
+                let after_p = &rest[close_paren_idx + 1..];
+                let stars_offset = after_p.len() - after_p.trim_start().len();
+                let trimmed_after_p = &after_p[stars_offset..];
+                let close_stars = trimmed_after_p.chars().take_while(|&ch| ch == '*').count();
+
+                let is_composite = close_stars > 0;
+                let is_stage_dir = is_composite
+                    || is_parenthesized_stage_direction(inner, None, custom_gestures);
+
+                if is_stage_dir {
+                    let matched_bytes = close_paren_idx + 1 + stars_offset + close_stars;
+                    let matched_chars = rest[..matched_bytes.min(rest.len())].chars().count();
+
+                    let triggers = extract_semantic_triggers_internal(inner, Some(custom_gestures));
+                    events.extend(triggers);
+
+                    if !out.is_empty() && !out.ends_with(' ') && !out.ends_with('\n') {
+                        out.push(' ');
+                    }
+                    i += matched_chars;
+                    continue;
+                }
+            } else if is_stage_direction_candidate(&rest) {
+                // Unclosed parenthesized stage direction at end of text
+                let inner = &rest[1..];
+                let triggers = extract_semantic_triggers_internal(inner, Some(custom_gestures));
+                events.extend(triggers);
+                break;
+            }
+        }
+
+        out.push(c);
+        i += 1;
+    }
+
+    // Cleanup: collapse consecutive spaces on the same line (preserve newlines)
+    let mut cleaned = String::with_capacity(out.len());
+    let mut in_spaces = false;
+    for ch in out.chars() {
+        if ch == ' ' || ch == '\t' {
+            if !in_spaces {
+                cleaned.push(' ');
+                in_spaces = true;
+            }
+        } else {
+            in_spaces = false;
+            cleaned.push(ch);
+        }
+    }
+
+    cleaned
 }
 
 /// Events produced during streaming LLM parsing for avatar animation and voice synthesis.
@@ -726,12 +983,20 @@ impl StreamParser {
     }
 
     fn push_text_to_chunker(&mut self, text: &str, events: &mut Vec<ParsedStreamEvent>) {
-        if let Some(last) = text.chars().last() {
+        let cleaned = sanitize_speakable_text(text, &self.custom_gestures, events);
+        if cleaned.is_empty() {
+            return;
+        }
+        if let Some(last) = cleaned.chars().last() {
             self.last_char = Some(last);
         }
-        let chunks = self.chunker.feed(text);
+        let chunks = self.chunker.feed(&cleaned);
         for chunk in chunks {
-            events.push(ParsedStreamEvent::SpeakableText(chunk));
+            let chunk_cleaned = sanitize_speakable_text(&chunk, &self.custom_gestures, events);
+            let chunk_trimmed = chunk_cleaned.trim();
+            if !chunk_trimmed.is_empty() {
+                events.push(ParsedStreamEvent::SpeakableText(chunk_trimmed.to_string()));
+            }
         }
     }
 
@@ -851,10 +1116,10 @@ impl StreamParser {
             }
 
             let earliest = [
-                earliest_thought.map(|(i, t)| (i, t)),
-                bracket_open.map(|(i, t)| (i, t)),
-                asterisk_open.map(|(i, t)| (i, t)),
-                paren_open.map(|(i, t)| (i, t)),
+                earliest_thought,
+                bracket_open,
+                asterisk_open,
+                paren_open,
             ]
             .into_iter()
             .flatten()
@@ -943,20 +1208,79 @@ impl StreamParser {
                 }
                 TagCandidate::Asterisk => {
                     let asterisks_open_count = self.pending_raw.chars().take_while(|&c| c == '*').count();
-                    let close_offset = self.pending_raw[asterisks_open_count..].find('*');
-                    match close_offset {
-                        Some(c_off) => {
-                            let inner_slice = &self.pending_raw[asterisks_open_count..asterisks_open_count + c_off];
-                            if inner_slice.contains('\n') || inner_slice.contains('\r') {
+                    let after_open = &self.pending_raw[asterisks_open_count..];
+                    let open_trimmed_len = after_open.trim_start().len();
+                    let open_trimmed_offset = after_open.len() - open_trimmed_len;
+                    let trimmed_open = &after_open[open_trimmed_offset..];
+
+                    // Check composite patterns: *(...)*, *[...]*, or plain *...*
+                    let match_res = if let Some(stripped) = trimmed_open.strip_prefix('(') {
+                        // Pattern *(...)* or * (...) *
+                        if let Some(rel_close) = stripped.find(')') {
+                            let close_paren_idx = 1 + rel_close;
+                            let inner = &stripped[..rel_close];
+                            let after_paren = &stripped[rel_close + 1..];
+                            let close_stars_offset = after_paren.len() - after_paren.trim_start().len();
+                            let trimmed_after_paren = &after_paren[close_stars_offset..];
+                            let close_stars_count = trimmed_after_paren.chars().take_while(|&c| c == '*').count();
+                            if close_stars_count > 0 {
+                                let total_end = asterisks_open_count + open_trimmed_offset + close_paren_idx + 1 + close_stars_offset + close_stars_count - 1;
+                                Some((total_end, inner, true))
+                            } else if !trimmed_after_paren.is_empty() {
+                                let total_end = asterisks_open_count + open_trimmed_offset + close_paren_idx;
+                                Some((total_end, inner, true))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else if let Some(stripped) = trimmed_open.strip_prefix('[') {
+                        // Pattern *[...]* or * [...] *
+                        if let Some(rel_close) = stripped.find(']') {
+                            let close_bracket_idx = 1 + rel_close;
+                            let inner = &stripped[..rel_close];
+                            let after_bracket = &stripped[rel_close + 1..];
+                            let close_stars_offset = after_bracket.len() - after_bracket.trim_start().len();
+                            let trimmed_after_bracket = &after_bracket[close_stars_offset..];
+                            let close_stars_count = trimmed_after_bracket.chars().take_while(|&c| c == '*').count();
+                            if close_stars_count > 0 {
+                                let total_end = asterisks_open_count + open_trimmed_offset + close_bracket_idx + 1 + close_stars_offset + close_stars_count - 1;
+                                Some((total_end, inner, true))
+                            } else if !trimmed_after_bracket.is_empty() {
+                                let total_end = asterisks_open_count + open_trimmed_offset + close_bracket_idx;
+                                Some((total_end, inner, true))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        // Plain asterisk tag: *...*
+                        match after_open.find('*') {
+                            Some(c_off) => {
+                                let inner = &after_open[..c_off];
+                                let rest_slice = &after_open[c_off..];
+                                let asterisks_close_count = rest_slice.chars().take_while(|&c| c == '*').count();
+                                let total_end = asterisks_open_count + c_off + asterisks_close_count - 1;
+                                Some((total_end, inner, false))
+                            }
+                            None => None,
+                        }
+                    };
+
+                    match match_res {
+                        Some((total_end_idx, inner_slice, is_composite)) => {
+                            let is_multiline = inner_slice.contains('\n') || inner_slice.contains('\r');
+                            let is_stage_dir = is_composite || is_stage_direction_content(inner_slice, &self.custom_gestures);
+
+                            if is_multiline && !is_stage_dir {
                                 let non_tag = self.pending_raw[..asterisks_open_count].to_string();
                                 self.pending_raw.drain(..asterisks_open_count);
                                 self.push_text_to_chunker(&non_tag, &mut events);
                                 continue;
                             }
-
-                            let rest_slice = &self.pending_raw[asterisks_open_count + c_off..];
-                            let asterisks_close_count = rest_slice.chars().take_while(|&c| c == '*').count();
-                            let total_end_idx = asterisks_open_count + c_off + asterisks_close_count - 1;
 
                             let inner = inner_slice.trim();
                             if !inner.is_empty() {
@@ -968,7 +1292,16 @@ impl StreamParser {
                         }
                         None => {
                             let slice = &self.pending_raw[asterisks_open_count..];
-                            if slice.contains('\n') || slice.contains('\r') || slice.contains('<') || slice.contains('>') || slice.contains('{') || slice.contains('}') || self.pending_raw.len() > 120 {
+                            let is_stage_dir = is_stage_direction_candidate(&self.pending_raw);
+                            let has_thought_tag = slice.to_ascii_lowercase().contains("<thought>")
+                                || slice.to_ascii_lowercase().contains("<think>");
+                            let exceeds_max = self.pending_raw.len() > MAX_TAG_LOOKAHEAD;
+
+                            let should_abort = exceeds_max
+                                || has_thought_tag
+                                || (!is_stage_dir && (slice.contains('\n') || slice.contains('\r')));
+
+                            if should_abort {
                                 let non_tag = std::mem::take(&mut self.pending_raw);
                                 self.push_text_to_chunker(&non_tag, &mut events);
                             }
@@ -981,18 +1314,26 @@ impl StreamParser {
                     match close_idx {
                         Some(c_idx) => {
                             let inner_slice = &self.pending_raw[1..c_idx];
-                            if inner_slice.contains('\n') || inner_slice.contains('\r') {
-                                let non_tag = self.pending_raw[..1].to_string();
-                                self.pending_raw.drain(..1);
-                                self.push_text_to_chunker(&non_tag, &mut events);
-                                continue;
-                            }
-
                             let inner = inner_slice.trim();
-                            if is_parenthesized_stage_direction(inner, self.last_char, &self.custom_gestures) {
+
+                            let after_close = &self.pending_raw[c_idx + 1..];
+                            let close_stars_offset = after_close.len() - after_close.trim_start().len();
+                            let trimmed_after_close = &after_close[close_stars_offset..];
+                            let trailing_asterisks = trimmed_after_close.chars().take_while(|&c| c == '*').count();
+
+                            let is_composite = trailing_asterisks > 0;
+                            let is_stage_dir = is_composite
+                                || is_parenthesized_stage_direction(inner, self.last_char, &self.custom_gestures);
+
+                            if is_stage_dir {
+                                let total_end_idx = if trailing_asterisks > 0 {
+                                    c_idx + 1 + close_stars_offset + trailing_asterisks - 1
+                                } else {
+                                    c_idx
+                                };
                                 let triggers = extract_semantic_triggers_internal(inner, Some(&self.custom_gestures));
                                 events.extend(triggers);
-                                self.on_tag_removed(c_idx);
+                                self.on_tag_removed(total_end_idx);
                                 continue;
                             } else {
                                 let non_tag = self.pending_raw[..=c_idx].to_string();
@@ -1003,7 +1344,16 @@ impl StreamParser {
                         }
                         None => {
                             let slice = &self.pending_raw[1..];
-                            if slice.contains('\n') || slice.contains('\r') || self.pending_raw.len() > 120 {
+                            let is_stage_dir = is_stage_direction_candidate(&self.pending_raw);
+                            let has_thought_tag = slice.to_ascii_lowercase().contains("<thought>")
+                                || slice.to_ascii_lowercase().contains("<think>");
+                            let exceeds_max = self.pending_raw.len() > MAX_TAG_LOOKAHEAD;
+
+                            let should_abort = exceeds_max
+                                || has_thought_tag
+                                || (!is_stage_dir && (slice.contains('\n') || slice.contains('\r')));
+
+                            if should_abort {
                                 let non_tag = std::mem::take(&mut self.pending_raw);
                                 self.push_text_to_chunker(&non_tag, &mut events);
                             }
@@ -1029,29 +1379,27 @@ impl StreamParser {
             }
         } else if !self.pending_raw.is_empty() {
             let leftover = std::mem::take(&mut self.pending_raw);
-            if leftover.starts_with('*') && leftover.ends_with('*') && leftover.len() >= 2 {
-                let inner = leftover.trim_matches('*').trim();
-                if !inner.is_empty() {
-                    let triggers = extract_semantic_triggers_internal(inner, Some(&self.custom_gestures));
-                    events.extend(triggers);
-                }
-            } else if leftover.starts_with('(') && is_parenthesized_stage_direction(&leftover[1..], self.last_char, &self.custom_gestures) {
-                let inner = leftover.trim_matches(|c| c == '(' || c == ')').trim();
-                if !inner.is_empty() {
-                    let triggers = extract_semantic_triggers_internal(inner, Some(&self.custom_gestures));
-                    events.extend(triggers);
-                }
-            } else {
-                let chunks = self.chunker.feed(&leftover);
+            let cleaned = sanitize_speakable_text(&leftover, &self.custom_gestures, &mut events);
+            let trimmed = cleaned.trim();
+            if !trimmed.is_empty() {
+                let chunks = self.chunker.feed(trimmed);
                 for chunk in chunks {
-                    events.push(ParsedStreamEvent::SpeakableText(chunk));
+                    let chunk_cleaned = sanitize_speakable_text(&chunk, &self.custom_gestures, &mut events);
+                    let chunk_trimmed = chunk_cleaned.trim();
+                    if !chunk_trimmed.is_empty() {
+                        events.push(ParsedStreamEvent::SpeakableText(chunk_trimmed.to_string()));
+                    }
                 }
             }
         }
 
         let flushed = self.chunker.finish();
         for chunk in flushed {
-            events.push(ParsedStreamEvent::SpeakableText(chunk));
+            let chunk_cleaned = sanitize_speakable_text(&chunk, &self.custom_gestures, &mut events);
+            let chunk_trimmed = chunk_cleaned.trim();
+            if !chunk_trimmed.is_empty() {
+                events.push(ParsedStreamEvent::SpeakableText(chunk_trimmed.to_string()));
+            }
         }
 
         self.last_char = None;

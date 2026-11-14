@@ -362,6 +362,46 @@ async fn test_save_settings_and_get_app_state() {
 }
 
 #[tokio::test]
+async fn test_save_settings_temperature_and_dynamic_llm() {
+    let state = AppState::new_headless();
+
+    // 1. Initial settings with endpoint and model
+    let settings1 = AppSettingsPayload {
+        llm_endpoint: Some("http://127.0.0.1:11434".to_string()),
+        llm_model: Some("qwen2.5-coder".to_string()),
+        temperature: Some(0.7),
+        ..Default::default()
+    };
+    let res1 = handle_save_settings(settings1, &state).await;
+    assert!(res1.is_ok());
+    assert!(state.dynamic_llm.read().unwrap().is_some());
+    assert_eq!(state.settings.read().unwrap().temperature, Some(0.7));
+    assert_eq!(
+        state.settings.read().unwrap().llm_model,
+        Some("qwen2.5-coder".to_string())
+    );
+
+    // 2. Update temperature only without endpoint/model changes
+    let settings2 = AppSettingsPayload {
+        temperature: Some(0.2),
+        ..Default::default()
+    };
+    let res2 = handle_save_settings(settings2, &state).await;
+    assert!(res2.is_ok());
+    assert!(state.dynamic_llm.read().unwrap().is_some());
+    assert_eq!(state.settings.read().unwrap().temperature, Some(0.2));
+    // Verify endpoint and model are preserved
+    assert_eq!(
+        state.settings.read().unwrap().llm_model,
+        Some("qwen2.5-coder".to_string())
+    );
+    assert_eq!(
+        state.settings.read().unwrap().llm_endpoint,
+        Some("http://127.0.0.1:11434".to_string())
+    );
+}
+
+#[tokio::test]
 async fn test_viseme_tick_loop_high_frequency_broadcast() {
     let emitter = Arc::new(MockEventEmitter::new());
     let state = AppState::new_headless_with_emitter(emitter.clone());

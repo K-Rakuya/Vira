@@ -72,14 +72,15 @@ impl Default for ReqwestHttpTransport {
 }
 
 impl ReqwestHttpTransport {
-    /// Creates a new reqwest-backed transport with 30s timeout.
+    /// Creates a new reqwest-backed transport with 15s connection timeout and 600s max stream timeout.
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
                 .tcp_nodelay(true)
                 .build()
                 .unwrap_or_default(),
-            timeout: Duration::from_secs(30),
+            timeout: Duration::from_secs(600),
         }
     }
 
@@ -87,7 +88,7 @@ impl ReqwestHttpTransport {
     pub fn with_client(client: reqwest::Client) -> Self {
         Self {
             client,
-            timeout: Duration::from_secs(30),
+            timeout: Duration::from_secs(600),
         }
     }
 
@@ -95,6 +96,11 @@ impl ReqwestHttpTransport {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// Returns configured stream timeout.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 }
 
@@ -153,6 +159,7 @@ impl HttpTransport for ReqwestHttpTransport {
 
         let (tx, rx) = mpsc::channel(64);
         let mut sse_stream = resp.bytes_stream().eventsource();
+        let idle_timeout = Duration::from_secs(120).min(self.timeout);
 
         tokio::spawn(async move {
             loop {
@@ -161,19 +168,25 @@ impl HttpTransport for ReqwestHttpTransport {
                         let _ = tx.send(Err(LlmError::Cancelled)).await;
                         break;
                     }
-                    item = sse_stream.next() => {
+                    item = tokio::time::timeout(idle_timeout, sse_stream.next()) => {
                         match item {
-                            Some(Ok(event)) => {
+                            Ok(Some(Ok(event))) => {
                                 let data = event.data.trim().to_string();
                                 if !data.is_empty() && tx.send(Ok(data)).await.is_err() {
                                     break;
                                 }
                             }
-                            Some(Err(e)) => {
+                            Ok(Some(Err(e))) => {
                                 let _ = tx.send(Err(LlmError::Network(e.to_string()))).await;
                                 break;
                             }
-                            None => break,
+                            Ok(None) => break,
+                            Err(_) => {
+                                let _ = tx.send(Err(LlmError::Timeout(
+                                    "SSE stream idle timeout: no chunk received within idle limit".to_string(),
+                                ))).await;
+                                break;
+                            }
                         }
                     }
                 }
@@ -1151,5 +1164,14 @@ mod tests {
         assert_eq!(path2, "/chat/completions");
 
         assert!(NativeHttpTransport::parse_url("https://api.openai.com").is_err());
+    }
+
+    #[test]
+    fn test_reqwest_transport_timeouts() {
+        let default_transport = ReqwestHttpTransport::new();
+        assert_eq!(default_transport.timeout(), Duration::from_secs(600));
+
+        let custom_transport = ReqwestHttpTransport::new().with_timeout(Duration::from_secs(120));
+        assert_eq!(custom_transport.timeout(), Duration::from_secs(120));
     }
 }
