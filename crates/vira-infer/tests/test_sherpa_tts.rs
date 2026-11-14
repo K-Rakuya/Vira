@@ -84,7 +84,11 @@ async fn test_sherpa_tts_stream_synthesize_flow() {
             match event {
                 TtsStreamEvent::Audio(chunk) => {
                     assert!(!chunk.is_empty());
-                    assert_eq!(chunk.sample_rate, SHERPA_TTS_DEFAULT_SAMPLE_RATE);
+                    assert!(
+                        chunk.sample_rate == 22050 || chunk.sample_rate == SHERPA_TTS_DEFAULT_SAMPLE_RATE,
+                        "expected sample rate 22050 or 24000, got {}",
+                        chunk.sample_rate
+                    );
                     audio_chunks += 1;
                 }
                 TtsStreamEvent::Visemes(batch) => {
@@ -160,4 +164,43 @@ async fn test_sherpa_tts_with_missing_model_paths_falls_back_gracefully() {
     assert!(!adapter.is_neural_active());
     let output = adapter.synthesize("Fallback test").await.expect("synthesize success");
     assert!(!output.samples.is_empty());
+}
+
+#[tokio::test]
+async fn test_sherpa_tts_neural_vietnamese_synthesis_no_beeps() {
+    let adapter = SherpaTtsAdapter::new();
+    if !adapter.is_piper_active() {
+        return; // Skip if models not present on disk
+    }
+
+    let text = "Xin chào bạn, tôi là trợ lý ảo Vira.";
+    let output = adapter.synthesize(text).await.expect("neural vietnamese synthesis");
+
+    assert_eq!(output.sample_rate, 22050, "Piper Vietnamese sample rate is 22050Hz");
+    assert!(!output.samples.is_empty(), "audio samples must be generated");
+    assert!(!output.visemes.is_empty(), "visemes must be generated");
+    assert!(output.duration_ms() > 500, "audio duration must be realistic");
+
+    // Verify it is real speech (active amplitude)
+    let max_amp = output.samples.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
+    assert!(max_amp > 0.05, "audio amplitude must reflect active speech");
+}
+
+#[tokio::test]
+async fn test_sherpa_tts_neural_kokoro_english_synthesis() {
+    let adapter = SherpaTtsAdapter::new();
+    if !adapter.is_kokoro_active() {
+        return; // Skip if models not present on disk
+    }
+
+    let text = "Good morning! Welcome to the Vira companion system.";
+    let output = adapter.synthesize(text).await.expect("neural english synthesis");
+
+    assert_eq!(output.sample_rate, 24000, "Kokoro English sample rate is 24000Hz");
+    assert!(!output.samples.is_empty(), "audio samples must be generated");
+    assert!(!output.visemes.is_empty(), "visemes must be generated");
+    assert!(output.duration_ms() > 500, "audio duration must be realistic");
+
+    let max_amp = output.samples.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
+    assert!(max_amp > 0.05, "audio amplitude must reflect active speech");
 }

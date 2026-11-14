@@ -34,6 +34,149 @@ impl Default for CaptureConfig {
     }
 }
 
+/// Continuous streaming linear interpolation resampler that preserves phase and sample
+/// continuity across arbitrary audio chunk boundaries without allocations or phase drift.
+#[derive(Debug, Clone)]
+pub struct LinearResampler {
+    from_rate: u32,
+    to_rate: u32,
+    ratio: f64,
+    phase: f64,
+    last_sample: f32,
+    has_last_sample: bool,
+}
+
+impl LinearResampler {
+    /// Creates a new streaming resampler between sample rates.
+    pub fn new(from_rate: u32, to_rate: u32) -> Self {
+        let ratio = if to_rate > 0 {
+            from_rate as f64 / to_rate as f64
+        } else {
+            1.0
+        };
+        Self {
+            from_rate,
+            to_rate,
+            ratio,
+            phase: 0.0,
+            last_sample: 0.0,
+            has_last_sample: false,
+        }
+    }
+
+    /// Resamples an input slice of mono PCM samples into an existing stack or heap buffer `output`.
+    /// Returns the number of resampled samples written into `output`.
+    ///
+    /// Real-time safe: zero heap allocations, zero locks.
+    pub fn resample_into_slice(&mut self, input: &[f32], output: &mut [f32]) -> usize {
+        if input.is_empty() || self.ratio <= 0.0 {
+            return 0;
+        }
+
+        if self.from_rate == self.to_rate {
+            let n = input.len().min(output.len());
+            output[..n].copy_from_slice(&input[..n]);
+            return n;
+        }
+
+        if !self.has_last_sample {
+            self.last_sample = input[0];
+            self.has_last_sample = true;
+            self.phase = 0.0;
+        }
+
+        let in_len = input.len();
+        let mut t = self.phase;
+        let mut out_idx = 0;
+
+        while t < in_len as f64 && out_idx < output.len() {
+            let idx0 = t.floor() as isize;
+            let frac = (t - t.floor()) as f32;
+
+            let (s0, s1) = if idx0 < 0 {
+                (self.last_sample, input[0])
+            } else if (idx0 as usize + 1) < in_len {
+                (input[idx0 as usize], input[idx0 as usize + 1])
+            } else if idx0 as usize == in_len - 1 && frac < 1e-6 {
+                (input[idx0 as usize], input[idx0 as usize])
+            } else {
+                // Next sample is in the upcoming chunk; break and retain phase
+                break;
+            };
+
+            output[out_idx] = s0 + frac * (s1 - s0);
+            out_idx += 1;
+            t += self.ratio;
+        }
+
+        self.phase = t - in_len as f64;
+        self.last_sample = input[in_len - 1];
+        out_idx
+    }
+
+    /// Resamples an input slice of mono PCM samples, appending resampled samples into `output`.
+    pub fn resample_chunk(&mut self, input: &[f32], output: &mut Vec<f32>) {
+        if input.is_empty() || self.ratio <= 0.0 {
+            return;
+        }
+
+        if self.from_rate == self.to_rate {
+            output.extend_from_slice(input);
+            return;
+        }
+
+        if !self.has_last_sample {
+            self.last_sample = input[0];
+            self.has_last_sample = true;
+            self.phase = 0.0;
+        }
+
+        let in_len = input.len();
+        let mut t = self.phase;
+
+        while t < in_len as f64 {
+            let idx0 = t.floor() as isize;
+            let frac = (t - t.floor()) as f32;
+
+            let (s0, s1) = if idx0 < 0 {
+                (self.last_sample, input[0])
+            } else if (idx0 as usize + 1) < in_len {
+                (input[idx0 as usize], input[idx0 as usize + 1])
+            } else if idx0 as usize == in_len - 1 && frac < 1e-6 {
+                (input[idx0 as usize], input[idx0 as usize])
+            } else {
+                // Next sample is in the upcoming chunk; break and retain phase
+                break;
+            };
+
+            output.push(s0 + frac * (s1 - s0));
+            t += self.ratio;
+        }
+
+        self.phase = t - in_len as f64;
+        self.last_sample = input[in_len - 1];
+    }
+}
+
+/// One-shot linear interpolation resampler.
+pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == to_rate || samples.is_empty() || from_rate == 0 || to_rate == 0 {
+        return samples.to_vec();
+    }
+    let ratio = to_rate as f64 / from_rate as f64;
+    let out_len = (samples.len() as f64 * ratio).round() as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src_idx = i as f64 / ratio;
+        let idx0 = src_idx.floor() as usize;
+        let frac = (src_idx - idx0 as f64) as f32;
+        let s0 = samples.get(idx0).copied().unwrap_or(0.0);
+        let s1 = samples.get(idx0 + 1).copied().unwrap_or(s0);
+        out.push(s0 + frac * (s1 - s0));
+    }
+    out
+}
+
 /// Simulated / virtual microphone feed handle for feeding PCM data into `CaptureEngine`.
 #[derive(Clone)]
 pub struct VirtualAudioFeed {
@@ -89,9 +232,12 @@ impl CaptureEngine {
 
     /// Initializes a live native audio capture engine using `cpal` and the system's microphone.
     ///
-    /// The high-priority OS audio callback pushes directly to a lock-free `AudioRingBuffer`
-    /// without mutexes or heap allocations. A background async task consumes chunks and broadcasts
-    /// them downstream.
+    /// Automatically queries `device.default_input_config()` to detect the hardware's native
+    /// sample rate and channel layout (e.g. PipeWire stereo 48000Hz or 44100Hz).
+    /// If native channels > 1 or sample rate != 16000Hz, downmixes to mono and resamples
+    /// down to 16000Hz before pushing to the lock-free `AudioRingBuffer`.
+    ///
+    /// Outputs clean 16000Hz mono audio chunks of `config.chunk_size` (default 512 samples / 32ms).
     pub fn new_native(config: CaptureConfig) -> Result<Self, AudioError> {
         let host = cpal::default_host();
         let device = if let Some(ref name) = config.device_name {
@@ -104,9 +250,20 @@ impl CaptureEngine {
                 .ok_or_else(|| AudioError::Device("No default input audio device found".into()))?
         };
 
+        // Query native hardware configuration
+        let default_config = device.default_input_config().ok();
+        let (native_channels, native_sample_rate, sample_format) = match default_config {
+            Some(ref supported) => (
+                supported.channels(),
+                supported.sample_rate().0,
+                supported.sample_format(),
+            ),
+            None => (config.channels, config.sample_rate, cpal::SampleFormat::F32),
+        };
+
         let stream_config = cpal::StreamConfig {
-            channels: config.channels,
-            sample_rate: cpal::SampleRate(config.sample_rate),
+            channels: native_channels,
+            sample_rate: cpal::SampleRate(native_sample_rate),
             buffer_size: cpal::BufferSize::Default,
         };
 
@@ -119,43 +276,125 @@ impl CaptureEngine {
 
         let notify = Arc::new(tokio::sync::Notify::new());
         let notify_audio = notify.clone();
-        let channels = config.channels as usize;
+        let channels = native_channels as usize;
+        let target_sample_rate = config.sample_rate;
 
         let err_callback = |err| {
             eprintln!("Audio capture stream error: {err}");
         };
 
-        let stream = device
-            .build_input_stream(
-                &stream_config,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    if !is_capturing_clone.load(Ordering::Relaxed) {
-                        return;
-                    }
+        let stream = match sample_format {
+            cpal::SampleFormat::I16 => {
+                let mut mono_buf = [0.0f32; 1024];
+                let mut resample_buf = [0.0f32; 1024];
+                let mut resampler = if native_sample_rate != target_sample_rate {
+                    Some(LinearResampler::new(native_sample_rate, target_sample_rate))
+                } else {
+                    None
+                };
 
-                    if channels == 1 {
-                        let _ = producer.push_partial(data);
-                    } else {
-                        // Downmix multi-channel to mono via stack buffer - zero heap allocations
-                        let mut mono_buf = [0.0f32; 512];
-                        for chunk in data.chunks(512 * channels) {
-                            let frames = chunk.len() / channels;
-                            for (i, mono) in mono_buf[..frames].iter_mut().enumerate() {
-                                let mut sum = 0.0f32;
-                                for ch in 0..channels {
-                                    sum += chunk[i * channels + ch];
-                                }
-                                *mono = sum / channels as f32;
-                            }
-                            let _ = producer.push_partial(&mono_buf[..frames]);
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        if !is_capturing_clone.load(Ordering::Relaxed) {
+                            return;
                         }
-                    }
-                    notify_audio.notify_one();
-                },
-                err_callback,
-                None,
-            )
-            .map_err(|e| AudioError::Stream(e.to_string()))?;
+
+                        if channels == 1 {
+                            for chunk in data.chunks(1024) {
+                                for (dst, &src) in mono_buf[..chunk.len()].iter_mut().zip(chunk.iter()) {
+                                    *dst = src as f32 / 32768.0;
+                                }
+                                if let Some(ref mut r) = resampler {
+                                    let written = r.resample_into_slice(&mono_buf[..chunk.len()], &mut resample_buf);
+                                    if written > 0 {
+                                        let _ = producer.push_partial(&resample_buf[..written]);
+                                    }
+                                } else {
+                                    let _ = producer.push_partial(&mono_buf[..chunk.len()]);
+                                }
+                            }
+                        } else {
+                            for chunk in data.chunks(1024 * channels) {
+                                let frames = chunk.len() / channels;
+                                for (i, mono) in mono_buf[..frames].iter_mut().enumerate() {
+                                    let mut sum = 0.0f32;
+                                    for ch in 0..channels {
+                                        sum += chunk[i * channels + ch] as f32 / 32768.0;
+                                    }
+                                    *mono = sum / channels as f32;
+                                }
+                                if let Some(ref mut r) = resampler {
+                                    let written = r.resample_into_slice(&mono_buf[..frames], &mut resample_buf);
+                                    if written > 0 {
+                                        let _ = producer.push_partial(&resample_buf[..written]);
+                                    }
+                                } else {
+                                    let _ = producer.push_partial(&mono_buf[..frames]);
+                                }
+                            }
+                        }
+                        notify_audio.notify_one();
+                    },
+                    err_callback,
+                    None,
+                )
+            }
+            _ => {
+                let mut mono_buf = [0.0f32; 1024];
+                let mut resample_buf = [0.0f32; 1024];
+                let mut resampler = if native_sample_rate != target_sample_rate {
+                    Some(LinearResampler::new(native_sample_rate, target_sample_rate))
+                } else {
+                    None
+                };
+
+                device.build_input_stream(
+                    &stream_config,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        if !is_capturing_clone.load(Ordering::Relaxed) {
+                            return;
+                        }
+
+                        if channels == 1 {
+                            if let Some(ref mut r) = resampler {
+                                for chunk in data.chunks(1024) {
+                                    let written = r.resample_into_slice(chunk, &mut resample_buf);
+                                    if written > 0 {
+                                        let _ = producer.push_partial(&resample_buf[..written]);
+                                    }
+                                }
+                            } else {
+                                let _ = producer.push_partial(data);
+                            }
+                        } else {
+                            for chunk in data.chunks(1024 * channels) {
+                                let frames = chunk.len() / channels;
+                                for (i, mono) in mono_buf[..frames].iter_mut().enumerate() {
+                                    let mut sum = 0.0f32;
+                                    for ch in 0..channels {
+                                        sum += chunk[i * channels + ch];
+                                    }
+                                    *mono = sum / channels as f32;
+                                }
+                                if let Some(ref mut r) = resampler {
+                                    let written = r.resample_into_slice(&mono_buf[..frames], &mut resample_buf);
+                                    if written > 0 {
+                                        let _ = producer.push_partial(&resample_buf[..written]);
+                                    }
+                                } else {
+                                    let _ = producer.push_partial(&mono_buf[..frames]);
+                                }
+                            }
+                        }
+                        notify_audio.notify_one();
+                    },
+                    err_callback,
+                    None,
+                )
+            }
+        }
+        .map_err(|e| AudioError::Stream(e.to_string()))?;
 
         stream
             .play()
@@ -286,6 +525,65 @@ impl AudioCapturePort for CaptureEngine {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_linear_resampler_streaming_equivalence() {
+        // Generate a 48000Hz test signal (sine wave)
+        let sample_count = 4800; // 100ms at 48kHz
+        let mut signal_48k = Vec::with_capacity(sample_count);
+        for i in 0..sample_count {
+            let t = i as f32 / 48000.0;
+            signal_48k.push((2.0 * std::f32::consts::PI * 440.0 * t).sin());
+        }
+
+        // 1. One-shot reference resampling (48k -> 16k)
+        let oneshot = resample_linear(&signal_48k, 48000, 16000);
+        assert_eq!(oneshot.len(), 1600); // exactly 1/3 samples
+
+        // 2. Streaming resampler fed in small chunks (e.g. 240 samples per chunk = 5ms)
+        let mut resampler = LinearResampler::new(48000, 16000);
+        let mut streamed = Vec::new();
+        for chunk in signal_48k.chunks(240) {
+            resampler.resample_chunk(chunk, &mut streamed);
+        }
+
+        // Verify streamed output matches one-shot with high precision
+        assert!((streamed.len() as isize - oneshot.len() as isize).abs() <= 1);
+        let compare_len = streamed.len().min(oneshot.len());
+        for i in 0..compare_len {
+            assert!(
+                (streamed[i] - oneshot[i]).abs() < 1e-4,
+                "Sample mismatch at {i}: streamed={}, oneshot={}",
+                streamed[i],
+                oneshot[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_linear_resampler_non_integer_ratio() {
+        // 44100Hz -> 16000Hz (ratio = 2.75625)
+        let sample_count = 4410; // 100ms
+        let mut signal_44k = Vec::with_capacity(sample_count);
+        for i in 0..sample_count {
+            let t = i as f32 / 44100.0;
+            signal_44k.push((2.0 * std::f32::consts::PI * 1000.0 * t).sin());
+        }
+
+        let mut resampler = LinearResampler::new(44100, 16000);
+        let mut streamed = Vec::new();
+        for chunk in signal_44k.chunks(256) {
+            let mut buf = [0.0f32; 512];
+            let written = resampler.resample_into_slice(chunk, &mut buf);
+            streamed.extend_from_slice(&buf[..written]);
+        }
+
+        // Expected output samples: ~1600 samples
+        assert!((streamed.len() as isize - 1600).abs() <= 5);
+        for &s in &streamed {
+            assert!(s >= -1.0 && s <= 1.0);
+        }
+    }
+
     #[tokio::test]
     async fn test_virtual_capture_engine_read_chunk() {
         let (engine, feed) = CaptureEngine::new_virtual(16000, 512);
@@ -351,5 +649,25 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let decoded: CaptureConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, decoded);
+    }
+
+    #[tokio::test]
+    async fn test_native_device_info_and_creation() {
+        let host = cpal::default_host();
+        if let Some(device) = host.default_input_device() {
+            if let Ok(config) = device.default_input_config() {
+                println!(
+                    "Default input config: channels={}, sample_rate={}, format={:?}",
+                    config.channels(),
+                    config.sample_rate().0,
+                    config.sample_format()
+                );
+            }
+            let res = CaptureEngine::new_native(CaptureConfig::default());
+            assert!(res.is_ok(), "Native capture engine should successfully initialize");
+            let engine = res.unwrap();
+            assert_eq!(engine.sample_rate(), 16000);
+            assert_eq!(engine.chunk_size(), 512);
+        }
     }
 }

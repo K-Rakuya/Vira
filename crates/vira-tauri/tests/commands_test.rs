@@ -249,6 +249,88 @@ async fn test_toggle_mic_transcription_triggers_conversation_turn() {
 }
 
 #[tokio::test]
+async fn test_toggle_mic_continuous_vad_endpointing_triggers_turn() {
+    use vira_infer::SherpaSttAdapter;
+    use vira_voice::capture::CaptureEngine;
+
+    let emitter = Arc::new(MockEventEmitter::new());
+    let (capture, feed) = CaptureEngine::new_virtual(16000, 512);
+    let state = AppState::new_headless_with_emitter(emitter.clone())
+        .with_audio_capture(Arc::new(capture));
+
+    // Configure STT with a mock response
+    let stt = SherpaSttAdapter::virtual_fallback()
+        .with_mock_responses(vec!["Hôm nay thời tiết thế nào?".to_string()]);
+    state.set_dynamic_stt(Arc::new(stt));
+
+    // 1. Toggle mic ON (starts continuous streaming capture loop)
+    let res_on = handle_toggle_mic(true, &state).await.expect("toggle mic on");
+    assert!(res_on);
+    assert_eq!(state.get_conversation_state(), ConversationState::Listening);
+
+    // 2. Feed silence chunks (< vad_energy_threshold) to populate pre-roll buffer (~250ms)
+    let silence_chunk = vec![0.001f32; 512]; // RMS ~ 0.001 < 0.01
+    for _ in 0..4 {
+        feed.feed_chunk(silence_chunk.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // 3. User begins speaking: feed loud chunks (RMS ~ 0.2 >= 0.01)
+    // 16 chunks * 512 samples = 8192 samples = 0.512s of active speech (satisfies min_speech_samples >= 0.5s)
+    let speech_chunk = vec![0.2f32; 512];
+    for _ in 0..16 {
+        feed.feed_chunk(speech_chunk.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // 4. User finishes speaking: feed >= 20 silence frames (~640ms silence)
+    for _ in 0..22 {
+        feed.feed_chunk(silence_chunk.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // Wait briefly for background endpointing, STT slice transcription, and conversation turn execution
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // 5. Verify conversation turn executed automatically WITHOUT manually toggling mic off!
+    let history = state.history.read().await;
+    assert!(
+        history.iter().any(|m| m.is_user() && m.raw_content == "Hôm nay thời tiết thế nào?"),
+        "Continuous VAD endpointing must automatically trigger conversation turn when user stops speaking"
+    );
+}
+
+#[tokio::test]
+async fn test_continuous_vad_barge_in_cancels_speaking_avatar() {
+    use vira_voice::capture::CaptureEngine;
+
+    let emitter = Arc::new(MockEventEmitter::new());
+    let (capture, feed) = CaptureEngine::new_virtual(16000, 512);
+    let state = AppState::new_headless_with_emitter(emitter.clone())
+        .with_audio_capture(Arc::new(capture));
+
+    // 1. Toggle mic ON
+    handle_toggle_mic(true, &state).await.expect("toggle mic on");
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    // 2. Simulate avatar speaking
+    state.force_state(ConversationState::Speaking);
+    let _ = state.audio_playback.enqueue_samples(&[0.5; 2048]);
+    assert!(state.audio_playback.is_playing());
+
+    // 3. Feed loud speech chunk from microphone -> should trigger barge-in and cancel playback
+    let speech_chunk = vec![0.3f32; 512];
+    feed.feed_chunk(speech_chunk);
+
+    // Give streaming task a moment to process chunk
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    // Avatar speech should be cancelled and flushed
+    assert_eq!(state.audio_playback.buffered_samples(), 0);
+    assert_eq!(state.get_conversation_state(), ConversationState::Listening);
+}
+
+#[tokio::test]
 async fn test_save_settings_and_get_app_state() {
     let state = AppState::new_headless();
 

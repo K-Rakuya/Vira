@@ -813,12 +813,19 @@ pub async fn handle_toggle_mic(
             .map_err(|e| e.to_string())?;
         state.mic_active.store(true, Ordering::Release);
 
-        // Spawn background task to stream captured microphone frames
+        // Spawn background task to stream captured microphone frames with continuous VAD and endpointing
         let cancel = CancellationToken::new();
         *state.mic_task_cancel.lock().unwrap() = Some(cancel.clone());
         let state_clone = state.clone();
         let capture = state.audio_capture.clone();
         tokio::spawn(async move {
+            let vad_energy_threshold = 0.01f32;
+            let mut pre_roll_buffer: Vec<f32> = Vec::with_capacity(4096);
+            let mut speech_buffer: Vec<f32> = Vec::new();
+            let mut in_speech = false;
+            let mut consecutive_silence_frames: usize = 0;
+            let sample_rate = state_clone.audio_capture.sample_rate();
+
             while !cancel.is_cancelled() {
                 match capture.read_chunk(cancel.clone()).await {
                     Ok(chunk) => {
@@ -827,7 +834,84 @@ pub async fn handle_toggle_mic(
                         }
                         let rms = vira_infer::SherpaSttAdapter::calculate_rms(&chunk);
                         state_clone.append_recorded_audio(&chunk);
-                        state_clone.emit_audio_state(rms, false);
+
+                        if rms >= vad_energy_threshold {
+                            if !in_speech {
+                                // Transition: user started talking!
+                                // Trigger barge-in: cancel any active avatar speech
+                                state_clone.cancel_active_speech();
+                                state_clone.force_state(ConversationState::Listening);
+                                state_clone.emit_audio_state(rms, true);
+
+                                in_speech = true;
+                                speech_buffer.clear();
+                                speech_buffer.extend_from_slice(&pre_roll_buffer);
+                            } else {
+                                state_clone.emit_audio_state(rms, false);
+                            }
+                            speech_buffer.extend_from_slice(&chunk);
+                            consecutive_silence_frames = 0;
+                        } else {
+                            // Chunk RMS < vad_energy_threshold
+                            if in_speech {
+                                speech_buffer.extend_from_slice(&chunk);
+                                consecutive_silence_frames += 1;
+                                state_clone.emit_audio_state(rms, false);
+
+                                // Check endpoint condition: >= 20 silence frames (~640ms silence at 32ms/frame)
+                                // and speech buffer has >= 0.5s of audio
+                                let min_speech_samples = if sample_rate > 0 {
+                                    sample_rate as usize / 2
+                                } else {
+                                    8000
+                                };
+
+                                if consecutive_silence_frames >= 20
+                                    && speech_buffer.len() >= min_speech_samples
+                                {
+                                    // ENDPOINT DETECTED! Turn is complete!
+                                    let speech_to_transcribe = speech_buffer.clone();
+                                    in_speech = false;
+                                    consecutive_silence_frames = 0;
+                                    speech_buffer.clear();
+                                    pre_roll_buffer.clear();
+                                    state_clone.clear_recorded_audio();
+
+                                    let stt = state_clone.get_stt();
+                                    let state_task = state_clone.clone();
+                                    let s_rate = if sample_rate > 0 {
+                                        sample_rate
+                                    } else {
+                                        16000
+                                    };
+
+                                    tokio::spawn(async move {
+                                        if let Ok(stt_event) =
+                                            stt.transcribe_slice(&speech_to_transcribe, s_rate).await
+                                        {
+                                            let transcribed = stt_event.text.trim();
+                                            if !transcribed.is_empty()
+                                                && transcribed != "[speech detected]"
+                                            {
+                                                let _ = execute_conversation_turn(
+                                                    transcribed,
+                                                    &state_task,
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                    });
+                                }
+                            } else {
+                                // Not in speech: maintain rolling pre-roll buffer (~250ms / 4000 samples)
+                                pre_roll_buffer.extend_from_slice(&chunk);
+                                if pre_roll_buffer.len() > 4000 {
+                                    let excess = pre_roll_buffer.len() - 4000;
+                                    pre_roll_buffer.drain(0..excess);
+                                }
+                                state_clone.emit_audio_state(rms, false);
+                            }
+                        }
                     }
                     Err(_) => break,
                 }

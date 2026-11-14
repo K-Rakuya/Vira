@@ -16,12 +16,17 @@ pub struct OfflineModelPaths {
     pub piper_vits_model: PathBuf,
     pub piper_tokens: PathBuf,
     pub piper_data_dir: PathBuf,
+    pub piper_bin: PathBuf,
+    pub piper_config: PathBuf,
+    pub piper_espeak_dir: PathBuf,
 
     // --- Kokoro Multi-Language TTS (English / Japanese) ---
     pub kokoro_model: PathBuf,
     pub kokoro_voices: PathBuf,
     pub kokoro_tokens: PathBuf,
     pub kokoro_data_dir: PathBuf,
+    pub kokoro_lexicon: PathBuf,
+    pub kokoro_dict_dir: PathBuf,
 
     // --- Streaming Zipformer STT ---
     pub stt_encoder: PathBuf,
@@ -97,11 +102,16 @@ impl OfflineModelPaths {
             piper_vits_model: base.join("piper").join("vi_VN-vais1000-medium.onnx"),
             piper_tokens: base.join("piper").join("tokens.txt"),
             piper_data_dir: base.join("piper").join("espeak-ng-data"),
+            piper_bin: base.join("bin").join("piper").join("piper"),
+            piper_config: base.join("piper").join("vi_VN-vais1000-medium.onnx.json"),
+            piper_espeak_dir: base.join("bin").join("piper").join("espeak-ng-data"),
 
             kokoro_model: base.join("kokoro").join("kokoro-multi-lang-v1_0.onnx"),
             kokoro_voices: base.join("kokoro").join("voices.bin"),
             kokoro_tokens: base.join("kokoro").join("tokens.txt"),
             kokoro_data_dir: base.join("kokoro").join("espeak-ng-data"),
+            kokoro_lexicon: base.join("kokoro").join("lexicon-us-en.txt"),
+            kokoro_dict_dir: base.join("kokoro").join("dict"),
 
             stt_encoder: base.join("streaming-zipformer").join("encoder.onnx"),
             stt_decoder: base.join("streaming-zipformer").join("decoder.onnx"),
@@ -171,6 +181,7 @@ impl OfflineModelPaths {
         let candidates = [
             self.base_dir.join("vi_VN-vais1000-medium.onnx"),
             self.base_dir.join("vits-piper-vi_VN-vais1000-medium").join("vi_VN-vais1000-medium.onnx"),
+            self.base_dir.join("piper").join("vi_VN-vais1000-medium.onnx"),
             self.base_dir.join("piper").join("model.onnx"),
         ];
         for c in &candidates {
@@ -189,9 +200,64 @@ impl OfflineModelPaths {
         let candidates = [
             self.base_dir.join("tokens.txt"),
             self.base_dir.join("vits-piper-vi_VN-vais1000-medium").join("tokens.txt"),
+            self.base_dir.join("piper").join("tokens.txt"),
         ];
         for c in &candidates {
             if c.is_file() {
+                return Some(c.clone());
+            }
+        }
+        None
+    }
+
+    /// Resolves actual Piper native executable binary path.
+    pub fn resolve_piper_bin(&self) -> Option<PathBuf> {
+        if self.piper_bin.is_file() {
+            return Some(self.piper_bin.clone());
+        }
+        let candidates = [
+            self.base_dir.join("bin").join("piper").join("piper"),
+            self.base_dir.join("bin").join("piper"),
+            PathBuf::from("models/bin/piper/piper"),
+        ];
+        for c in &candidates {
+            if c.is_file() {
+                return Some(c.clone());
+            }
+        }
+        None
+    }
+
+    /// Resolves actual Piper JSON configuration path.
+    pub fn resolve_piper_config(&self) -> Option<PathBuf> {
+        if self.piper_config.is_file() {
+            return Some(self.piper_config.clone());
+        }
+        let candidates = [
+            self.base_dir.join("piper").join("vi_VN-vais1000-medium.onnx.json"),
+            self.base_dir.join("vits-piper-vi_VN-vais1000-medium").join("vi_VN-vais1000-medium.onnx.json"),
+            self.base_dir.join("vi_VN-vais1000-medium.onnx.json"),
+        ];
+        for c in &candidates {
+            if c.is_file() {
+                return Some(c.clone());
+            }
+        }
+        None
+    }
+
+    /// Resolves actual Piper espeak-ng-data directory path.
+    pub fn resolve_piper_espeak_dir(&self) -> Option<PathBuf> {
+        if self.piper_espeak_dir.is_dir() {
+            return Some(self.piper_espeak_dir.clone());
+        }
+        let candidates = [
+            self.base_dir.join("bin").join("piper").join("espeak-ng-data"),
+            self.base_dir.join("piper").join("espeak-ng-data"),
+            self.base_dir.join("vits-piper-vi_VN-vais1000-medium").join("espeak-ng-data"),
+        ];
+        for c in &candidates {
+            if c.is_dir() {
                 return Some(c.clone());
             }
         }
@@ -203,6 +269,13 @@ impl OfflineModelPaths {
         self.resolve_piper_model().is_some() && self.resolve_piper_tokens().is_some()
     }
 
+    /// Checks if offline Piper native binary synthesis assets are available on disk.
+    pub fn is_piper_bin_available(&self) -> bool {
+        self.resolve_piper_bin().is_some()
+            && self.resolve_piper_model().is_some()
+            && self.resolve_piper_config().is_some()
+    }
+
     /// Resolves actual Kokoro ONNX model path.
     pub fn resolve_kokoro_model(&self) -> Option<PathBuf> {
         if self.kokoro_model.is_file() {
@@ -211,7 +284,9 @@ impl OfflineModelPaths {
         let candidates = [
             self.base_dir.join("kokoro-multi-lang-v1_0.onnx"),
             self.base_dir.join("kokoro-v1.0.onnx"),
+            self.base_dir.join("kokoro").join("kokoro-multi-lang-v1_0.onnx"),
             self.base_dir.join("kokoro").join("model.onnx"),
+            self.base_dir.join("kokoro-multi-lang-v1_0").join("model.onnx"),
         ];
         for c in &candidates {
             if c.is_file() {
@@ -229,6 +304,7 @@ impl OfflineModelPaths {
         let candidates = [
             self.base_dir.join("voices.bin"),
             self.base_dir.join("kokoro").join("voices.bin"),
+            self.base_dir.join("kokoro-multi-lang-v1_0").join("voices.bin"),
         ];
         for c in &candidates {
             if c.is_file() {
@@ -245,10 +321,47 @@ impl OfflineModelPaths {
         }
         let candidates = [
             self.base_dir.join("kokoro").join("tokens.txt"),
+            self.base_dir.join("kokoro-multi-lang-v1_0").join("tokens.txt"),
             self.base_dir.join("tokens.txt"),
         ];
         for c in &candidates {
             if c.is_file() {
+                return Some(c.clone());
+            }
+        }
+        None
+    }
+
+    /// Resolves actual Kokoro lexicon file path.
+    pub fn resolve_kokoro_lexicon(&self) -> Option<PathBuf> {
+        if self.kokoro_lexicon.is_file() {
+            return Some(self.kokoro_lexicon.clone());
+        }
+        let candidates = [
+            self.base_dir.join("kokoro").join("lexicon-us-en.txt"),
+            self.base_dir.join("kokoro-multi-lang-v1_0").join("lexicon-us-en.txt"),
+            self.base_dir.join("lexicon-us-en.txt"),
+        ];
+        for c in &candidates {
+            if c.is_file() {
+                return Some(c.clone());
+            }
+        }
+        None
+    }
+
+    /// Resolves actual Kokoro dict directory path.
+    pub fn resolve_kokoro_dict_dir(&self) -> Option<PathBuf> {
+        if self.kokoro_dict_dir.is_dir() {
+            return Some(self.kokoro_dict_dir.clone());
+        }
+        let candidates = [
+            self.base_dir.join("kokoro").join("dict"),
+            self.base_dir.join("kokoro-multi-lang-v1_0").join("dict"),
+            self.base_dir.join("dict"),
+        ];
+        for c in &candidates {
+            if c.is_dir() {
                 return Some(c.clone());
             }
         }
@@ -264,7 +377,7 @@ impl OfflineModelPaths {
 
     /// Returns true if either Piper or Kokoro offline TTS model assets are available.
     pub fn is_tts_available(&self) -> bool {
-        self.is_piper_available() || self.is_kokoro_available()
+        self.is_piper_bin_available() || self.is_piper_available() || self.is_kokoro_available()
     }
 
     /// Checks if streaming Zipformer STT model assets are available on disk.

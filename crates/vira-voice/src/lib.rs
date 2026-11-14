@@ -9,7 +9,9 @@ pub mod ring_buffer;
 pub mod stream_parser;
 
 pub use barge_in::{BargeInController, BargeInReport};
-pub use capture::{CaptureConfig, CaptureEngine, VirtualAudioFeed};
+pub use capture::{
+    resample_linear, CaptureConfig, CaptureEngine, LinearResampler, VirtualAudioFeed,
+};
 pub use chunker::{ChunkerConfig, SentenceChunker};
 pub use clock::MasterAudioClock;
 pub use gop::{

@@ -254,6 +254,12 @@ impl AppState {
         )
     }
 
+    /// Replaces the audio capture port (useful for injecting `VirtualAudioFeed` during tests).
+    pub fn with_audio_capture(mut self, capture: Arc<dyn AudioCapturePort>) -> Self {
+        self.audio_capture = capture;
+        self
+    }
+
     /// Obtains the active LLM port (either dynamically reconfigured or initial fallback).
     pub fn get_llm(&self) -> Arc<dyn LlmPort> {
         if let Some(ref dynamic) = *self.dynamic_llm.read().unwrap() {

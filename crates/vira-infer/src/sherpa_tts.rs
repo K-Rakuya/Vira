@@ -69,6 +69,10 @@ pub struct SherpaTtsAdapter {
     aligner: PhonemeAligner,
     piper_tts: Option<Arc<Mutex<OfflineTts>>>,
     kokoro_tts: Option<Arc<Mutex<OfflineTts>>>,
+    piper_bin: Option<std::path::PathBuf>,
+    piper_model: Option<std::path::PathBuf>,
+    piper_config: Option<std::path::PathBuf>,
+    piper_espeak: Option<std::path::PathBuf>,
 }
 
 impl Default for SherpaTtsAdapter {
@@ -107,10 +111,24 @@ impl SherpaTtsAdapter {
                 aligner,
                 piper_tts: None,
                 kokoro_tts: None,
+                piper_bin: None,
+                piper_model: None,
+                piper_config: None,
+                piper_espeak: None,
             };
         }
 
-        let piper_tts = Self::try_init_piper(&config.model_paths, config.speed);
+        let piper_bin = config.model_paths.resolve_piper_bin();
+        let piper_model = config.model_paths.resolve_piper_model();
+        let piper_config = config.model_paths.resolve_piper_config();
+        let piper_espeak = config.model_paths.resolve_piper_espeak_dir();
+
+        // If native piper binary is found, use it directly for Vietnamese
+        let piper_tts = if piper_bin.is_none() {
+            Self::try_init_piper(&config.model_paths, config.speed)
+        } else {
+            None
+        };
         let kokoro_tts = Self::try_init_kokoro(&config.model_paths, config.speed);
 
         Self {
@@ -118,6 +136,10 @@ impl SherpaTtsAdapter {
             aligner,
             piper_tts,
             kokoro_tts,
+            piper_bin,
+            piper_model,
+            piper_config,
+            piper_espeak,
         }
     }
 
@@ -161,9 +183,10 @@ impl SherpaTtsAdapter {
         &self.aligner
     }
 
-    /// Returns true if Piper VITS Vietnamese neural model is initialized.
+    /// Returns true if Piper VITS Vietnamese neural model is initialized or native binary is available.
     pub fn is_piper_active(&self) -> bool {
-        self.piper_tts.is_some()
+        (self.piper_bin.is_some() && self.piper_model.is_some() && self.piper_config.is_some())
+            || self.piper_tts.is_some()
     }
 
     /// Returns true if Kokoro multi-language neural model is initialized.
@@ -216,7 +239,9 @@ impl SherpaTtsAdapter {
         let tokens_path = paths.resolve_kokoro_tokens()?;
 
         let length_scale = if speed > 0.0 { 1.0 / speed } else { 1.0 };
-        let data_dir = if paths.kokoro_data_dir.is_dir() {
+        let lexicon = paths.resolve_kokoro_lexicon().map(|p| p.to_string_lossy().to_string());
+        let dict_dir = paths.resolve_kokoro_dict_dir().map(|p| p.to_string_lossy().to_string());
+        let data_dir = if lexicon.is_none() && paths.kokoro_data_dir.is_dir() {
             Some(paths.kokoro_data_dir.to_string_lossy().to_string())
         } else {
             None
@@ -230,8 +255,8 @@ impl SherpaTtsAdapter {
                     tokens: Some(tokens_path.to_string_lossy().to_string()),
                     data_dir,
                     length_scale,
-                    dict_dir: None,
-                    lexicon: None,
+                    dict_dir,
+                    lexicon,
                     lang: None,
                 },
                 provider: Some("cpu".to_string()),
@@ -243,6 +268,129 @@ impl SherpaTtsAdapter {
         };
 
         OfflineTts::create(&config).map(|engine| Arc::new(Mutex::new(engine)))
+    }
+
+    /// Synthesizes speech using the native Piper standalone binary for Vietnamese.
+    /// Runs piper with `--model <model> --config <json> --espeak_data <dir> --output_raw`,
+    /// streams input text to stdin, reads raw PCM 16-bit mono little-endian from stdout,
+    /// and converts to f32 in [-1.0, 1.0] at 22050 Hz.
+    fn synthesize_piper_native(
+        &self,
+        clean_text: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<f32>, TtsError> {
+        let piper_bin = self
+            .piper_bin
+            .as_ref()
+            .ok_or_else(|| TtsError::Other("piper binary path not configured".to_string()))?;
+        let piper_model = self
+            .piper_model
+            .as_ref()
+            .ok_or_else(|| TtsError::Other("piper model path not configured".to_string()))?;
+        let piper_config = self
+            .piper_config
+            .as_ref()
+            .ok_or_else(|| TtsError::Other("piper config path not configured".to_string()))?;
+
+        if cancel.is_cancelled() {
+            return Err(TtsError::Cancelled);
+        }
+
+        let length_scale = if self.config.speed > 0.0 {
+            1.0 / self.config.speed
+        } else {
+            1.0
+        };
+
+        let mut cmd = std::process::Command::new(piper_bin);
+        cmd.arg("--model")
+            .arg(piper_model)
+            .arg("--config")
+            .arg(piper_config)
+            .arg("--output_raw")
+            .arg("--length_scale")
+            .arg(format!("{:.3}", length_scale))
+            .arg("--speaker")
+            .arg(self.config.speaker_id.to_string())
+            .arg("-q")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+
+        if let Some(espeak_dir) = &self.piper_espeak {
+            cmd.arg("--espeak_data").arg(espeak_dir);
+        }
+
+        if let Some(parent) = piper_bin.parent() {
+            let current_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+            let new_ld = if current_ld.is_empty() {
+                parent.to_string_lossy().to_string()
+            } else {
+                format!("{}:{}", parent.to_string_lossy(), current_ld)
+            };
+            cmd.env("LD_LIBRARY_PATH", new_ld);
+        }
+
+        let mut child = cmd.spawn().map_err(|e| {
+            TtsError::Other(format!("failed to spawn piper process: {e}"))
+        })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(clean_text.as_bytes());
+            let _ = stdin.write_all(b"\n");
+            let _ = stdin.flush();
+        }
+
+        let mut raw_bytes = Vec::new();
+        if let Some(mut stdout) = child.stdout.take() {
+            use std::io::Read;
+            let mut buffer = [0u8; 4096];
+            loop {
+                if cancel.is_cancelled() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(TtsError::Cancelled);
+                }
+                match stdout.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        raw_bytes.extend_from_slice(&buffer[..n]);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(TtsError::Other(format!("error reading piper stdout: {e}")));
+                    }
+                }
+            }
+        }
+
+        let status = child.wait().map_err(|e| {
+            TtsError::Other(format!("failed waiting for piper process: {e}"))
+        })?;
+
+        if !status.success() {
+            return Err(TtsError::Other(format!(
+                "piper process exited with failure status: {:?}",
+                status.code()
+            )));
+        }
+
+        if cancel.is_cancelled() {
+            return Err(TtsError::Cancelled);
+        }
+
+        let num_samples = raw_bytes.len() / 2;
+        let mut samples = Vec::with_capacity(num_samples);
+        for chunk in raw_bytes.chunks_exact(2) {
+            let sample_i16 = i16::from_le_bytes([chunk[0], chunk[1]]);
+            let sample_f32 = (sample_i16 as f32 / 32768.0).clamp(-1.0, 1.0);
+            samples.push(sample_f32);
+        }
+
+        Ok(samples)
     }
 
     /// Synthesizes audio samples using active offline neural models if available,
@@ -258,7 +406,25 @@ impl SherpaTtsAdapter {
 
         let lang = G2pConverter::detect_language(clean_text);
 
-        // Select neural engine by language preference
+        // 1. Vietnamese synthesis via native Piper binary
+        if lang == PhonemeLanguage::Vietnamese
+            && self.piper_bin.is_some()
+            && self.piper_model.is_some()
+            && self.piper_config.is_some()
+        {
+            match self.synthesize_piper_native(clean_text, cancel) {
+                Ok(samples) if !samples.is_empty() => {
+                    return Ok((samples, 22050, lang));
+                }
+                Ok(_) => {}
+                Err(TtsError::Cancelled) => return Err(TtsError::Cancelled),
+                Err(e) => {
+                    eprintln!("Piper native synthesis failed: {e}; falling back to secondary");
+                }
+            }
+        }
+
+        // 2. Multilingual synthesis via Kokoro or Piper sherpa-onnx engine
         let selected_engine = match lang {
             PhonemeLanguage::Vietnamese => {
                 self.piper_tts.as_ref().or(self.kokoro_tts.as_ref())
@@ -292,11 +458,13 @@ impl SherpaTtsAdapter {
                 }
                 let samples = generated.samples().to_vec();
                 let sample_rate = generated.sample_rate() as u32;
-                return Ok((samples, sample_rate, lang));
+                if !samples.is_empty() {
+                    return Ok((samples, sample_rate, lang));
+                }
             }
         }
 
-        // Virtual acoustic fallback
+        // 3. Virtual fallback if no neural engine generated samples
         let (samples, sample_rate) = self.generate_virtual_fallback_samples(clean_text);
         Ok((samples, sample_rate, lang))
     }
