@@ -1423,21 +1423,45 @@ pub struct AssessPronunciationPayload {
     pub target_text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioSamplesResponse {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferenceAudioPayload {
+    pub target_text: Option<String>,
+}
+
 /// Evaluates pronunciation of target text using recorded audio and acoustic GOP.
-#[tauri::command]
-pub async fn assess_pronunciation(
+pub async fn handle_assess_pronunciation(
     payload: AssessPronunciationPayload,
-    state: tauri::State<'_, AppState>,
-) -> Result<vira_voice::gop::PronunciationAssessment, String> {
+    state: &AppState,
+) -> Result<vira_voice::gop::PronunciationReport, String> {
     let target = payload.target_text.trim();
     if target.is_empty() {
         return Err("Target text cannot be empty".to_string());
     }
 
     let converter = vira_voice::phoneme_aligner::G2pConverter::new();
-    let phonemes =
-        converter.text_to_phonemes(target, vira_voice::phoneme_aligner::PhonemeLanguage::Auto);
-    if phonemes.is_empty() {
+    let target_words: Vec<&str> = target.split_whitespace().collect();
+    if target_words.is_empty() {
+        return Err("Target text cannot be empty".to_string());
+    }
+
+    // Extract word-level phonemes
+    let mut word_phoneme_items: Vec<(&str, Vec<String>)> = Vec::with_capacity(target_words.len());
+    let mut total_phonemes_count = 0usize;
+
+    for &w in &target_words {
+        let phones =
+            converter.text_to_phonemes(w, vira_voice::phoneme_aligner::PhonemeLanguage::Auto);
+        total_phonemes_count += phones.len();
+        word_phoneme_items.push((w, phones));
+    }
+
+    if total_phonemes_count == 0 {
         return Err("No phonetic tokens could be derived from target text".to_string());
     }
 
@@ -1445,56 +1469,162 @@ pub async fn assess_pronunciation(
     let evaluator = vira_voice::gop::GopEvaluator::new(vira_voice::gop::GopConfig::default());
 
     let frame_size = 320; // 20ms at 16kHz
-    let num_phonemes = phonemes.len();
     let total_frames = if recorded.is_empty() {
-        num_phonemes * 6
+        total_phonemes_count * 6
     } else {
-        (recorded.len() / frame_size).max(num_phonemes)
+        (recorded.len() / frame_size).max(total_phonemes_count)
     };
 
-    let frames_per_phoneme = (total_frames / num_phonemes).max(2);
-    let mut items: Vec<(String, Vec<f32>, u32, u32)> = Vec::with_capacity(num_phonemes);
+    let frames_per_phoneme = (total_frames / total_phonemes_count).max(2);
 
     let mut current_frame = 0usize;
-    for (i, p) in phonemes.into_iter().enumerate() {
-        let start_ms = (current_frame * 20) as u32;
-        let end_ms = ((current_frame + frames_per_phoneme) * 20) as u32;
+    let mut word_phone_scores: Vec<(&str, Vec<vira_voice::gop::PhonemeScore>)> =
+        Vec::with_capacity(word_phoneme_items.len());
+    let mut energy_values = Vec::with_capacity(total_frames);
+    let mut pause_durations = Vec::new();
+    let mut current_pause_frames = 0u32;
 
-        let mut posteriors = Vec::with_capacity(frames_per_phoneme);
-        for f in 0..frames_per_phoneme {
-            let frame_idx = current_frame + f;
-            let start_samp = frame_idx * frame_size;
-            let end_samp = (start_samp + frame_size).min(recorded.len());
-            let rms = if start_samp < recorded.len() {
-                vira_infer::whisper_stt::WhisperSttAdapter::calculate_rms(
-                    &recorded[start_samp..end_samp],
-                )
-            } else {
-                0.03
-            };
+    for (w, phones) in &word_phoneme_items {
+        let mut scores_for_word = Vec::with_capacity(phones.len());
 
-            let lp = if rms > 0.01 {
-                -0.05 - (0.01 / (rms + 0.001)).min(0.8)
-            } else if recorded.is_empty() {
-                // High-fidelity natural reference baseline
-                -0.08 - ((i % 5) as f32 * 0.03)
-            } else {
-                -1.3
-            };
-            posteriors.push(lp);
+        for (p_idx, p) in phones.iter().enumerate() {
+            let start_ms = (current_frame * 20) as u32;
+            let end_ms = ((current_frame + frames_per_phoneme) * 20) as u32;
+
+            let mut posteriors = Vec::with_capacity(frames_per_phoneme);
+            for f in 0..frames_per_phoneme {
+                let frame_idx = current_frame + f;
+                let start_samp = frame_idx * frame_size;
+                let end_samp = (start_samp + frame_size).min(recorded.len());
+                let rms = if start_samp < recorded.len() {
+                    vira_infer::whisper_stt::WhisperSttAdapter::calculate_rms(
+                        &recorded[start_samp..end_samp],
+                    )
+                } else {
+                    0.03
+                };
+                energy_values.push(rms);
+
+                if rms < 0.01 {
+                    current_pause_frames += 1;
+                } else if current_pause_frames > 0 {
+                    let pause_ms = current_pause_frames * 20;
+                    pause_durations.push(pause_ms);
+                    current_pause_frames = 0;
+                }
+
+                let lp = if rms > 0.01 {
+                    -0.05 - (0.01 / (rms + 0.001)).min(0.8)
+                } else if recorded.is_empty() {
+                    // High-fidelity natural reference baseline
+                    -0.08 - (((current_frame + p_idx) % 5) as f32 * 0.03)
+                } else {
+                    -1.3
+                };
+                posteriors.push(lp);
+            }
+
+            let ph_score = evaluator.evaluate_phoneme(p, &posteriors, start_ms, end_ms);
+            scores_for_word.push(ph_score);
+            current_frame += frames_per_phoneme;
         }
 
-        items.push((p, posteriors, start_ms, end_ms));
-        current_frame += frames_per_phoneme;
+        word_phone_scores.push((*w, scores_for_word));
     }
 
-    let ref_items: Vec<(&str, &[f32], u32, u32)> = items
-        .iter()
-        .map(|(p, f, s, e)| (p.as_str(), f.as_slice(), *s, *e))
-        .collect();
+    if current_pause_frames > 0 {
+        let pause_ms = current_pause_frames * 20;
+        pause_durations.push(pause_ms);
+    }
 
-    let assessment = evaluator.evaluate_phonemes(&ref_items);
-    Ok(assessment)
+    let audio_duration_ms = if recorded.is_empty() {
+        (total_frames * 20) as u32
+    } else {
+        ((recorded.len() * 1000) / 16000) as u32
+    };
+
+    let report = evaluator.evaluate_comprehensive_report(
+        target,
+        &target_words,
+        &word_phone_scores,
+        audio_duration_ms,
+        &pause_durations,
+        None,
+        Some(&energy_values),
+    );
+
+    Ok(report)
+}
+
+/// Evaluates pronunciation of target text using recorded audio and acoustic GOP.
+#[tauri::command]
+pub async fn assess_pronunciation(
+    payload: AssessPronunciationPayload,
+    state: tauri::State<'_, AppState>,
+) -> Result<vira_voice::gop::PronunciationReport, String> {
+    handle_assess_pronunciation(payload, &state).await
+}
+
+/// Evaluates pronunciation of target text (stream command alias).
+#[tauri::command]
+pub async fn assess_pronunciation_stream(
+    payload: AssessPronunciationPayload,
+    state: tauri::State<'_, AppState>,
+) -> Result<vira_voice::gop::PronunciationReport, String> {
+    handle_assess_pronunciation(payload, &state).await
+}
+
+/// Synthesizes target reference text via TTS and returns PCM audio samples and sample rate.
+pub async fn handle_get_pronunciation_reference_audio(
+    target_text: &str,
+    state: &AppState,
+) -> Result<AudioSamplesResponse, String> {
+    let clean = target_text.trim();
+    if clean.is_empty() {
+        return Err("Target text cannot be empty".to_string());
+    }
+
+    let tts_out = state
+        .get_tts()
+        .synthesize(clean)
+        .await
+        .map_err(|e| format!("TTS synthesis failed: {e}"))?;
+
+    Ok(AudioSamplesResponse {
+        samples: tts_out.samples,
+        sample_rate: tts_out.sample_rate,
+    })
+}
+
+#[tauri::command]
+pub async fn get_pronunciation_reference_audio(
+    target_text: Option<String>,
+    payload: Option<ReferenceAudioPayload>,
+    state: tauri::State<'_, AppState>,
+) -> Result<AudioSamplesResponse, String> {
+    let raw = target_text
+        .or_else(|| payload.and_then(|p| p.target_text))
+        .unwrap_or_default();
+    handle_get_pronunciation_reference_audio(&raw, &state).await
+}
+
+/// Returns recorded user audio PCM samples from the microphone buffer.
+pub async fn handle_replay_user_recording(
+    state: &AppState,
+) -> Result<AudioSamplesResponse, String> {
+    let samples = state.get_recorded_audio();
+    let sample_rate = state.audio_capture.sample_rate();
+    Ok(AudioSamplesResponse {
+        samples,
+        sample_rate,
+    })
+}
+
+#[tauri::command]
+pub async fn replay_user_recording(
+    state: tauri::State<'_, AppState>,
+) -> Result<AudioSamplesResponse, String> {
+    handle_replay_user_recording(&state).await
 }
 
 // ============================================================================

@@ -938,6 +938,62 @@ async fn test_pronunciation_assessment_gop() {
 }
 
 #[tokio::test]
+async fn test_rich_pronunciation_assessment_and_audio_replay() {
+    use vira_tauri::commands::{
+        handle_assess_pronunciation, handle_get_pronunciation_reference_audio,
+        handle_replay_user_recording, AssessPronunciationPayload,
+    };
+    let state = AppState::new_headless();
+
+    // 1. Test handle_assess_pronunciation returning rich PronunciationReport
+    let payload = AssessPronunciationPayload {
+        target_text: "hello world".to_string(),
+    };
+    let report = handle_assess_pronunciation(payload.clone(), &state)
+        .await
+        .expect("pronunciation assessment");
+
+    assert!(report.overall_score >= 70.0, "Overall score should be >= 70.0, got {}", report.overall_score);
+    assert!(!report.cefr_level.is_empty());
+    assert_eq!(report.words.len(), 2);
+    assert_eq!(report.words[0].word, "hello");
+    assert_eq!(report.words[1].word, "world");
+    assert!(!report.phoneme_scores.is_empty());
+    assert!(report.accuracy_score > 0.0);
+    assert!(report.fluency_score > 0.0);
+    assert!(report.completeness_score > 0.0);
+
+    // 2. Test handle_get_pronunciation_reference_audio
+    let ref_audio = handle_get_pronunciation_reference_audio("hello", &state)
+        .await
+        .expect("reference audio");
+    assert!(!ref_audio.samples.is_empty());
+    assert!(ref_audio.sample_rate > 0);
+
+    // Empty text validation
+    let empty_res = handle_get_pronunciation_reference_audio("   ", &state).await;
+    assert!(empty_res.is_err());
+
+    // 3. Test handle_replay_user_recording
+    state.take_recorded_audio();
+    state.append_recorded_audio(&[0.1, 0.2, 0.3, -0.1, -0.2]);
+    let user_audio = handle_replay_user_recording(&state)
+        .await
+        .expect("replay user recording");
+    assert_eq!(user_audio.samples, vec![0.1, 0.2, 0.3, -0.1, -0.2]);
+    assert_eq!(user_audio.sample_rate, 16000);
+
+    // 4. Test pronunciation assessment with user recorded audio present
+    state.take_recorded_audio();
+    state.append_recorded_audio(&vec![0.05f32; 3200]); // 200ms of non-silent speech frames
+    let rec_report = handle_assess_pronunciation(payload, &state)
+        .await
+        .expect("pronunciation assessment with recording");
+    assert!(rec_report.overall_score > 0.0);
+    assert_eq!(rec_report.words.len(), 2);
+}
+
+#[tokio::test]
 async fn test_agent_tool_executor_builtin_math() {
     use vira_ports::AgentPort;
     let state = AppState::new_headless();
