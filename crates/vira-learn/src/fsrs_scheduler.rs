@@ -261,6 +261,21 @@ pub struct CardRecord {
     pub back: String,
     /// Optional CEFR difficulty level (e.g. "B1", "C1").
     pub cefr_level: Option<String>,
+    /// Optional International Phonetic Alphabet (IPA) pronunciation (e.g. "/prəˌnʌn.siˈeɪ.ʃən/").
+    #[serde(default)]
+    pub phonetic: Option<String>,
+    /// Optional context sentence demonstrating real-world usage.
+    #[serde(default)]
+    pub context_sentence: Option<String>,
+    /// Optional translation of the context sentence.
+    #[serde(default)]
+    pub context_translation: Option<String>,
+    /// Optional part of speech (noun, verb, adjective, phrase, etc.).
+    #[serde(default)]
+    pub part_of_speech: Option<String>,
+    /// Classification and categorization tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// FSRS memory stability (retrievability half-life in days).
     pub stability: f32,
     /// FSRS difficulty rating [1.0, 10.0].
@@ -292,6 +307,11 @@ impl CardRecord {
             front: front.into(),
             back: back.into(),
             cefr_level: None,
+            phonetic: None,
+            context_sentence: None,
+            context_translation: None,
+            part_of_speech: None,
+            tags: Vec::new(),
             stability: 0.0,
             difficulty: 0.0,
             reps: 0,
@@ -315,6 +335,35 @@ impl CardRecord {
         self
     }
 
+    /// Sets the phonetic pronunciation.
+    pub fn with_phonetic(mut self, phonetic: impl Into<String>) -> Self {
+        self.phonetic = Some(phonetic.into());
+        self
+    }
+
+    /// Sets context sentence and its translation.
+    pub fn with_context(
+        mut self,
+        sentence: impl Into<String>,
+        translation: impl Into<Option<String>>,
+    ) -> Self {
+        self.context_sentence = Some(sentence.into());
+        self.context_translation = translation.into();
+        self
+    }
+
+    /// Sets part of speech.
+    pub fn with_part_of_speech(mut self, pos: impl Into<String>) -> Self {
+        self.part_of_speech = Some(pos.into());
+        self
+    }
+
+    /// Sets tags.
+    pub fn with_tags(mut self, tags: Vec<String>) -> Self {
+        self.tags = tags;
+        self
+    }
+
     /// Returns true if this card is currently due at `current_time_ms`.
     pub fn is_due(&self, current_time_ms: u64) -> bool {
         self.due_timestamp <= current_time_ms
@@ -335,6 +384,11 @@ impl CardRecord {
             last_review: self.last_review,
             reps: self.reps,
             lapses: self.lapses,
+            phonetic: self.phonetic.clone(),
+            context_sentence: self.context_sentence.clone(),
+            context_translation: self.context_translation.clone(),
+            part_of_speech: self.part_of_speech.clone(),
+            tags: self.tags.clone(),
         }
     }
 
@@ -353,6 +407,11 @@ impl CardRecord {
             front: card.front.clone(),
             back: card.back.clone(),
             cefr_level: card.cefr_level.clone(),
+            phonetic: card.phonetic.clone(),
+            context_sentence: card.context_sentence.clone(),
+            context_translation: card.context_translation.clone(),
+            part_of_speech: card.part_of_speech.clone(),
+            tags: card.tags.clone(),
             stability: card.stability,
             difficulty: card.difficulty,
             reps: card.reps,
@@ -432,6 +491,28 @@ impl FsrsScheduler {
         CardRecord::new(front, back)
     }
 
+    /// Creates a new rich card initialized with contextual fields.
+    pub fn new_rich_card(
+        &self,
+        front: impl Into<String>,
+        back: impl Into<String>,
+        phonetic: Option<String>,
+        context_sentence: Option<String>,
+        context_translation: Option<String>,
+        part_of_speech: Option<String>,
+        cefr_level: Option<String>,
+        tags: Vec<String>,
+    ) -> CardRecord {
+        let mut card = CardRecord::new(front, back);
+        card.phonetic = phonetic;
+        card.context_sentence = context_sentence;
+        card.context_translation = context_translation;
+        card.part_of_speech = part_of_speech;
+        card.cefr_level = cefr_level;
+        card.tags = tags;
+        card
+    }
+
     /// Calculates preview intervals for all ratings using current system time.
     pub fn preview_intervals(&self, card: &CardRecord) -> PreviewIntervals {
         let now_ms = std::time::SystemTime::now()
@@ -509,6 +590,11 @@ impl FsrsScheduler {
             front: card.front.clone(),
             back: card.back.clone(),
             cefr_level: card.cefr_level.clone(),
+            phonetic: card.phonetic.clone(),
+            context_sentence: card.context_sentence.clone(),
+            context_translation: card.context_translation.clone(),
+            part_of_speech: card.part_of_speech.clone(),
+            tags: card.tags.clone(),
             stability: chosen_item.memory.stability,
             difficulty: chosen_item.memory.difficulty,
             reps,

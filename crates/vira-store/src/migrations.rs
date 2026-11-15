@@ -79,6 +79,18 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at INTEGER NOT NULL
 );
 "#,
+},
+Migration {
+    version: 2,
+    name: "002_rich_flashcards",
+    sql: r#"
+-- Extend flashcards table with pronunciation, contextual sentences, and tags
+ALTER TABLE flashcards ADD COLUMN phonetic TEXT;
+ALTER TABLE flashcards ADD COLUMN context_sentence TEXT;
+ALTER TABLE flashcards ADD COLUMN context_translation TEXT;
+ALTER TABLE flashcards ADD COLUMN part_of_speech TEXT;
+ALTER TABLE flashcards ADD COLUMN tags TEXT;
+"#,
 }];
 
 /// Migration manager for SQLite databases.
@@ -217,17 +229,82 @@ mod tests {
 
         DatabaseMigrations::run(&mut conn).expect("run migrations");
 
-        assert_eq!(DatabaseMigrations::current_version(&conn).unwrap(), 1);
+        assert_eq!(DatabaseMigrations::current_version(&conn).unwrap(), 2);
         assert!(DatabaseMigrations::is_up_to_date(&conn).unwrap());
 
         let applied = DatabaseMigrations::list_applied(&conn).expect("list applied");
-        assert_eq!(applied.len(), 1);
+        assert_eq!(applied.len(), 2);
         assert_eq!(applied[0].0, 1);
         assert_eq!(applied[0].1, "001_initial_schema");
+        assert_eq!(applied[1].0, 2);
+        assert_eq!(applied[1].1, "002_rich_flashcards");
 
         // Idempotent second run does not fail or duplicate
         DatabaseMigrations::run(&mut conn).expect("rerun migrations");
+        assert_eq!(DatabaseMigrations::current_version(&conn).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_migration_v1_to_v2_backward_compatibility() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        DatabaseMigrations::ensure_migration_table(&mut conn).expect("ensure table");
+
+        // Manually apply v1 schema only
+        let v1_migration = &MIGRATIONS[0];
+        DatabaseMigrations::apply_migration(&mut conn, v1_migration).expect("apply v1");
         assert_eq!(DatabaseMigrations::current_version(&conn).unwrap(), 1);
+
+        // Insert legacy flashcard with v1 columns
+        conn.execute(
+            r#"
+            INSERT INTO flashcards (id, word, definition, cefr_level, state, stability, difficulty, reps, lapses, due)
+            VALUES ('v1_card', 'resilient', 'kiên cường', 'B2', 2, 4.2, 3.1, 5, 0, 5000)
+            "#,
+            [],
+        )
+        .expect("insert v1 flashcard");
+
+        // Run full migrations (should upgrade v1 -> v2)
+        DatabaseMigrations::run(&mut conn).expect("upgrade to v2");
+        assert_eq!(DatabaseMigrations::current_version(&conn).unwrap(), 2);
+
+        // Verify existing card survived and new columns are NULL
+        let (word, phonetic, context_sentence, tags): (String, Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT word, phonetic, context_sentence, tags FROM flashcards WHERE id = 'v1_card'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("query upgraded card");
+
+        assert_eq!(word, "resilient");
+        assert_eq!(phonetic, None);
+        assert_eq!(context_sentence, None);
+        assert_eq!(tags, None);
+
+        // Insert rich flashcard using v2 columns
+        conn.execute(
+            r#"
+            INSERT INTO flashcards (id, word, definition, cefr_level, state, stability, difficulty, reps, lapses, due,
+                                    phonetic, context_sentence, context_translation, part_of_speech, tags)
+            VALUES ('v2_card', 'tenacious', 'bền bỉ', 'C1', 0, 0.0, 0.0, 0, 0, 1000,
+                    '/təˈneɪ.ʃəs/', 'She was tenacious in pursuing her goal.', 'Cô ấy rất bền bỉ theo đuổi mục tiêu.', 'adjective', '["c1", "exam"]')
+            "#,
+            [],
+        )
+        .expect("insert v2 rich card");
+
+        let (phonetic2, pos, tags2): (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT phonetic, part_of_speech, tags FROM flashcards WHERE id = 'v2_card'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("query v2 card");
+
+        assert_eq!(phonetic2.as_deref(), Some("/təˈneɪ.ʃəs/"));
+        assert_eq!(pos.as_deref(), Some("adjective"));
+        assert_eq!(tags2.as_deref(), Some("[\"c1\", \"exam\"]"));
     }
 
     #[test]

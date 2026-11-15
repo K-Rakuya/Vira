@@ -348,6 +348,11 @@ fn row_to_flashcard(row: &Row<'_>) -> rusqlite::Result<Flashcard> {
     let lapses: i64 = row.get(9)?;
     let due: i64 = row.get(10)?;
     let last_review: Option<i64> = row.get(11)?;
+    let phonetic: Option<String> = row.get(12)?;
+    let context_sentence: Option<String> = row.get(13)?;
+    let context_translation: Option<String> = row.get(14)?;
+    let part_of_speech: Option<String> = row.get(15)?;
+    let tags_str: Option<String> = row.get(16)?;
 
     let stability_f32 = if stability.is_finite() {
         stability as f32
@@ -358,6 +363,18 @@ fn row_to_flashcard(row: &Row<'_>) -> rusqlite::Result<Flashcard> {
         difficulty as f32
     } else {
         0.0
+    };
+
+    let tags = match tags_str {
+        Some(s) if !s.trim().is_empty() => {
+            serde_json::from_str::<Vec<String>>(&s).unwrap_or_else(|_| {
+                s.split(',')
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect()
+            })
+        }
+        _ => Vec::new(),
     };
 
     Ok(Flashcard {
@@ -373,6 +390,11 @@ fn row_to_flashcard(row: &Row<'_>) -> rusqlite::Result<Flashcard> {
         last_review: last_review.map(|lr| lr.max(0) as u64),
         reps: reps.max(0) as u32,
         lapses: lapses.max(0) as u32,
+        phonetic,
+        context_sentence,
+        context_translation,
+        part_of_speech,
+        tags,
     })
 }
 
@@ -672,11 +694,19 @@ impl StorePort for SqliteStore {
         } else {
             0.0
         };
+        let tags_json = if card.tags.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&card.tags).unwrap_or_else(|_| "[]".to_string()))
+        };
 
         conn.execute(
             r#"
-            INSERT INTO flashcards (id, word, definition, cefr_level, state, step, stability, difficulty, reps, lapses, due, last_review)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            INSERT INTO flashcards (
+                id, word, definition, cefr_level, state, step, stability, difficulty, reps, lapses, due, last_review,
+                phonetic, context_sentence, context_translation, part_of_speech, tags
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             ON CONFLICT(id) DO UPDATE SET
                 word = excluded.word,
                 definition = excluded.definition,
@@ -688,7 +718,12 @@ impl StorePort for SqliteStore {
                 reps = excluded.reps,
                 lapses = excluded.lapses,
                 due = excluded.due,
-                last_review = excluded.last_review;
+                last_review = excluded.last_review,
+                phonetic = excluded.phonetic,
+                context_sentence = excluded.context_sentence,
+                context_translation = excluded.context_translation,
+                part_of_speech = excluded.part_of_speech,
+                tags = excluded.tags;
             "#,
             params![
                 card.id,
@@ -703,6 +738,11 @@ impl StorePort for SqliteStore {
                 card.lapses as i64,
                 card.due as i64,
                 card.last_review.map(|lr| lr as i64),
+                card.phonetic,
+                card.context_sentence,
+                card.context_translation,
+                card.part_of_speech,
+                tags_json,
             ],
         )
         .map_err(|e| StoreError::Database(format!("Failed to upsert flashcard: {e}")))?;
@@ -715,7 +755,8 @@ impl StorePort for SqliteStore {
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT id, word, definition, cefr_level, state, step, stability, difficulty, reps, lapses, due, last_review
+                SELECT id, word, definition, cefr_level, state, step, stability, difficulty, reps, lapses, due, last_review,
+                       phonetic, context_sentence, context_translation, part_of_speech, tags
                 FROM flashcards
                 WHERE id = ?1;
                 "#,
@@ -773,7 +814,8 @@ impl StorePort for SqliteStore {
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT id, word, definition, cefr_level, state, step, stability, difficulty, reps, lapses, due, last_review
+                SELECT id, word, definition, cefr_level, state, step, stability, difficulty, reps, lapses, due, last_review,
+                       phonetic, context_sentence, context_translation, part_of_speech, tags
                 FROM flashcards
                 WHERE due <= ?1
                 ORDER BY due ASC, id ASC
@@ -782,8 +824,9 @@ impl StorePort for SqliteStore {
             )
             .map_err(|e| StoreError::Database(format!("Failed to prepare get_due_flashcards query: {e}")))?;
 
+        let current_time_i64 = current_time.min(i64::MAX as u64) as i64;
         let rows = stmt
-            .query_map(params![current_time as i64, limit as i64], row_to_flashcard)
+            .query_map(params![current_time_i64, limit as i64], row_to_flashcard)
             .map_err(|e| StoreError::Database(format!("Failed to execute get_due_flashcards: {e}")))?;
 
         let mut cards = Vec::new();
@@ -805,7 +848,8 @@ impl StorePort for SqliteStore {
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT id, word, definition, cefr_level, state, step, stability, difficulty, reps, lapses, due, last_review
+                SELECT id, word, definition, cefr_level, state, step, stability, difficulty, reps, lapses, due, last_review,
+                       phonetic, context_sentence, context_translation, part_of_speech, tags
                 FROM flashcards
                 ORDER BY due ASC, id ASC
                 LIMIT ?1;

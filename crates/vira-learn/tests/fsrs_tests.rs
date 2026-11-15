@@ -159,12 +159,30 @@ fn test_card_rating_conversions_and_display() {
 fn test_card_record_flashcard_conversion_and_serde() {
     let record = CardRecord::new("ubiquitous", "phổ biến khắp nơi")
         .with_id("card_101")
-        .with_cefr("C1");
+        .with_cefr("C1")
+        .with_phonetic("/juːˈbɪk.wə.təs/")
+        .with_context(
+            "Smartphones have become ubiquitous in daily life.",
+            Some("Điện thoại thông minh đã trở nên phổ biến khắp nơi trong cuộc sống hàng ngày.".to_string()),
+        )
+        .with_part_of_speech("adjective")
+        .with_tags(vec!["academic".to_string(), "c1".to_string()]);
 
     assert_eq!(record.id, "card_101");
     assert_eq!(record.front, "ubiquitous");
     assert_eq!(record.back, "phổ biến khắp nơi");
     assert_eq!(record.cefr_level.as_deref(), Some("C1"));
+    assert_eq!(record.phonetic.as_deref(), Some("/juːˈbɪk.wə.təs/"));
+    assert_eq!(
+        record.context_sentence.as_deref(),
+        Some("Smartphones have become ubiquitous in daily life.")
+    );
+    assert_eq!(
+        record.context_translation.as_deref(),
+        Some("Điện thoại thông minh đã trở nên phổ biến khắp nơi trong cuộc sống hàng ngày.")
+    );
+    assert_eq!(record.part_of_speech.as_deref(), Some("adjective"));
+    assert_eq!(record.tags, vec!["academic".to_string(), "c1".to_string()]);
     assert_eq!(record.state, CardReviewState::New);
     assert_eq!(record.reps, 0);
     assert_eq!(record.lapses, 0);
@@ -175,6 +193,17 @@ fn test_card_record_flashcard_conversion_and_serde() {
     assert_eq!(flashcard.front, "ubiquitous");
     assert_eq!(flashcard.back, "phổ biến khắp nơi");
     assert_eq!(flashcard.cefr_level.as_deref(), Some("C1"));
+    assert_eq!(flashcard.phonetic.as_deref(), Some("/juːˈbɪk.wə.təs/"));
+    assert_eq!(
+        flashcard.context_sentence.as_deref(),
+        Some("Smartphones have become ubiquitous in daily life.")
+    );
+    assert_eq!(
+        flashcard.context_translation.as_deref(),
+        Some("Điện thoại thông minh đã trở nên phổ biến khắp nơi trong cuộc sống hàng ngày.")
+    );
+    assert_eq!(flashcard.part_of_speech.as_deref(), Some("adjective"));
+    assert_eq!(flashcard.tags, vec!["academic".to_string(), "c1".to_string()]);
     assert_eq!(flashcard.state, 0);
 
     // Convert back from Flashcard
@@ -183,6 +212,11 @@ fn test_card_record_flashcard_conversion_and_serde() {
     assert_eq!(restored.front, record.front);
     assert_eq!(restored.back, record.back);
     assert_eq!(restored.cefr_level, record.cefr_level);
+    assert_eq!(restored.phonetic, record.phonetic);
+    assert_eq!(restored.context_sentence, record.context_sentence);
+    assert_eq!(restored.context_translation, record.context_translation);
+    assert_eq!(restored.part_of_speech, record.part_of_speech);
+    assert_eq!(restored.tags, record.tags);
     assert_eq!(restored.state, record.state);
 
     // Serde roundtrip
@@ -653,4 +687,97 @@ fn test_cefr_short_text_false_b1_suppression() {
     let short_text = "I cry because sad.";
     let level = CefrLevel::assess_text(short_text);
     assert!(level <= CefrLevel::A2);
+}
+
+#[test]
+fn test_fsrs_review_preserves_rich_fields() {
+    let scheduler = FsrsScheduler::with_retention(0.9);
+    let card = scheduler.new_rich_card(
+        "resilient",
+        "kiên cường",
+        Some("/rɪˈzɪl.jənt/".to_string()),
+        Some("He is resilient despite many setbacks.".to_string()),
+        Some("Anh ấy rất kiên cường bất chấp nhiều khó khăn.".to_string()),
+        Some("adjective".to_string()),
+        Some("B2".to_string()),
+        vec!["personality".to_string(), "b2".to_string()],
+    );
+
+    let reviewed = scheduler.review_at(&card, CardRating::Good, 1_700_000_000_000);
+    assert_eq!(reviewed.phonetic.as_deref(), Some("/rɪˈzɪl.jənt/"));
+    assert_eq!(
+        reviewed.context_sentence.as_deref(),
+        Some("He is resilient despite many setbacks.")
+    );
+    assert_eq!(
+        reviewed.context_translation.as_deref(),
+        Some("Anh ấy rất kiên cường bất chấp nhiều khó khăn.")
+    );
+    assert_eq!(reviewed.part_of_speech.as_deref(), Some("adjective"));
+    assert_eq!(reviewed.cefr_level.as_deref(), Some("B2"));
+    assert_eq!(reviewed.tags, vec!["personality".to_string(), "b2".to_string()]);
+    assert_eq!(reviewed.reps, 1);
+}
+
+#[tokio::test]
+async fn test_async_spaced_repetition_service_rich_card_lifecycle() {
+    let mock_store = Arc::new(MockStore::default());
+    let service = SpacedRepetitionService::new(mock_store);
+
+    // 1. Create rich card via SpacedRepetitionPort
+    let card = service
+        .create_rich_card(
+            "ephemeral",
+            "phù du, sớm nở tối tàn",
+            Some("/ɪˈfem.ər.əl/".to_string()),
+            Some("Fame in the digital age is often ephemeral.".to_string()),
+            Some("Sự nổi tiếng trong thời đại số thường rất phù du.".to_string()),
+            Some("adjective".to_string()),
+            Some("C2".to_string()),
+            vec!["philosophy".to_string(), "c2".to_string()],
+        )
+        .await
+        .expect("create rich card");
+
+    assert_eq!(card.front, "ephemeral");
+    assert_eq!(card.phonetic.as_deref(), Some("/ɪˈfem.ər.əl/"));
+    assert_eq!(card.tags, vec!["philosophy".to_string(), "c2".to_string()]);
+
+    // 2. Fetch card and verify rich fields
+    let fetched = service
+        .get_card(&card.id)
+        .await
+        .expect("get card")
+        .expect("found");
+    assert_eq!(fetched.phonetic.as_deref(), Some("/ɪˈfem.ər.əl/"));
+    assert_eq!(
+        fetched.context_sentence.as_deref(),
+        Some("Fame in the digital age is often ephemeral.")
+    );
+    assert_eq!(
+        fetched.context_translation.as_deref(),
+        Some("Sự nổi tiếng trong thời đại số thường rất phù du.")
+    );
+    assert_eq!(fetched.part_of_speech.as_deref(), Some("adjective"));
+    assert_eq!(fetched.cefr_level.as_deref(), Some("C2"));
+    assert_eq!(fetched.tags, vec!["philosophy".to_string(), "c2".to_string()]);
+
+    // 3. Review card and verify persistence of rich fields
+    let reviewed = service
+        .review_card(&card.id, CardRating::Good)
+        .await
+        .expect("review rich card");
+    assert_eq!(reviewed.phonetic.as_deref(), Some("/ɪˈfem.ər.əl/"));
+    assert_eq!(reviewed.tags.len(), 2);
+    assert_eq!(reviewed.reps, 1);
+
+    // 4. Fetch after review
+    let re_fetched = service
+        .get_card(&card.id)
+        .await
+        .expect("re-fetch")
+        .expect("found");
+    assert_eq!(re_fetched.reps, 1);
+    assert_eq!(re_fetched.phonetic.as_deref(), Some("/ɪˈfem.ər.əl/"));
+    assert_eq!(re_fetched.tags, vec!["philosophy".to_string(), "c2".to_string()]);
 }
