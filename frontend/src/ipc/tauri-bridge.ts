@@ -185,13 +185,19 @@ class MockIPC {
         return hits as T;
       }
 
+      case 'create_rich_flashcard':
       case 'create_flashcard': {
         const payload = args.payload || {};
         const card = {
-          id: 'fc_' + Date.now(),
+          id: 'fc_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
           front: payload.front,
           back: payload.back,
+          phonetic: payload.phonetic || '/fəˈnɛtɪk/',
+          context_sentence: payload.context_sentence || '',
+          context_translation: payload.context_translation || '',
+          part_of_speech: payload.part_of_speech || 'phrase',
           cefr_level: payload.cefr_level || 'A1',
+          tags: Array.isArray(payload.tags) ? payload.tags : ['conversation'],
           state: 0,
           stability: 2.0,
           difficulty: 5.0,
@@ -203,6 +209,22 @@ class MockIPC {
         cards.push(card);
         this.setItem('vira_mock_cards', JSON.stringify(cards));
         return card as T;
+      }
+
+      case 'generate_flashcard_ai_suggestion': {
+        const text = String(args.text || args.payload?.text || 'Xin chào, tôi là Vira').trim();
+        const words = text.split(/\s+/).filter(Boolean);
+        const front = words[0] || 'Vira';
+        return {
+          front,
+          back: 'Từ vựng quan trọng được trích xuất từ cuộc trò chuyện',
+          phonetic: '/ˈvaɪrə/',
+          context_sentence: text,
+          context_translation: 'Bản dịch ngữ cảnh tự động của Vira.',
+          part_of_speech: 'phrase',
+          cefr_level: 'B1',
+          tags: ['auto-extracted', 'chat'],
+        } as T;
       }
 
       case 'list_flashcards':
@@ -234,31 +256,87 @@ class MockIPC {
 
       case 'preview_flashcard_intervals': {
         return {
-          again: 1,
-          hard: 2,
-          good: 4,
-          easy: 8,
+          again: '< 10m',
+          hard: '1 ngày',
+          good: '3 ngày',
+          easy: '7 ngày',
         } as T;
       }
 
+      case 'get_pronunciation_reference_audio': {
+        const target = String(args.target_text || args.payload?.target_text || 'Xin chào');
+        return {
+          target_text: target,
+          audio_base64: 'UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=',
+          sample_rate: 24000,
+          status: 'ok',
+        } as T;
+      }
+
+      case 'replay_user_recording': {
+        return {
+          audio_base64: 'UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=',
+          sample_rate: 16000,
+          status: 'ok',
+        } as T;
+      }
+
+      case 'assess_pronunciation_stream':
       case 'assess_pronunciation': {
-        const target = args.payload?.target_text || args.target_text || 'hello';
-        const words = target.split(/\s+/).filter(Boolean);
-        const phonemeScores = words.map((w: string, idx: number) => ({
-          phoneme: w.toUpperCase(),
-          score: 85 + (idx % 3) * 5,
-          accuracy: 'correct',
-          start_ms: idx * 250,
-          end_ms: (idx + 1) * 250,
-          viseme_hint: { aa: 0.8, ih: 0.1, ou: 0, ee: 0.1, oh: 0 },
-          recommended_viseme: 'aa',
-        }));
+        const target = args.payload?.target_text || args.target_text || 'Xin chào';
+        const rawWords = target.split(/\s+/).filter(Boolean);
+        const words = rawWords.map((w: string, idx: number) => {
+          const accScore = 88 + (idx % 3) * 4;
+          return {
+            word: w,
+            accuracy_score: accScore,
+            error_type: accScore >= 80 ? 'None' : 'Mispronounced',
+            phonemes: [
+              {
+                phoneme: w.slice(0, 1) || 'a',
+                score: accScore + 2,
+                accuracy: 'correct',
+                viseme_hint: { aa: 0.8, ih: 0.1, ou: 0, ee: 0.1, oh: 0 },
+                recommended_viseme: 'aa',
+              },
+              {
+                phoneme: w.slice(1) || 'h',
+                score: accScore - 2,
+                accuracy: accScore >= 80 ? 'correct' : 'minorflaw',
+                viseme_hint: { aa: 0.1, ih: 0.7, ou: 0, ee: 0.2, oh: 0 },
+                recommended_viseme: 'ih',
+              },
+            ],
+          };
+        });
+
+        const phonemeScores = words.flatMap((w: any, wIdx: number) =>
+          w.phonemes.map((p: any, pIdx: number) => ({
+            phoneme: p.phoneme,
+            score: p.score,
+            accuracy: p.accuracy,
+            start_ms: (wIdx * 2 + pIdx) * 150,
+            end_ms: (wIdx * 2 + pIdx + 1) * 150,
+            viseme_hint: p.viseme_hint,
+            recommended_viseme: p.recommended_viseme,
+          }))
+        );
+
         return {
           overall_score: 91.5,
-          accuracy: 'correct',
+          cefr_level: 'C1',
+          accuracy_score: 92.0,
+          fluency_score: 89.0,
+          completeness_score: 95.0,
+          prosody_score: 88.0,
+          words,
           phoneme_scores: phonemeScores,
           mispronounced_count: 0,
-          total_phonemes: phonemeScores.len,
+          total_phonemes: phonemeScores.length,
+          feedback_tips: [
+            'Ngữ điệu và trọng âm câu tự nhiên, nhịp điệu nói chuẩn người bản xứ.',
+            'Mở rộng khẩu hình vòm họng hơn một chút ở các nguyên âm để tăng độ dày âm.',
+          ],
         } as T;
       }
 
