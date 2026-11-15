@@ -216,6 +216,8 @@ pub fn run() {
             crate::commands::delete_document,
             crate::commands::search_knowledge,
             crate::commands::create_flashcard,
+            crate::commands::create_rich_flashcard,
+            crate::commands::generate_flashcard_ai_suggestion,
             crate::commands::list_flashcards,
             crate::commands::get_due_flashcards,
             crate::commands::review_flashcard,

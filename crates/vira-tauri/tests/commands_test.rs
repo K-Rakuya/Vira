@@ -911,6 +911,110 @@ async fn test_flashcard_lifecycle_fsrs() {
 }
 
 #[tokio::test]
+async fn test_rich_flashcard_and_ai_suggestion_commands() {
+    use vira_learn::SpacedRepetitionPort;
+    use vira_tauri::commands::{
+        handle_create_rich_flashcard, handle_generate_flashcard_ai_suggestion,
+        CreateRichFlashcardPayload,
+    };
+    let state = AppState::new_headless();
+
+    // 1. Test validation error on empty fields
+    let invalid_payload = CreateRichFlashcardPayload {
+        front: "   ".to_string(),
+        back: "meaning".to_string(),
+        phonetic: None,
+        context_sentence: None,
+        context_translation: None,
+        part_of_speech: None,
+        cefr_level: None,
+        tags: None,
+    };
+    assert!(handle_create_rich_flashcard(invalid_payload, &state).await.is_err());
+
+    // 2. Test handle_create_rich_flashcard with all rich contextual fields
+    let payload = CreateRichFlashcardPayload {
+        front: "serendipity".to_string(),
+        back: "sự tình cờ may mắn".to_string(),
+        phonetic: Some("/ˌser.ənˈdɪp.ə.ti/".to_string()),
+        context_sentence: Some("Finding this cafe was serendipity.".to_string()),
+        context_translation: Some("Tìm thấy quán này đúng là duyên may.".to_string()),
+        part_of_speech: Some("noun".to_string()),
+        cefr_level: Some("C1".to_string()),
+        tags: Some(vec!["c1".to_string(), "exam".to_string()]),
+    };
+
+    let card = handle_create_rich_flashcard(payload, &state)
+        .await
+        .expect("create rich flashcard");
+
+    assert_eq!(card.front, "serendipity");
+    assert_eq!(card.back, "sự tình cờ may mắn");
+    assert_eq!(card.phonetic.as_deref(), Some("/ˌser.ənˈdɪp.ə.ti/"));
+    assert_eq!(
+        card.context_sentence.as_deref(),
+        Some("Finding this cafe was serendipity.")
+    );
+    assert_eq!(
+        card.context_translation.as_deref(),
+        Some("Tìm thấy quán này đúng là duyên may.")
+    );
+    assert_eq!(card.part_of_speech.as_deref(), Some("noun"));
+    assert_eq!(card.cefr_level.as_deref(), Some("C1"));
+    assert_eq!(card.tags, vec!["c1".to_string(), "exam".to_string()]);
+
+    // Verify stored and retrievable via learn port
+    let fetched = state
+        .learn
+        .get_card(&card.id)
+        .await
+        .expect("get card")
+        .expect("found card");
+    assert_eq!(fetched.phonetic.as_deref(), Some("/ˌser.ənˈdɪp.ə.ti/"));
+    assert_eq!(fetched.tags, vec!["c1".to_string(), "exam".to_string()]);
+
+    // 3. Test handle_generate_flashcard_ai_suggestion
+    assert!(handle_generate_flashcard_ai_suggestion("   ", &state).await.is_err());
+
+    let sentence = "The pronunciation of this phrase is extraordinary.";
+    let suggestion = handle_generate_flashcard_ai_suggestion(sentence, &state)
+        .await
+        .expect("generate suggestion");
+
+    assert_eq!(suggestion.front, "extraordinary");
+    assert!(suggestion.phonetic.is_some());
+    assert_eq!(
+        suggestion.context_sentence.as_deref(),
+        Some(sentence)
+    );
+    assert!(suggestion.context_translation.is_some());
+    assert_eq!(suggestion.part_of_speech.as_deref(), Some("adjective"));
+    assert_eq!(suggestion.cefr_level.as_deref(), Some("B2"));
+    assert!(suggestion.tags.contains(&"ai-suggestion".to_string()));
+
+    // 4. Create rich card directly from AI suggestion
+    let created_from_ai = handle_create_rich_flashcard(
+        CreateRichFlashcardPayload {
+            front: suggestion.front,
+            back: suggestion.back,
+            phonetic: suggestion.phonetic,
+            context_sentence: suggestion.context_sentence,
+            context_translation: suggestion.context_translation,
+            part_of_speech: suggestion.part_of_speech,
+            cefr_level: suggestion.cefr_level,
+            tags: Some(suggestion.tags),
+        },
+        &state,
+    )
+    .await
+    .expect("create card from ai suggestion");
+
+    assert_eq!(created_from_ai.front, "extraordinary");
+    assert_eq!(created_from_ai.part_of_speech.as_deref(), Some("adjective"));
+    assert_eq!(created_from_ai.cefr_level.as_deref(), Some("B2"));
+}
+
+#[tokio::test]
 async fn test_pronunciation_assessment_gop() {
     let _state = AppState::new_headless();
 

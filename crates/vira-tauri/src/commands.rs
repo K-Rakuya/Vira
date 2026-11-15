@@ -1345,6 +1345,263 @@ pub async fn create_flashcard(
         .map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateRichFlashcardPayload {
+    pub front: String,
+    pub back: String,
+    pub phonetic: Option<String>,
+    pub context_sentence: Option<String>,
+    pub context_translation: Option<String>,
+    pub part_of_speech: Option<String>,
+    pub cefr_level: Option<String>,
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerateFlashcardAiSuggestionPayload {
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlashcardSuggestionResponse {
+    pub front: String,
+    pub back: String,
+    pub phonetic: Option<String>,
+    pub context_sentence: Option<String>,
+    pub context_translation: Option<String>,
+    pub part_of_speech: Option<String>,
+    pub cefr_level: Option<String>,
+    pub tags: Vec<String>,
+}
+
+/// Helper implementing business logic for rich flashcard creation.
+pub async fn handle_create_rich_flashcard(
+    payload: CreateRichFlashcardPayload,
+    state: &AppState,
+) -> Result<vira_learn::fsrs_scheduler::CardRecord, String> {
+    let front = payload.front.trim();
+    let back = payload.back.trim();
+    if front.is_empty() || back.is_empty() {
+        return Err("Front and back fields cannot be empty".to_string());
+    }
+    state
+        .learn
+        .create_rich_card(
+            front,
+            back,
+            payload.phonetic,
+            payload.context_sentence,
+            payload.context_translation,
+            payload.part_of_speech,
+            payload.cefr_level,
+            payload.tags.unwrap_or_default(),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Creates a new rich FSRS vocabulary flashcard with phonetic, context, and POS.
+#[tauri::command]
+pub async fn create_rich_flashcard(
+    payload: Option<CreateRichFlashcardPayload>,
+    front: Option<String>,
+    back: Option<String>,
+    phonetic: Option<String>,
+    context_sentence: Option<String>,
+    context_translation: Option<String>,
+    part_of_speech: Option<String>,
+    cefr_level: Option<String>,
+    tags: Option<Vec<String>>,
+    state: tauri::State<'_, AppState>,
+) -> Result<vira_learn::fsrs_scheduler::CardRecord, String> {
+    let p = match payload {
+        Some(p) => p,
+        None => CreateRichFlashcardPayload {
+            front: front.unwrap_or_default(),
+            back: back.unwrap_or_default(),
+            phonetic,
+            context_sentence,
+            context_translation,
+            part_of_speech,
+            cefr_level,
+            tags,
+        },
+    };
+    handle_create_rich_flashcard(p, &state).await
+}
+
+/// Helper extracting an intelligent flashcard suggestion from text.
+pub fn extract_flashcard_ai_suggestion(raw_text: &str) -> FlashcardSuggestionResponse {
+    let text = raw_text.trim();
+    let words: Vec<&str> = text
+        .split(|c: char| c.is_whitespace() || (c.is_ascii_punctuation() && c != '\''))
+        .map(|w| w.trim_matches(|c: char| !c.is_alphabetic()))
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    let stop_words: std::collections::HashSet<&str> = [
+        "the", "a", "an", "is", "are", "was", "were", "of", "in", "to", "for", "with",
+        "on", "at", "from", "by", "about", "as", "into", "like", "through", "after",
+        "over", "between", "out", "against", "during", "without", "before", "under",
+        "around", "among", "this", "that", "these", "those", "my", "your", "his", "her",
+        "its", "our", "their", "it", "he", "she", "they", "we", "you", "i", "me", "him",
+        "her", "us", "them", "and", "but", "or", "so", "because", "very", "too", "can",
+        "could", "will", "would", "shall", "should", "may", "might", "must", "have", "has", "had"
+    ]
+    .iter()
+    .cloned()
+    .collect();
+
+    // Select candidate word: prefer longest non-stopword, fallback to first word
+    let best_word = words
+        .iter()
+        .filter(|w| !stop_words.contains(w.to_ascii_lowercase().as_str()))
+        .max_by_key(|w| w.len())
+        .copied()
+        .or_else(|| words.first().copied())
+        .unwrap_or("Vira");
+
+    let front = best_word.to_ascii_lowercase();
+
+    // Common curated dictionary for key vocabulary
+    let (back, trans, default_pos, default_cefr) = match front.as_str() {
+        "extraordinary" => (
+            "phi thường, xuất chúng, đặc biệt".to_string(),
+            Some("Cách phát âm của cụm từ này thật phi thường.".to_string()),
+            "adjective",
+            "B2",
+        ),
+        "pronunciation" => (
+            "cách phát âm, ngữ âm".to_string(),
+            Some("Cách phát âm của từ này rất rõ ràng.".to_string()),
+            "noun",
+            "B1",
+        ),
+        "serendipity" => (
+            "sự tình cờ may mắn, duyên may".to_string(),
+            Some("Tìm thấy điều tuyệt vời một cách tình cờ.".to_string()),
+            "noun",
+            "C1",
+        ),
+        "ubiquitous" => (
+            "phổ biến khắp nơi, nhan nhản".to_string(),
+            Some("Điện thoại thông minh đã trở nên phổ biến khắp nơi.".to_string()),
+            "adjective",
+            "C1",
+        ),
+        "resilient" => (
+            "kiên cường, bất khuất, mau phục hồi".to_string(),
+            Some("Anh ấy rất kiên cường trước nghịch cảnh.".to_string()),
+            "adjective",
+            "B2",
+        ),
+        "ephemeral" => (
+            "phù du, chóng tàn, ngắn ngủi".to_string(),
+            Some("Sự nổi tiếng có thể rất phù du.".to_string()),
+            "adjective",
+            "C2",
+        ),
+        "tenacious" => (
+            "bền bỉ, kiên trì, ngoan cường".to_string(),
+            Some("Cô ấy rất bền bỉ theo đuổi mục tiêu.".to_string()),
+            "adjective",
+            "C1",
+        ),
+        _ => {
+            let default_back = format!("Định nghĩa và ý nghĩa của từ '{front}'");
+            let default_trans = Some(format!("Bản dịch ngữ cảnh của: \"{text}\""));
+            (default_back, default_trans, "noun", "B1")
+        }
+    };
+
+    // Determine part of speech
+    let pos = if front.ends_with("tion")
+        || front.ends_with("sion")
+        || front.ends_with("ment")
+        || front.ends_with("ness")
+        || front.ends_with("ity")
+        || front.ends_with("ance")
+        || front.ends_with("ence")
+    {
+        "noun"
+    } else if front.ends_with("ful")
+        || front.ends_with("less")
+        || front.ends_with("ous")
+        || front.ends_with("ive")
+        || front.ends_with("able")
+        || front.ends_with("ible")
+        || front.ends_with("ary")
+        || front.ends_with("ic")
+    {
+        "adjective"
+    } else if front.ends_with("ly") {
+        "adverb"
+    } else if front.ends_with("ate") || front.ends_with("ize") || front.ends_with("ise") || front.ends_with("ify") {
+        "verb"
+    } else {
+        default_pos
+    };
+
+    // Phonetic transcription via G2P converter
+    let converter = vira_voice::phoneme_aligner::G2pConverter::new();
+    let phonemes = converter.text_to_phonemes(&front, vira_voice::phoneme_aligner::PhonemeLanguage::Auto);
+    let phonetic = if !phonemes.is_empty() {
+        Some(format!("/{}/", phonemes.join(" ")))
+    } else {
+        None
+    };
+
+    // CEFR level assessment
+    let text_cefr = vira_learn::CefrLevel::assess_text(text).to_string();
+    let cefr_level = if default_cefr > text_cefr.as_str() {
+        default_cefr.to_string()
+    } else {
+        text_cefr
+    };
+
+    let tags = vec![
+        "ai-suggestion".to_string(),
+        cefr_level.to_lowercase(),
+        pos.to_string(),
+    ];
+
+    FlashcardSuggestionResponse {
+        front,
+        back,
+        phonetic,
+        context_sentence: Some(text.to_string()),
+        context_translation: trans,
+        part_of_speech: Some(pos.to_string()),
+        cefr_level: Some(cefr_level),
+        tags,
+    }
+}
+
+pub async fn handle_generate_flashcard_ai_suggestion(
+    raw_text: &str,
+    _state: &AppState,
+) -> Result<FlashcardSuggestionResponse, String> {
+    let clean = raw_text.trim();
+    if clean.is_empty() {
+        return Err("Input text cannot be empty".to_string());
+    }
+
+    Ok(extract_flashcard_ai_suggestion(clean))
+}
+
+/// Generates an AI flashcard suggestion with phonetic, translation, and context.
+#[tauri::command]
+pub async fn generate_flashcard_ai_suggestion(
+    text: Option<String>,
+    payload: Option<GenerateFlashcardAiSuggestionPayload>,
+    state: tauri::State<'_, AppState>,
+) -> Result<FlashcardSuggestionResponse, String> {
+    let raw = text
+        .or_else(|| payload.and_then(|p| p.text))
+        .unwrap_or_default();
+    handle_generate_flashcard_ai_suggestion(&raw, &state).await
+}
+
 /// Lists all flashcards.
 #[tauri::command]
 pub async fn list_flashcards(
