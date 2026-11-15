@@ -129,6 +129,21 @@ pub struct Flashcard {
     pub reps: u32,
     /// Total lapses / forgot count.
     pub lapses: u32,
+    /// Optional International Phonetic Alphabet (IPA) pronunciation (e.g. "/prəˌnʌn.siˈeɪ.ʃən/").
+    #[serde(default)]
+    pub phonetic: Option<String>,
+    /// Optional context sentence demonstrating real-world usage.
+    #[serde(default)]
+    pub context_sentence: Option<String>,
+    /// Optional translation of the context sentence.
+    #[serde(default)]
+    pub context_translation: Option<String>,
+    /// Optional part of speech (noun, verb, adjective, phrase, etc.).
+    #[serde(default)]
+    pub part_of_speech: Option<String>,
+    /// Classification and categorization tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 impl Flashcard {
@@ -151,12 +166,46 @@ impl Flashcard {
             last_review: None,
             reps: 0,
             lapses: 0,
+            phonetic: None,
+            context_sentence: None,
+            context_translation: None,
+            part_of_speech: None,
+            tags: Vec::new(),
         }
     }
 
     /// Sets the CEFR difficulty level.
     pub fn with_cefr_level(mut self, level: impl Into<String>) -> Self {
         self.cefr_level = Some(level.into());
+        self
+    }
+
+    /// Sets the phonetic pronunciation.
+    pub fn with_phonetic(mut self, phonetic: impl Into<String>) -> Self {
+        self.phonetic = Some(phonetic.into());
+        self
+    }
+
+    /// Sets context sentence and its translation.
+    pub fn with_context(
+        mut self,
+        sentence: impl Into<String>,
+        translation: impl Into<Option<String>>,
+    ) -> Self {
+        self.context_sentence = Some(sentence.into());
+        self.context_translation = translation.into();
+        self
+    }
+
+    /// Sets part of speech.
+    pub fn with_part_of_speech(mut self, pos: impl Into<String>) -> Self {
+        self.part_of_speech = Some(pos.into());
+        self
+    }
+
+    /// Sets tags.
+    pub fn with_tags(mut self, tags: Vec<String>) -> Self {
+        self.tags = tags;
         self
     }
 

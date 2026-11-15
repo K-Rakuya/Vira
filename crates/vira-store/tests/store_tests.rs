@@ -561,3 +561,96 @@ async fn test_nested_directory_creation_on_open() {
         .expect("found");
     assert_eq!(loaded.front, "depth");
 }
+
+#[tokio::test]
+async fn test_rich_card_record_sqlite_persistence() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let db_path = temp_dir.path().join("rich_cards.db");
+    let store = SqliteStore::open(&db_path).expect("open store");
+
+    // 1. Create a rich flashcard with phonetic, context, POS, and tags
+    let rich_card = Flashcard::new("c_rich_1", "serendipity", "sự tình cờ may mắn")
+        .with_cefr_level("C1")
+        .with_phonetic("/ˌser.ənˈdɪp.ə.ti/")
+        .with_context(
+            "Finding this cozy cafe was pure serendipity.",
+            Some("Tìm thấy quán cà phê ấm cúng này đúng là một sự tình cờ may mắn.".to_string()),
+        )
+        .with_part_of_speech("noun")
+        .with_tags(vec!["ielts".to_string(), "vocabulary".to_string(), "c1".to_string()]);
+
+    store.save_flashcard(&rich_card).await.expect("save rich card");
+
+    // 2. Fetch and assert all rich fields are accurately retrieved
+    let loaded = store
+        .get_flashcard("c_rich_1")
+        .await
+        .expect("get rich card")
+        .expect("card exists");
+
+    assert_eq!(loaded.id, "c_rich_1");
+    assert_eq!(loaded.front, "serendipity");
+    assert_eq!(loaded.back, "sự tình cờ may mắn");
+    assert_eq!(loaded.cefr_level.as_deref(), Some("C1"));
+    assert_eq!(loaded.phonetic.as_deref(), Some("/ˌser.ənˈdɪp.ə.ti/"));
+    assert_eq!(
+        loaded.context_sentence.as_deref(),
+        Some("Finding this cozy cafe was pure serendipity.")
+    );
+    assert_eq!(
+        loaded.context_translation.as_deref(),
+        Some("Tìm thấy quán cà phê ấm cúng này đúng là một sự tình cờ may mắn.")
+    );
+    assert_eq!(loaded.part_of_speech.as_deref(), Some("noun"));
+    assert_eq!(
+        loaded.tags,
+        vec!["ielts".to_string(), "vocabulary".to_string(), "c1".to_string()]
+    );
+
+    // 3. Update rich card and verify persistence
+    let mut updated_card = loaded.clone();
+    updated_card.tags.push("favorites".to_string());
+    updated_card.part_of_speech = Some("noun/phrase".to_string());
+    store.save_flashcard(&updated_card).await.expect("update rich card");
+
+    let re_loaded = store
+        .get_flashcard("c_rich_1")
+        .await
+        .expect("get updated card")
+        .expect("card exists");
+    assert_eq!(
+        re_loaded.tags,
+        vec![
+            "ielts".to_string(),
+            "vocabulary".to_string(),
+            "c1".to_string(),
+            "favorites".to_string()
+        ]
+    );
+    assert_eq!(re_loaded.part_of_speech.as_deref(), Some("noun/phrase"));
+
+    // 4. Test listing and due queries preserve rich fields
+    let list = store.list_flashcards(10).await.expect("list cards");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].phonetic.as_deref(), Some("/ˌser.ənˈdɪp.ə.ti/"));
+    assert_eq!(list[0].tags.len(), 4);
+
+    let due = store.get_due_flashcards(u64::MAX, 10).await.expect("due cards");
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].phonetic.as_deref(), Some("/ˌser.ənˈdɪp.ə.ti/"));
+
+    // 5. Backwards compatibility: legacy card without rich fields defaults cleanly
+    let legacy_card = Flashcard::new("c_legacy", "apple", "quả táo");
+    store.save_flashcard(&legacy_card).await.expect("save legacy card");
+
+    let loaded_legacy = store
+        .get_flashcard("c_legacy")
+        .await
+        .expect("get legacy card")
+        .expect("exists");
+    assert_eq!(loaded_legacy.phonetic, None);
+    assert_eq!(loaded_legacy.context_sentence, None);
+    assert_eq!(loaded_legacy.context_translation, None);
+    assert_eq!(loaded_legacy.part_of_speech, None);
+    assert!(loaded_legacy.tags.is_empty());
+}

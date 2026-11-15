@@ -36,6 +36,19 @@ pub trait SpacedRepetitionPort: Send + Sync {
         cefr_level: Option<String>,
     ) -> Result<CardRecord, LearnError>;
 
+    /// Creates and stores a new rich flashcard with phonetic pronunciation, context sentence, part of speech, and tags.
+    async fn create_rich_card(
+        &self,
+        front: &str,
+        back: &str,
+        phonetic: Option<String>,
+        context_sentence: Option<String>,
+        context_translation: Option<String>,
+        part_of_speech: Option<String>,
+        cefr_level: Option<String>,
+        tags: Vec<String>,
+    ) -> Result<CardRecord, LearnError>;
+
     /// Reviews an existing flashcard with a learner rating.
     async fn review_card(
         &self,
@@ -118,6 +131,33 @@ impl SpacedRepetitionPort for SpacedRepetitionService {
     ) -> Result<CardRecord, LearnError> {
         let mut card = self.scheduler.new_card(front, back);
         card.cefr_level = cefr_level;
+
+        let flashcard = card.to_flashcard();
+        self.store.save_flashcard(&flashcard).await?;
+        Ok(card)
+    }
+
+    async fn create_rich_card(
+        &self,
+        front: &str,
+        back: &str,
+        phonetic: Option<String>,
+        context_sentence: Option<String>,
+        context_translation: Option<String>,
+        part_of_speech: Option<String>,
+        cefr_level: Option<String>,
+        tags: Vec<String>,
+    ) -> Result<CardRecord, LearnError> {
+        let card = self.scheduler.new_rich_card(
+            front,
+            back,
+            phonetic,
+            context_sentence,
+            context_translation,
+            part_of_speech,
+            cefr_level,
+            tags,
+        );
 
         let flashcard = card.to_flashcard();
         self.store.save_flashcard(&flashcard).await?;
