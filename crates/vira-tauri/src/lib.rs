@@ -222,6 +222,9 @@ pub fn run() {
             crate::commands::delete_flashcard,
             crate::commands::preview_flashcard_intervals,
             crate::commands::assess_pronunciation,
+            crate::commands::assess_pronunciation_stream,
+            crate::commands::get_pronunciation_reference_audio,
+            crate::commands::replay_user_recording,
             crate::commands::execute_tool,
         ])
         .run(tauri::generate_context!())
