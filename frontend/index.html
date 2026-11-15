@@ -72,8 +72,14 @@
 
       <div id="subtitle-card" class="subtitle-card interactive active" data-state="idle">
         <div class="subtitle-head">
-          <span class="status-dot" aria-hidden="true"></span>
-          <span id="subtitle-badge" class="subtitle-badge">Vira · Ready</span>
+          <div class="subtitle-head-left">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="subtitle-badge" class="subtitle-badge">Vira · Ready</span>
+          </div>
+          <button id="btn-create-card-from-subtitle" class="btn-subtitle-action" type="button" title="Tạo thẻ flashcard từ câu này">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            <span>+ Tạo thẻ từ câu này</span>
+          </button>
         </div>
         <div id="subtitle-text" class="subtitle-text" aria-live="polite">Xin chào! Tôi là Vira, trợ lý ảo 3D đồng hành cùng bạn. Bạn cần tôi hỗ trợ gì hôm nay?</div>
       </div>
@@ -237,16 +243,56 @@
     <!-- Tab 1: Study / Review -->
     <div id="tab-fc-study" class="tab-content active">
       <div id="fc-study-box" class="flashcard-study-container">
-        <div id="fc-active-card" class="flashcard-card">
-          <div class="fc-level-tag" id="fc-card-level">A1</div>
-          <div class="fc-front-text" id="fc-card-front">Nhấn "Bắt đầu ôn tập" để học từ vựng</div>
-          <div class="fc-divider"></div>
-          <div class="fc-back-text" id="fc-card-back" hidden>Nghĩa của từ</div>
+        <!-- Session Progress Bar -->
+        <div class="fc-session-progress">
+          <div class="fc-session-info">
+            <span class="fc-session-badge">Phiên học FSRS</span>
+            <span id="fc-session-progress-text" class="fc-session-text">Thẻ 1 / 1</span>
+          </div>
+          <div class="progress-track">
+            <div id="fc-session-progress-bar" class="progress-fill" style="width: 100%;"></div>
+          </div>
         </div>
 
-        <button id="btn-fc-reveal" class="btn-primary" type="button">Hiện đáp án</button>
+        <!-- 3D Interactive Flip Card -->
+        <div id="fc-card-3d" class="flashcard-card-3d" role="region" aria-label="3D Flashcard">
+          <div class="card-inner">
+            <!-- Front Face -->
+            <div class="card-face card-face-front" id="fc-active-card">
+              <div class="fc-card-header">
+                <span class="fc-level-tag" id="fc-card-level">A1</span>
+                <span class="fc-pos-tag" id="fc-card-pos">phrase</span>
+                <button id="btn-fc-audio" class="btn-icon-sm fc-btn-audio" type="button" title="Phát âm từ vựng (TTS)" aria-label="Phát âm">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+                </button>
+              </div>
+              <div class="fc-front-main">
+                <div class="fc-front-text" id="fc-card-front">Nhấn "Bắt đầu ôn tập" để học từ vựng</div>
+                <div class="fc-phonetic-badge" id="fc-card-phonetic">/fəˈnɛtɪk/</div>
+              </div>
+              <div class="fc-hint-flip">Nhấp thẻ hoặc phím Space để lật mặt sau ↻</div>
+            </div>
 
-        <!-- FSRS rating buttons -->
+            <!-- Back Face -->
+            <div class="card-face card-face-back">
+              <div class="fc-card-header">
+                <span class="fc-card-type-label">Định nghĩa & Ngữ cảnh</span>
+                <button id="btn-fc-flip-back" class="btn-icon-sm" type="button" title="Lật lại mặt trước" aria-label="Lật lại">
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+                </button>
+              </div>
+              <div class="fc-back-text" id="fc-card-back">Nghĩa của từ</div>
+              <div class="fc-context-box" id="fc-context-box">
+                <div class="fc-context-sentence" id="fc-card-context-sentence">Câu ví dụ ngữ cảnh thực tế.</div>
+                <div class="fc-context-translation" id="fc-card-context-translation">Bản dịch nghĩa câu ví dụ.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <button id="btn-fc-reveal" class="btn-primary" type="button">Hiện đáp án (Lật thẻ)</button>
+
+        <!-- FSRS rating buttons with dynamic intervals -->
         <div id="fc-rating-actions" class="fsrs-rating-grid" hidden>
           <button class="btn-rating btn-rating-again" type="button" data-rating="again">
             <span class="rating-label">Quên</span>
@@ -268,28 +314,52 @@
       </div>
     </div>
 
-    <!-- Tab 2: Create new card -->
+    <!-- Tab 2: Create new card with Rich Fields -->
     <div id="tab-fc-create" class="tab-content">
       <div class="field-group">
-        <label class="field-label" for="fc-input-front">Mặt trước (Từ vựng / Câu hỏi)</label>
-        <input type="text" id="fc-input-front" class="field-input" placeholder="vd: Hello / こんにちは / Xin chào">
+        <label class="field-label" for="fc-input-front">Mặt trước (Từ vựng / Thuật ngữ chính)</label>
+        <input type="text" id="fc-input-front" class="field-input" placeholder="vd: Pronunciation / Hello / Xin chào">
+      </div>
+      <div class="field-row">
+        <div class="field-group">
+          <label class="field-label" for="fc-input-phonetic">Phiên âm quốc tế IPA</label>
+          <input type="text" id="fc-input-phonetic" class="field-input" placeholder="vd: /prəˌnʌn.siˈeɪ.ʃən/">
+        </div>
+        <div class="field-group">
+          <label class="field-label" for="fc-select-pos">Từ loại</label>
+          <select id="fc-select-pos" class="field-select">
+            <option value="noun">Danh từ (Noun)</option>
+            <option value="verb">Động từ (Verb)</option>
+            <option value="adjective">Tính từ (Adjective)</option>
+            <option value="phrase">Cụm từ (Phrase)</option>
+            <option value="idiom">Thành ngữ (Idiom)</option>
+          </select>
+        </div>
       </div>
       <div class="field-group">
-        <label class="field-label" for="fc-input-back">Mặt sau (Nghĩa / Giải thích)</label>
-        <textarea id="fc-input-back" class="field-textarea" placeholder="vd: Lời chào thân thiện khi gặp gỡ"></textarea>
+        <label class="field-label" for="fc-input-back">Mặt sau (Định nghĩa / Giải thích tiếng Việt)</label>
+        <textarea id="fc-input-back" class="field-textarea" placeholder="vd: Cách phát âm hoặc ngữ điệu của một từ hoặc ngôn ngữ"></textarea>
+      </div>
+      <div class="field-group">
+        <label class="field-label" for="fc-input-sentence">Câu ví dụ trong ngữ cảnh thực tế</label>
+        <input type="text" id="fc-input-sentence" class="field-input" placeholder="vd: Clear pronunciation is essential for effective communication.">
+      </div>
+      <div class="field-group">
+        <label class="field-label" for="fc-input-translation">Dịch nghĩa câu ví dụ</label>
+        <input type="text" id="fc-input-translation" class="field-input" placeholder="vd: Phát âm rõ ràng là điều cần thiết để giao tiếp hiệu quả.">
       </div>
       <div class="field-group">
         <label class="field-label" for="fc-select-level">Cấp độ CEFR</label>
         <select id="fc-select-level" class="field-select">
           <option value="A1">A1 - Sơ cấp</option>
           <option value="A2">A2 - Cơ bản</option>
-          <option value="B1">B1 - Trung cấp</option>
+          <option value="B1" selected>B1 - Trung cấp</option>
           <option value="B2">B2 - Trung cao</option>
           <option value="C1">C1 - Cao cấp</option>
           <option value="C2">C2 - Thành thạo</option>
         </select>
       </div>
-      <button id="btn-fc-save" class="btn-primary" type="button">Tạo thẻ Flashcard</button>
+      <button id="btn-fc-save" class="btn-primary" type="button">Tạo thẻ Flashcard FSRS</button>
     </div>
 
     <!-- Tab 3: List cards -->
@@ -298,30 +368,56 @@
     </div>
   </aside>
 
-  <!-- Pronunciation Assessment (GOP) Modal -->
+  <!-- Pronunciation Assessment (GOP & CEFR) Modal -->
   <dialog id="pronounce-modal" class="modal-dialog" aria-labelledby="pronounce-title">
     <div class="modal-content glass-card">
       <div class="drawer-header">
-        <h2 id="pronounce-title" class="drawer-title">Luyện phát âm · GOP</h2>
+        <h2 id="pronounce-title" class="drawer-title">Luyện phát âm · GOP & CEFR</h2>
         <button id="btn-close-pronounce" class="drawer-close" type="button" aria-label="Close">
           <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
       </div>
 
-      <p class="drawer-note">Đánh giá chính xác từng âm tiết ngữ âm theo chuẩn acoustic GOP và phản hồi khẩu hình miệng 3D.</p>
+      <p class="drawer-note">Đánh giá chính xác từng âm tiết ngữ âm theo chuẩn GOP acoustic, sóng âm thời gian thực và thị phạm khẩu hình 3D.</p>
 
       <div class="field-group">
         <label class="field-label" for="pronounce-target-input">Câu luyện nói</label>
         <input type="text" id="pronounce-target-input" class="field-input" value="Xin chào, tôi là Vira">
       </div>
 
-      <div class="pronounce-actions">
+      <!-- Waveform Visualizer Canvas -->
+      <div class="pronounce-visualizer-container">
+        <canvas id="pronounce-waveform" class="pronounce-waveform" width="480" height="64" aria-label="Audio waveform visualizer"></canvas>
+      </div>
+
+      <!-- Controls Row: Record Start/Stop + Timer + Assess -->
+      <div class="pronounce-record-controls">
+        <div class="record-btn-group">
+          <button id="btn-pronounce-record" class="btn-record" type="button" aria-pressed="false">
+            <span class="record-dot" aria-hidden="true"></span>
+            <span id="pronounce-record-label">Bắt đầu ghi âm</span>
+          </button>
+          <span id="pronounce-timer-badge" class="timer-badge">00:00</span>
+        </div>
         <button id="btn-pronounce-assess" class="btn-primary" type="button">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
-          Ghi âm & Đánh giá phát âm
+          Đánh giá phát âm
         </button>
       </div>
 
+      <!-- Parallel Audio Listen Controls -->
+      <div class="pronounce-listen-actions">
+        <button id="btn-pronounce-listen-native" class="btn-secondary" type="button" title="Nghe người bản ngữ đọc câu mẫu">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+          Nghe giọng bản ngữ (TTS)
+        </button>
+        <button id="btn-pronounce-listen-user" class="btn-secondary" type="button" title="Nghe lại đoạn thu âm của bạn" disabled>
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/></svg>
+          Nghe lại giọng của tôi
+        </button>
+      </div>
+
+      <!-- Multi-metric Score Dashboard -->
       <div id="pronounce-result" class="pronounce-result-card" hidden>
         <div class="pronounce-score-row">
           <div class="score-circle">
@@ -329,12 +425,43 @@
             <span class="score-unit">/100</span>
           </div>
           <div class="score-meta">
-            <div id="pronounce-accuracy-label" class="score-status status-correct">Chuẩn xác</div>
-            <div class="score-hint">Chạm vào từng âm tiết bên dưới để avatar 3D thị phạm khẩu hình miệng chuẩn:</div>
+            <div class="score-header-pill">
+              <span id="pronounce-cefr-badge" class="cefr-badge cefr-c1">C1 · Cao cấp</span>
+              <span id="pronounce-accuracy-label" class="score-status status-correct">Chuẩn xác</span>
+            </div>
+            <div class="score-hint">Chạm vào từng từ hoặc âm vị IPA bên dưới để avatar 3D thị phạm khẩu hình miệng:</div>
           </div>
         </div>
 
+        <!-- 4-metric score grid -->
+        <div class="score-metrics-grid">
+          <div class="metric-box">
+            <div class="metric-label">Accuracy (Độ chuẩn)</div>
+            <div class="metric-val" id="metric-accuracy-val">92%</div>
+            <div class="metric-track"><div id="metric-accuracy-bar" class="metric-bar" style="width: 92%;"></div></div>
+          </div>
+          <div class="metric-box">
+            <div class="metric-label">Fluency (Trôi chảy)</div>
+            <div class="metric-val" id="metric-fluency-val">89%</div>
+            <div class="metric-track"><div id="metric-fluency-bar" class="metric-bar" style="width: 89%;"></div></div>
+          </div>
+          <div class="metric-box">
+            <div class="metric-label">Completeness (Đầy đủ)</div>
+            <div class="metric-val" id="metric-completeness-val">95%</div>
+            <div class="metric-track"><div id="metric-completeness-bar" class="metric-bar" style="width: 95%;"></div></div>
+          </div>
+          <div class="metric-box">
+            <div class="metric-label">Prosody (Ngữ điệu)</div>
+            <div class="metric-val" id="metric-prosody-val">88%</div>
+            <div class="metric-track"><div id="metric-prosody-bar" class="metric-bar" style="width: 88%;"></div></div>
+          </div>
+        </div>
+
+        <!-- Word & IPA phoneme chips container -->
         <div id="pronounce-phonemes-container" class="phonemes-container"></div>
+
+        <!-- Actionable Feedback Tips -->
+        <div id="pronounce-feedback-tips" class="pronounce-feedback-tips"></div>
       </div>
     </div>
   </dialog>

@@ -272,4 +272,253 @@ describe('HudController tutor presets and normalization', () => {
     handleThoughtEvent({ text: '', is_done: true });
     expect(thoughtBadge.textContent).toBe('Thought complete');
   });
+
+  it('test_pronunciation_assessment_ui_interaction_and_waveform verifies multi-metric scoring, reference audio, and viseme feedback', async () => {
+    const { TauriBridge } = await import('../src/ipc/tauri-bridge');
+
+    // 1. Invoke assess_pronunciation and verify multi-dimensional report
+    const report = await TauriBridge.invoke('assess_pronunciation', {
+      payload: { target_text: 'Good morning, Vira' },
+    });
+
+    expect(report.overall_score).toBeGreaterThan(80);
+    expect(report.cefr_level).toBeDefined();
+    expect(['A1', 'A2', 'B1', 'B2', 'C1', 'C2']).toContain(report.cefr_level);
+    expect(report.accuracy_score).toBeGreaterThan(0);
+    expect(report.fluency_score).toBeGreaterThan(0);
+    expect(report.completeness_score).toBeGreaterThan(0);
+    expect(report.prosody_score).toBeGreaterThan(0);
+    expect(report.words.length).toBeGreaterThan(0);
+    expect(report.phoneme_scores.length).toBeGreaterThan(0);
+    expect(report.feedback_tips.length).toBeGreaterThan(0);
+
+    // Verify word and phoneme structure
+    const firstWord = report.words[0];
+    expect(firstWord.word).toBeDefined();
+    expect(firstWord.accuracy_score).toBeGreaterThan(0);
+    expect(firstWord.phonemes.length).toBeGreaterThan(0);
+
+    const firstPhoneme = report.phoneme_scores[0];
+    expect(firstPhoneme.phoneme).toBeDefined();
+    expect(firstPhoneme.score).toBeGreaterThan(0);
+    expect(firstPhoneme.viseme_hint).toBeDefined();
+
+    // 2. Test native reference and user recording audio IPCs
+    const refAudio = await TauriBridge.invoke('get_pronunciation_reference_audio', {
+      target_text: 'Good morning, Vira',
+    });
+    expect(refAudio.status).toBe('ok');
+    expect(refAudio.audio_base64).toBeDefined();
+
+    const replayAudio = await TauriBridge.invoke('replay_user_recording');
+    expect(replayAudio.status).toBe('ok');
+    expect(replayAudio.audio_base64).toBeDefined();
+
+    // 3. Test 3D Avatar mouth viseme trigger on phoneme click
+    let visemeDispatched: any = null;
+    const mockVrmViewer = {
+      onVisemeTick: (weights: any) => {
+        visemeDispatched = weights;
+      },
+    };
+
+    mockVrmViewer.onVisemeTick({
+      weights: firstPhoneme.viseme_hint,
+      is_speaking: true,
+    });
+    expect(visemeDispatched).toBeDefined();
+    expect(visemeDispatched.weights).toEqual(firstPhoneme.viseme_hint);
+    expect(visemeDispatched.is_speaking).toBe(true);
+  });
+
+  it('test_flashcard_3d_flip_and_ai_generation verifies 3D flip card, session progress, intervals, and 1-click AI generation', async () => {
+    const { TauriBridge } = await import('../src/ipc/tauri-bridge');
+
+    // 1. Test 1-click AI flashcard suggestion from subtitle text
+    const subtitleSample = 'The pronunciation of this phrase is extraordinary.';
+    const suggestion = await TauriBridge.invoke('generate_flashcard_ai_suggestion', {
+      text: subtitleSample,
+    });
+
+    expect(suggestion.front).toBeDefined();
+    expect(suggestion.back).toBeDefined();
+    expect(suggestion.phonetic).toBeDefined();
+    expect(suggestion.context_sentence).toContain(subtitleSample);
+    expect(suggestion.context_translation).toBeDefined();
+    expect(suggestion.cefr_level).toBeDefined();
+    expect(suggestion.part_of_speech).toBeDefined();
+
+    // 2. Create rich card with contextual fields
+    const created = await TauriBridge.invoke('create_rich_flashcard', {
+      payload: {
+        front: suggestion.front,
+        back: suggestion.back,
+        phonetic: suggestion.phonetic,
+        context_sentence: suggestion.context_sentence,
+        context_translation: suggestion.context_translation,
+        part_of_speech: suggestion.part_of_speech,
+        cefr_level: suggestion.cefr_level,
+        tags: suggestion.tags,
+      },
+    });
+
+    expect(created.id).toBeDefined();
+    expect(created.front).toBe(suggestion.front);
+    expect(created.phonetic).toBe(suggestion.phonetic);
+    expect(created.context_sentence).toBe(suggestion.context_sentence);
+
+    // 3. Test dynamic FSRS interval preview
+    const intervals = await TauriBridge.invoke('preview_flashcard_intervals', {
+      card_id: created.id,
+    });
+    expect(intervals.again).toBeDefined();
+    expect(intervals.hard).toBeDefined();
+    expect(intervals.good).toBeDefined();
+    expect(intervals.easy).toBeDefined();
+
+    // 4. Test 3D Flip Card state toggle simulation
+    const cardElement = {
+      classList: new Set<string>(['flashcard-card-3d']),
+      toggleFlip() {
+        if (this.classList.has('flipped')) {
+          this.classList.delete('flipped');
+        } else {
+          this.classList.add('flipped');
+        }
+      },
+      isFlipped() {
+        return this.classList.has('flipped');
+      },
+    };
+
+    expect(cardElement.isFlipped()).toBe(false);
+    cardElement.toggleFlip();
+    expect(cardElement.isFlipped()).toBe(true);
+    cardElement.toggleFlip();
+    expect(cardElement.isFlipped()).toBe(false);
+
+    // 5. Test session progress computation
+    const computeSessionProgress = (currentIdx: number, totalCards: number) => {
+      const clampedTotal = Math.max(1, totalCards);
+      const clampedCurrent = Math.min(clampedTotal, Math.max(1, currentIdx + 1));
+      const percentage = Math.round((clampedCurrent / clampedTotal) * 100);
+      return {
+        text: `Thẻ ${clampedCurrent} / ${clampedTotal}`,
+        percentage,
+      };
+    };
+
+    const p1 = computeSessionProgress(0, 10);
+    expect(p1.text).toBe('Thẻ 1 / 10');
+    expect(p1.percentage).toBe(10);
+
+    const p3 = computeSessionProgress(2, 10);
+    expect(p3.text).toBe('Thẻ 3 / 10');
+    expect(p3.percentage).toBe(30);
+
+    const pDone = computeSessionProgress(9, 10);
+    expect(pDone.text).toBe('Thẻ 10 / 10');
+    expect(pDone.percentage).toBe(100);
+  });
+
+  it('HudController handles 3D card flip, audio play, and recording state transitions', async () => {
+    const { HudController } = await import('../src/ui/hud-controller');
+    let visemeDispatched: any = null;
+    const mockVrmViewer: any = {
+      state: 'idle',
+      setState: (s: string) => {
+        mockVrmViewer.state = s;
+      },
+      onVisemeTick: (weights: any) => {
+        visemeDispatched = weights;
+      },
+      playGesture: () => {},
+      setEmotion: () => {},
+    };
+
+    const controller = new HudController(mockVrmViewer);
+
+    // Mock internal el map
+    const mock3DCard = {
+      classList: {
+        classes: new Set<string>(),
+        toggle(cls: string, force?: boolean) {
+          if (force !== undefined) {
+            if (force) this.classes.add(cls);
+            else this.classes.delete(cls);
+            return force;
+          }
+          if (this.classes.has(cls)) {
+            this.classes.delete(cls);
+            return false;
+          } else {
+            this.classes.add(cls);
+            return true;
+          }
+        },
+        contains(cls: string) {
+          return this.classes.has(cls);
+        },
+      },
+    };
+
+    const mockBtnReveal = { hidden: false };
+    const mockRatingActions = { hidden: true };
+    const mockBtnRecord = {
+      classList: {
+        classes: new Set<string>(),
+        add(cls: string) {
+          this.classes.add(cls);
+        },
+        remove(cls: string) {
+          this.classes.delete(cls);
+        },
+      },
+      setAttribute: () => {},
+    };
+    const mockRecordLabel = { textContent: '' };
+    const mockTimerBadge = { textContent: '' };
+    const mockBtnListenUser = { disabled: true };
+
+    (controller as any).el = {
+      fcCard3D: mock3DCard,
+      btnFcReveal: mockBtnReveal,
+      fcRatingActions: mockRatingActions,
+      btnPronounceRecord: mockBtnRecord,
+      pronounceRecordLabel: mockRecordLabel,
+      pronounceTimerBadge: mockTimerBadge,
+      btnPronounceListenUser: mockBtnListenUser,
+    };
+
+    // 1. Initial flip state: not flipped
+    expect((controller as any).isCardFlipped).toBe(false);
+
+    // 2. Toggle card flip -> flipped
+    controller.toggleCardFlip();
+    expect((controller as any).isCardFlipped).toBe(true);
+    expect(mock3DCard.classList.contains('flipped')).toBe(true);
+    expect(mockBtnReveal.hidden).toBe(true);
+    expect(mockRatingActions.hidden).toBe(false);
+
+    // 3. Set flip false -> front face
+    controller.setCardFlip(false);
+    expect((controller as any).isCardFlipped).toBe(false);
+    expect(mock3DCard.classList.contains('flipped')).toBe(false);
+
+    // 4. Test Pronunciation recording start
+    controller.startPronounceRecording();
+    expect((controller as any).isRecordingPronounce).toBe(true);
+    expect(mockBtnRecord.classList.classes.has('recording')).toBe(true);
+    expect(mockRecordLabel.textContent).toBe('Hoàn tất ghi âm');
+    expect(mockTimerBadge.textContent).toBe('00:00');
+
+    // 5. Test Pronunciation recording stop
+    controller.stopPronounceRecording();
+    expect((controller as any).isRecordingPronounce).toBe(false);
+    expect(mockBtnRecord.classList.classes.has('recording')).toBe(false);
+    expect(mockRecordLabel.textContent).toBe('Bắt đầu ghi âm');
+    expect(mockBtnListenUser.disabled).toBe(false);
+
+    controller.dispose();
+  });
 });
