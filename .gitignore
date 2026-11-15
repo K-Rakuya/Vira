@@ -1,24 +1,80 @@
+# ==============================================================================
+# Vira Production Gitignore
+# ==============================================================================
+
 # Rust
+/target/
 target/
 **/*.rs.bk
 *.pdb
+*.rlib
 
-# Environment & local secrets
+# Frontend / Node
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+.vite/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+bun.lockb
+
+# Tauri 2.0
+src-tauri/target/
+crates/**/target/
+gen/schemas/*.json.bak
+
+# SQLite & Vector DB
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+storage/
+data/
+*.lance
+lancedb/
+
+# AI Models & Weights
+models/
+*.onnx
+*.tar.bz2
+*.tar.gz
+*.bin
+*.safetensors
+*.gguf
+*.pt
+*.pth
+!frontend/public/models/
+!frontend/public/models/**
+
+# Audio & Media dumps
+recordings/
+*.wav
+*.pcm
+*.raw
+*.mp3
+
+# Secrets & Configs
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+*.keystore
 
-# Node / Frontend
-node_modules/
-dist/
-.vite/
-
-# OS / Editor
+# OS & IDEs
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
-# Local Model Assets & Weights
-models/
-
+# Agent & Superpowers
+.superpowers/
+docs/superpowers/
+brain/
