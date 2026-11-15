@@ -15,9 +15,10 @@ pub use capture::{
 pub use chunker::{ChunkerConfig, SentenceChunker};
 pub use clock::MasterAudioClock;
 pub use gop::{
-    dtw_distance_rolling, phoneme_to_viseme, phoneme_to_vrm_preset, split_phoneme_base_and_tag,
-    AccuracyLevel, DtwMatrix, GopConfig, GopEvaluator, PhonemeResult, PhonemeScore,
-    PronunciationAssessment, PronunciationScore,
+    dtw_distance_rolling, phoneme_to_viseme, phoneme_to_vrm_preset, score_to_cefr_level,
+    split_phoneme_base_and_tag, AccuracyLevel, DtwMatrix, FluencyMetrics, GopConfig, GopEvaluator,
+    PhonemeResult, PhonemeScore, PronunciationAssessment, PronunciationReport, PronunciationScore,
+    WordAssessment,
 };
 pub use phoneme_aligner::{
     AlignmentError, AlignmentMatch, CtcAligner, DtwAligner, DtwResult, G2pConverter, MatchStatus,

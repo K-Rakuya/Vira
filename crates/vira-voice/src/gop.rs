@@ -274,6 +274,249 @@ impl PronunciationAssessment {
     }
 }
 
+/// Assessment result for a single word in an utterance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WordAssessment {
+    /// Target or recognized word string.
+    pub word: String,
+    /// Accuracy score for this word in range [0.0, 100.0].
+    pub accuracy_score: f32,
+    /// Error category if any: `None` (correct), "Mispronounced", "Omission", "Insertion".
+    pub error_type: Option<String>,
+    /// Phone-level scores and alignments for this word.
+    pub phonemes: Vec<PhonemeScore>,
+}
+
+impl WordAssessment {
+    /// Creates a new `WordAssessment`.
+    pub fn new(
+        word: impl Into<String>,
+        accuracy_score: f32,
+        error_type: Option<String>,
+        phonemes: Vec<PhonemeScore>,
+    ) -> Self {
+        Self {
+            word: word.into(),
+            accuracy_score: if accuracy_score.is_nan() {
+                0.0
+            } else {
+                accuracy_score.clamp(0.0, 100.0)
+            },
+            error_type,
+            phonemes,
+        }
+    }
+
+    /// Returns true if this word was pronounced correctly.
+    pub fn is_correct(&self) -> bool {
+        self.error_type.is_none() || self.error_type.as_deref() == Some("None")
+    }
+
+    /// Returns true if this word was mispronounced.
+    pub fn is_mispronounced(&self) -> bool {
+        self.error_type.as_deref() == Some("Mispronounced")
+    }
+
+    /// Returns true if this word was omitted.
+    pub fn is_omission(&self) -> bool {
+        self.error_type.as_deref() == Some("Omission")
+    }
+
+    /// Returns true if this word was inserted.
+    pub fn is_insertion(&self) -> bool {
+        self.error_type.as_deref() == Some("Insertion")
+    }
+}
+
+/// Fluency metrics measuring speech tempo, pauses, and hesitations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FluencyMetrics {
+    /// Speaking rate in words per minute (WPM).
+    pub words_per_minute: f32,
+    /// Ratio of pause duration (>= 250ms) relative to total audio duration in range [0.0, 1.0].
+    pub pause_duration_ratio: f32,
+    /// Total count of hesitation intervals (>= 250ms).
+    pub hesitation_count: u32,
+    /// Overall normalized fluency score in range [0.0, 100.0].
+    pub fluency_score: f32,
+}
+
+impl FluencyMetrics {
+    /// Calculates fluency metrics from word count, total audio duration (ms), and pause intervals (ms).
+    pub fn calculate(
+        word_count: usize,
+        total_duration_ms: u32,
+        pause_durations_ms: &[u32],
+    ) -> Self {
+        if total_duration_ms == 0 || word_count == 0 {
+            return Self {
+                words_per_minute: 0.0,
+                pause_duration_ratio: 0.0,
+                hesitation_count: 0,
+                fluency_score: 0.0,
+            };
+        }
+
+        let duration_sec = total_duration_ms as f32 / 1000.0;
+        let words_per_minute = ((word_count as f32 / duration_sec) * 60.0).max(0.0);
+
+        // Standard pauses defined as intervals >= 250ms
+        let pause_threshold_ms = 250;
+        let significant_pauses: Vec<u32> = pause_durations_ms
+            .iter()
+            .copied()
+            .filter(|&p| p >= pause_threshold_ms)
+            .collect();
+
+        let total_pause_ms: u32 = significant_pauses.iter().sum();
+        let pause_duration_ratio =
+            (total_pause_ms as f32 / total_duration_ms as f32).clamp(0.0, 1.0);
+        let hesitation_count = significant_pauses.len() as u32;
+
+        // Native speaking tempo is 110 - 150 WPM (allow up to 160)
+        let wpm_score = if words_per_minute >= 110.0 && words_per_minute <= 160.0 {
+            100.0
+        } else if words_per_minute < 110.0 {
+            (words_per_minute / 110.0) * 100.0
+        } else {
+            (100.0 - (words_per_minute - 160.0) * 0.5).max(30.0)
+        };
+
+        // Penalize pause ratio above 15%
+        let pause_penalty = if pause_duration_ratio > 0.15 {
+            (pause_duration_ratio - 0.15) * 50.0
+        } else {
+            0.0
+        };
+
+        // Penalize hesitations beyond 2 occurrences
+        let hesitation_penalty = if hesitation_count > 2 {
+            ((hesitation_count - 2) as f32) * 5.0
+        } else {
+            0.0
+        };
+
+        let raw_fluency = wpm_score - pause_penalty - hesitation_penalty;
+        let fluency_score = if raw_fluency.is_nan() {
+            0.0
+        } else {
+            raw_fluency.clamp(0.0, 100.0)
+        };
+
+        Self {
+            words_per_minute,
+            pause_duration_ratio,
+            hesitation_count,
+            fluency_score,
+        }
+    }
+}
+
+/// Maps overall pronunciation score to CEFR level (A1, A2, B1, B2, C1, C2).
+pub fn score_to_cefr_level(score: f32) -> &'static str {
+    if score.is_nan() || score < 40.0 {
+        "A1"
+    } else if score < 55.0 {
+        "A2"
+    } else if score < 70.0 {
+        "B1"
+    } else if score < 80.0 {
+        "B2"
+    } else if score < 90.0 {
+        "C1"
+    } else {
+        "C2"
+    }
+}
+
+/// Comprehensive multi-dimensional pronunciation assessment report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PronunciationReport {
+    /// Overall composite score in range [0.0, 100.0].
+    pub overall_score: f32,
+    /// CEFR language proficiency level: "A1", "A2", "B1", "B2", "C1", "C2".
+    pub cefr_level: String,
+    /// Acoustic accuracy score (GOP and phoneme match) in range [0.0, 100.0].
+    pub accuracy_score: f32,
+    /// Fluency score (WPM, pauses, hesitations) in range [0.0, 100.0].
+    pub fluency_score: f32,
+    /// Completeness score (omissions and insertions) in range [0.0, 100.0].
+    pub completeness_score: f32,
+    /// Prosody score (intonation, rhythm, energy) in range [0.0, 100.0].
+    pub prosody_score: f32,
+    /// Detailed assessments for individual words.
+    pub words: Vec<WordAssessment>,
+    /// Flattened list of individual phoneme scores and timings.
+    pub phoneme_scores: Vec<PhonemeScore>,
+    /// Actionable instructional feedback tips for the learner.
+    pub feedback_tips: Vec<String>,
+}
+
+impl PronunciationReport {
+    /// Constructs a `PronunciationReport` computing `overall_score` and `cefr_level` automatically.
+    ///
+    /// Weights:
+    /// - Accuracy: 50%
+    /// - Fluency: 25%
+    /// - Completeness: 15%
+    /// - Prosody: 10%
+    pub fn new(
+        accuracy_score: f32,
+        fluency_score: f32,
+        completeness_score: f32,
+        prosody_score: f32,
+        words: Vec<WordAssessment>,
+        phoneme_scores: Vec<PhonemeScore>,
+        feedback_tips: Vec<String>,
+    ) -> Self {
+        let acc = if accuracy_score.is_nan() {
+            0.0
+        } else {
+            accuracy_score.clamp(0.0, 100.0)
+        };
+        let flu = if fluency_score.is_nan() {
+            0.0
+        } else {
+            fluency_score.clamp(0.0, 100.0)
+        };
+        let comp = if completeness_score.is_nan() {
+            0.0
+        } else {
+            completeness_score.clamp(0.0, 100.0)
+        };
+        let pro = if prosody_score.is_nan() {
+            0.0
+        } else {
+            prosody_score.clamp(0.0, 100.0)
+        };
+
+        let overall_raw = 0.50 * acc + 0.25 * flu + 0.15 * comp + 0.10 * pro;
+        let overall_score = if overall_raw.is_nan() {
+            0.0
+        } else {
+            overall_raw.clamp(0.0, 100.0)
+        };
+        let cefr_level = score_to_cefr_level(overall_score).to_string();
+
+        Self {
+            overall_score,
+            cefr_level,
+            accuracy_score: acc,
+            fluency_score: flu,
+            completeness_score: comp,
+            prosody_score: pro,
+            words,
+            phoneme_scores,
+            feedback_tips,
+        }
+    }
+
+    /// Checks if overall score meets or exceeds a given passing threshold.
+    pub fn is_passing(&self, threshold: f32) -> bool {
+        self.overall_score >= threshold
+    }
+}
+
 /// Configuration options for GOP calculation and scoring thresholds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GopConfig {
@@ -460,6 +703,403 @@ impl GopEvaluator {
             scores,
             self.config.correct_threshold,
             self.config.minor_flaw_threshold,
+        )
+    }
+
+    /// Aligns target words with spoken words to calculate completeness score and identify omissions / insertions.
+    pub fn calculate_completeness(
+        &self,
+        target_words: &[&str],
+        spoken_words: &[&str],
+    ) -> (f32, Vec<WordAssessment>) {
+        let m = target_words.len();
+        let n = spoken_words.len();
+
+        if m == 0 && n == 0 {
+            return (100.0, Vec::new());
+        }
+
+        if m == 0 {
+            let words = spoken_words
+                .iter()
+                .map(|&w| WordAssessment::new(w, 0.0, Some("Insertion".to_string()), vec![]))
+                .collect();
+            return (0.0, words);
+        }
+
+        if n == 0 {
+            let words = target_words
+                .iter()
+                .map(|&w| WordAssessment::new(w, 0.0, Some("Omission".to_string()), vec![]))
+                .collect();
+            return (0.0, words);
+        }
+
+        let normalize = |s: &str| {
+            s.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        };
+
+        let norm_targets: Vec<String> = target_words.iter().map(|&w| normalize(w)).collect();
+        let norm_spoken: Vec<String> = spoken_words.iter().map(|&w| normalize(w)).collect();
+
+        // Levenshtein / DTW dynamic programming on word tokens
+        let mut dp = DtwMatrix::new(m + 1, n + 1);
+        const COST_INS: f32 = 1.0;
+        const COST_DEL: f32 = 1.0;
+
+        for i in 1..=m {
+            dp.set(i, 0, i as f32 * COST_DEL);
+        }
+        for j in 1..=n {
+            dp.set(0, j, j as f32 * COST_INS);
+        }
+
+        for i in 1..=m {
+            for j in 1..=n {
+                let cost_sub = if norm_targets[i - 1] == norm_spoken[j - 1] {
+                    0.0
+                } else {
+                    1.0
+                };
+                let match_cost = dp.get(i - 1, j - 1) + cost_sub;
+                let del_cost = dp.get(i - 1, j) + COST_DEL;
+                let ins_cost = dp.get(i, j - 1) + COST_INS;
+                dp.set(i, j, match_cost.min(del_cost).min(ins_cost));
+            }
+        }
+
+        // Backtrack
+        let mut aligned_ops = Vec::new();
+        let mut i = m;
+        let mut j = n;
+
+        while i > 0 || j > 0 {
+            if i > 0 && j > 0 {
+                let cost_sub = if norm_targets[i - 1] == norm_spoken[j - 1] {
+                    0.0
+                } else {
+                    1.0
+                };
+                let match_cost = dp.get(i - 1, j - 1) + cost_sub;
+                let del_cost = dp.get(i - 1, j) + COST_DEL;
+                let cur = dp.get(i, j);
+
+                if (cur - match_cost).abs() < 1e-4 {
+                    if cost_sub == 0.0 {
+                        aligned_ops.push((Some(i - 1), Some(j - 1), "Match"));
+                    } else {
+                        aligned_ops.push((Some(i - 1), Some(j - 1), "Sub"));
+                    }
+                    i -= 1;
+                    j -= 1;
+                    continue;
+                } else if (cur - del_cost).abs() < 1e-4 {
+                    aligned_ops.push((Some(i - 1), None, "Del"));
+                    i -= 1;
+                    continue;
+                } else {
+                    aligned_ops.push((None, Some(j - 1), "Ins"));
+                    j -= 1;
+                    continue;
+                }
+            } else if i > 0 {
+                aligned_ops.push((Some(i - 1), None, "Del"));
+                i -= 1;
+            } else {
+                aligned_ops.push((None, Some(j - 1), "Ins"));
+                j -= 1;
+            }
+        }
+
+        aligned_ops.reverse();
+
+        let mut assessments = Vec::with_capacity(aligned_ops.len());
+        let mut match_count = 0usize;
+        let mut ins_count = 0usize;
+
+        for (t_idx, s_idx, op) in aligned_ops {
+            match op {
+                "Match" => {
+                    match_count += 1;
+                    let word = target_words[t_idx.unwrap()].to_string();
+                    assessments.push(WordAssessment::new(word, 100.0, None, vec![]));
+                }
+                "Sub" => {
+                    let word = target_words[t_idx.unwrap()].to_string();
+                    assessments.push(WordAssessment::new(
+                        word,
+                        50.0,
+                        Some("Mispronounced".to_string()),
+                        vec![],
+                    ));
+                }
+                "Del" => {
+                    let word = target_words[t_idx.unwrap()].to_string();
+                    assessments.push(WordAssessment::new(
+                        word,
+                        0.0,
+                        Some("Omission".to_string()),
+                        vec![],
+                    ));
+                }
+                "Ins" => {
+                    ins_count += 1;
+                    let word = spoken_words[s_idx.unwrap()].to_string();
+                    assessments.push(WordAssessment::new(
+                        word,
+                        0.0,
+                        Some("Insertion".to_string()),
+                        vec![],
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        let base_completeness = (match_count as f32 / m as f32) * 100.0;
+        let insertion_penalty = ins_count as f32 * 5.0;
+        let completeness = (base_completeness - insertion_penalty).clamp(0.0, 100.0);
+
+        (completeness, assessments)
+    }
+
+    /// Evaluates speech prosody from pitch (F0 in Hz) dynamics, energy (RMS) contours,
+    /// or phoneme duration distributions.
+    pub fn calculate_prosody(
+        &self,
+        pitch_values: Option<&[f32]>,
+        energy_values: Option<&[f32]>,
+        phonemes: &[PhonemeScore],
+    ) -> f32 {
+        let mut scores = Vec::new();
+
+        if let Some(pitch) = pitch_values {
+            let voiced: Vec<f32> = pitch
+                .iter()
+                .copied()
+                .filter(|&p| !p.is_nan() && p > 50.0 && p < 500.0)
+                .collect();
+
+            if voiced.len() >= 2 {
+                let mean: f32 = voiced.iter().sum::<f32>() / voiced.len() as f32;
+                let var: f32 = voiced
+                    .iter()
+                    .map(|&p| (p - mean).powi(2))
+                    .sum::<f32>()
+                    / voiced.len() as f32;
+                let std_dev = var.sqrt();
+                let cv = if mean > 0.0 { std_dev / mean } else { 0.0 };
+
+                let pitch_score = if cv < 0.05 {
+                    (cv / 0.05) * 45.0 + 10.0
+                } else if cv <= 0.35 {
+                    80.0 + ((cv - 0.08).max(0.0) / (0.35 - 0.08)).min(1.0) * 20.0
+                } else {
+                    (80.0 - (cv - 0.35) * 60.0).max(40.0)
+                };
+                scores.push((pitch_score, 0.65));
+            }
+        }
+
+        if let Some(energy) = energy_values {
+            let active: Vec<f32> = energy
+                .iter()
+                .copied()
+                .filter(|&e| !e.is_nan() && e > 0.005)
+                .collect();
+
+            if active.len() >= 2 {
+                let mean: f32 = active.iter().sum::<f32>() / active.len() as f32;
+                let var: f32 = active
+                    .iter()
+                    .map(|&e| (e - mean).powi(2))
+                    .sum::<f32>()
+                    / active.len() as f32;
+                let std_dev = var.sqrt();
+                let cv = if mean > 0.0 { std_dev / mean } else { 0.0 };
+
+                let energy_score = (cv / 0.35 * 30.0 + 70.0).clamp(50.0, 100.0);
+                scores.push((energy_score, 0.35));
+            }
+        }
+
+        if scores.is_empty() {
+            if phonemes.is_empty() {
+                return 0.0;
+            }
+            let durations: Vec<f32> = phonemes
+                .iter()
+                .map(|p| p.duration_ms().max(1) as f32)
+                .collect();
+
+            let mean: f32 = durations.iter().sum::<f32>() / durations.len() as f32;
+            let var: f32 = durations
+                .iter()
+                .map(|&d| (d - mean).powi(2))
+                .sum::<f32>()
+                / durations.len() as f32;
+            let cv = var.sqrt() / mean;
+
+            return if cv < 0.10 {
+                55.0
+            } else {
+                (80.0 + (cv - 0.10).min(0.40) * 40.0).clamp(60.0, 95.0)
+            };
+        }
+
+        let total_weight: f32 = scores.iter().map(|(_, w)| w).sum();
+        let weighted_score: f32 = scores.iter().map(|(s, w)| s * w).sum();
+        (weighted_score / total_weight).clamp(0.0, 100.0)
+    }
+
+    /// Evaluates a comprehensive multi-dimensional pronunciation report including
+    /// Accuracy, Fluency, Completeness, Prosody, CEFR level, word breakdown, and tips.
+    pub fn evaluate_comprehensive_report(
+        &self,
+        target_text: &str,
+        target_words: &[&str],
+        word_phonemes: &[(&str, Vec<PhonemeScore>)],
+        audio_duration_ms: u32,
+        pause_durations_ms: &[u32],
+        pitch_values: Option<&[f32]>,
+        energy_values: Option<&[f32]>,
+    ) -> PronunciationReport {
+        let derived_targets: Vec<&str> = if target_words.is_empty() && !target_text.is_empty() {
+            target_text.split_whitespace().collect()
+        } else {
+            target_words.to_vec()
+        };
+
+        let spoken_word_names: Vec<&str> = word_phonemes.iter().map(|(w, _)| *w).collect();
+        let (completeness_score, aligned_assessments) =
+            self.calculate_completeness(&derived_targets, &spoken_word_names);
+
+        let mut wp_map: std::collections::HashMap<String, Vec<PhonemeScore>> =
+            std::collections::HashMap::new();
+        for (w, phones) in word_phonemes {
+            wp_map.insert(w.to_lowercase(), phones.clone());
+        }
+
+        let mut words = Vec::with_capacity(derived_targets.len().max(word_phonemes.len()));
+        let mut all_phonemes = Vec::new();
+        let mut mispronounced_phonemes = Vec::new();
+        let mut omitted_words = Vec::new();
+
+        for mut wa in aligned_assessments {
+            let key = wa.word.to_lowercase();
+            if let Some(phones) = wp_map.remove(&key) {
+                if !phones.is_empty() {
+                    let total_dur: u32 = phones.iter().map(|p| p.duration_ms().max(1)).sum();
+                    let sum_score: f32 = phones
+                        .iter()
+                        .map(|p| p.score * (p.duration_ms().max(1) as f32))
+                        .sum();
+                    let word_acc = sum_score / total_dur as f32;
+                    wa.accuracy_score = word_acc.clamp(0.0, 100.0);
+
+                    let has_mispronounced = phones.iter().any(|p| p.is_mispronounced());
+                    if has_mispronounced {
+                        wa.error_type = Some("Mispronounced".to_string());
+                        for p in &phones {
+                            if p.is_mispronounced() {
+                                mispronounced_phonemes.push(p.phoneme.clone());
+                            }
+                        }
+                    }
+
+                    all_phonemes.extend(phones.clone());
+                    wa.phonemes = phones;
+                }
+            } else if wa.error_type.as_deref() == Some("Omission") {
+                omitted_words.push(wa.word.clone());
+            }
+            words.push(wa);
+        }
+
+        // Calculate accuracy score across all spoken phonemes
+        let accuracy_score = if all_phonemes.is_empty() {
+            0.0
+        } else {
+            let total_dur: u32 = all_phonemes.iter().map(|p| p.duration_ms().max(1)).sum();
+            let sum_score: f32 = all_phonemes
+                .iter()
+                .map(|p| p.score * (p.duration_ms().max(1) as f32))
+                .sum();
+            (sum_score / total_dur as f32).clamp(0.0, 100.0)
+        };
+
+        let fluency = FluencyMetrics::calculate(
+            spoken_word_names.len(),
+            audio_duration_ms,
+            pause_durations_ms,
+        );
+
+        let prosody_score = self.calculate_prosody(pitch_values, energy_values, &all_phonemes);
+
+        mispronounced_phonemes.sort();
+        mispronounced_phonemes.dedup();
+
+        let mut feedback_tips = Vec::new();
+        if !mispronounced_phonemes.is_empty() {
+            feedback_tips.push(format!(
+                "Cần chú ý phát âm chuẩn các âm: {}",
+                mispronounced_phonemes.join(", ")
+            ));
+        }
+        if !omitted_words.is_empty() {
+            feedback_tips.push(format!(
+                "Các từ bị bỏ sót hoặc chưa rõ: {}",
+                omitted_words.join(", ")
+            ));
+        }
+        if fluency.words_per_minute > 0.0 && fluency.words_per_minute < 100.0 {
+            feedback_tips.push(format!(
+                "Tốc độ nói còn chậm ({:.0} WPM, chuẩn bản ngữ: 110-150 WPM). Hãy tập đọc liền mạch hơn.",
+                fluency.words_per_minute
+            ));
+        }
+        if fluency.pause_duration_ratio > 0.25 {
+            feedback_tips.push(format!(
+                "Tỷ lệ khoảng lặng khá cao ({:.0}%). Cố gắng giảm ngập ngừng giữa các từ.",
+                fluency.pause_duration_ratio * 100.0
+            ));
+        }
+        if fluency.hesitation_count > 2 {
+            feedback_tips.push(format!(
+                "Có {} lần ngập ngừng kéo dài. Cố gắng giữ hơi thở đều.",
+                fluency.hesitation_count
+            ));
+        }
+        if prosody_score < 70.0 && prosody_score > 0.0 {
+            feedback_tips.push(
+                "Ngữ điệu câu còn đều đều (monotone). Hãy nhấn nhá trọng âm và ngữ điệu tự nhiên hơn."
+                    .to_string(),
+            );
+        }
+
+        let overall_raw = 0.50 * accuracy_score
+            + 0.25 * fluency.fluency_score
+            + 0.15 * completeness_score
+            + 0.10 * prosody_score;
+        let overall_score = overall_raw.clamp(0.0, 100.0);
+
+        if overall_score >= 90.0 {
+            feedback_tips.push(
+                "Phát âm xuất sắc, lưu loát và tự nhiên đạt chuẩn bản ngữ (C2)!".to_string(),
+            );
+        } else if overall_score >= 80.0 {
+            feedback_tips.push("Phát âm rất tốt và rõ ràng (C1)! Tiếp tục phát huy.".to_string());
+        }
+
+        PronunciationReport::new(
+            accuracy_score,
+            fluency.fluency_score,
+            completeness_score,
+            prosody_score,
+            words,
+            all_phonemes,
+            feedback_tips,
         )
     }
 }

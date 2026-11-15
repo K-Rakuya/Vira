@@ -1,6 +1,7 @@
 use vira_voice::gop::{
-    phoneme_to_viseme, phoneme_to_vrm_preset, AccuracyLevel, GopConfig, GopEvaluator,
-    PhonemeResult, PhonemeScore, PronunciationAssessment,
+    phoneme_to_viseme, phoneme_to_vrm_preset, AccuracyLevel, FluencyMetrics, GopConfig,
+    GopEvaluator, PhonemeResult, PhonemeScore, PronunciationAssessment, PronunciationReport,
+    WordAssessment,
 };
 use vira_voice::phoneme_aligner::{
     AlignmentError, CtcAligner, DtwAligner, G2pConverter, MatchStatus, PhonemeLanguage,
@@ -443,4 +444,159 @@ fn test_end_to_end_pronunciation_pipeline() {
     let visemes = assessment.all_viseme_hints();
     assert_eq!(visemes.len(), 4);
     assert_eq!(assessment.phoneme_scores[3].recommended_viseme.as_deref(), Some("oh"));
+}
+
+#[test]
+fn test_multi_dimensional_gop_assessment_cefr_and_fluency() {
+    let evaluator = GopEvaluator::default();
+
+    // 1. Test FluencyMetrics calculation (WPM, pause ratio, hesitations, fluency score)
+    // 10 words spoken in 4500ms = 133.3 WPM (optimal 110-150 range), pause 150ms (< 250ms threshold)
+    let fluent_metrics = FluencyMetrics::calculate(10, 4500, &[150]);
+    assert!(
+        fluent_metrics.words_per_minute >= 120.0 && fluent_metrics.words_per_minute <= 140.0,
+        "WPM should be ~133, got {}",
+        fluent_metrics.words_per_minute
+    );
+    assert_eq!(fluent_metrics.pause_duration_ratio, 0.0);
+    assert_eq!(fluent_metrics.hesitation_count, 0);
+    assert!(
+        fluent_metrics.fluency_score >= 95.0,
+        "Fluent utterance should score >= 95, got {}",
+        fluent_metrics.fluency_score
+    );
+
+    // Hesitant utterance: 4 words in 4000ms = 60 WPM, with 3 pauses of 400ms each (total pause 1200ms = 30%)
+    let hesitant_metrics = FluencyMetrics::calculate(4, 4000, &[400, 400, 400]);
+    assert_eq!(hesitant_metrics.hesitation_count, 3);
+    assert!((hesitant_metrics.pause_duration_ratio - 0.30).abs() < 1e-3);
+    assert!(
+        hesitant_metrics.fluency_score < 60.0,
+        "Hesitant utterance should be penalized, got {}",
+        hesitant_metrics.fluency_score
+    );
+
+    // Empty / silence recording: duration 0, words 0 -> 0 WPM, no panic, no NaN, score 0
+    let empty_metrics = FluencyMetrics::calculate(0, 0, &[]);
+    assert_eq!(empty_metrics.words_per_minute, 0.0);
+    assert_eq!(empty_metrics.pause_duration_ratio, 0.0);
+    assert_eq!(empty_metrics.hesitation_count, 0);
+    assert_eq!(empty_metrics.fluency_score, 0.0);
+    assert!(!empty_metrics.fluency_score.is_nan());
+
+    // 2. Test WordAssessment and Completeness
+    // Target: ["the", "quick", "fox"]
+    // Recognized: ["the", "fox"] -> "quick" is an Omission
+    let (comp_omission, words_omission) = evaluator.calculate_completeness(
+        &["the", "quick", "fox"],
+        &["the", "fox"],
+    );
+    assert!(comp_omission < 100.0, "Omission should reduce completeness, got {comp_omission}");
+    assert_eq!(words_omission.len(), 3);
+    assert_eq!(words_omission[1].word, "quick");
+    assert_eq!(words_omission[1].error_type.as_deref(), Some("Omission"));
+
+    // Recognized with insertion: ["the", "really", "quick", "fox"]
+    let (comp_insertion, words_insertion) = evaluator.calculate_completeness(
+        &["the", "quick", "fox"],
+        &["the", "really", "quick", "fox"],
+    );
+    assert!(comp_insertion <= 100.0);
+    assert!(words_insertion.iter().any(|w| w.error_type.as_deref() == Some("Insertion")));
+
+    // 3. Test Prosody Score
+    // Expressive pitch variation: pitch varying between 120Hz and 180Hz
+    let pitch_expressive = vec![130.0, 145.0, 160.0, 175.0, 150.0, 135.0, 120.0];
+    let energy_dynamic = vec![0.03, 0.08, 0.12, 0.09, 0.05, 0.02];
+    let prosody_expressive = evaluator.calculate_prosody(
+        Some(&pitch_expressive),
+        Some(&energy_dynamic),
+        &[],
+    );
+    assert!(
+        prosody_expressive >= 80.0,
+        "Expressive prosody should be >= 80.0, got {prosody_expressive}"
+    );
+
+    // Flat monotone pitch: all frames 150.0Hz
+    let pitch_monotone = vec![150.0, 150.0, 150.0, 150.0, 150.0];
+    let prosody_monotone = evaluator.calculate_prosody(
+        Some(&pitch_monotone),
+        Some(&energy_dynamic),
+        &[],
+    );
+    assert!(
+        prosody_monotone < 65.0,
+        "Monotone prosody should be < 65.0, got {prosody_monotone}"
+    );
+
+    // 4. Test CEFR Level Mapping and Overall Score Formula:
+    // S_overall = 0.50 * S_acc + 0.25 * S_flu + 0.15 * S_comp + 0.10 * S_pro
+    // C2 (>= 90): 95 * 0.5 + 92 * 0.25 + 100 * 0.15 + 90 * 0.10 = 47.5 + 23.0 + 15.0 + 9.0 = 94.5
+    let report_c2 = PronunciationReport::new(
+        95.0,
+        92.0,
+        100.0,
+        90.0,
+        vec![WordAssessment {
+            word: "hello".to_string(),
+            accuracy_score: 95.0,
+            error_type: None,
+            phonemes: vec![PhonemeScore::new("HH", 95.0, 0, 50)],
+        }],
+        vec![PhonemeScore::new("HH", 95.0, 0, 50)],
+        vec![],
+    );
+    assert_eq!(report_c2.cefr_level, "C2");
+    assert!((report_c2.overall_score - 94.5).abs() < 1e-3);
+    assert!(report_c2.is_passing(80.0));
+
+    // C1: 82 * 0.5 + 80 * 0.25 + 90 * 0.15 + 80 * 0.10 = 41.0 + 20.0 + 13.5 + 8.0 = 82.5
+    let report_c1 = PronunciationReport::new(82.0, 80.0, 90.0, 80.0, vec![], vec![], vec![]);
+    assert_eq!(report_c1.cefr_level, "C1");
+
+    // B2: 72 * 0.5 + 75 * 0.25 + 80 * 0.15 + 70 * 0.10 = 36.0 + 18.75 + 12.0 + 7.0 = 73.75
+    let report_b2 = PronunciationReport::new(72.0, 75.0, 80.0, 70.0, vec![], vec![], vec![]);
+    assert_eq!(report_b2.cefr_level, "B2");
+
+    // B1: 60 * 0.5 + 60 * 0.25 + 70 * 0.15 + 60 * 0.10 = 30.0 + 15.0 + 10.5 + 6.0 = 61.5
+    let report_b1 = PronunciationReport::new(60.0, 60.0, 70.0, 60.0, vec![], vec![], vec![]);
+    assert_eq!(report_b1.cefr_level, "B1");
+
+    // A2: 45 * 0.5 + 50 * 0.25 + 50 * 0.15 + 40 * 0.10 = 22.5 + 12.5 + 7.5 + 4.0 = 46.5
+    let report_a2 = PronunciationReport::new(45.0, 50.0, 50.0, 40.0, vec![], vec![], vec![]);
+    assert_eq!(report_a2.cefr_level, "A2");
+
+    // A1: < 40
+    let report_a1 = PronunciationReport::new(30.0, 30.0, 30.0, 30.0, vec![], vec![], vec![]);
+    assert_eq!(report_a1.cefr_level, "A1");
+
+    // 5. Test Full End-to-End Report Generation with Feedback Tips
+    let full_report = evaluator.evaluate_comprehensive_report(
+        "hello world",
+        &["hello", "world"],
+        &[
+            ("hello", vec![PhonemeScore::new("HH", 95.0, 0, 50), PhonemeScore::new("OW", 90.0, 50, 100)]),
+            ("world", vec![PhonemeScore::new("W", 45.0, 100, 150), PhonemeScore::new("ER", 85.0, 150, 200)]),
+        ],
+        1200, // 1200ms duration
+        &[],   // no pauses
+        Some(&[140.0, 150.0, 130.0]),
+        Some(&[0.05, 0.08, 0.04]),
+    );
+
+    assert_eq!(full_report.words.len(), 2);
+    assert_eq!(full_report.words[0].word, "hello");
+    assert_eq!(full_report.words[0].error_type, None);
+    assert_eq!(full_report.words[1].word, "world");
+    assert_eq!(full_report.words[1].error_type.as_deref(), Some("Mispronounced"));
+    assert!(!full_report.feedback_tips.is_empty(), "Feedback tips should provide advice on mispronunciation");
+    assert!(full_report.feedback_tips.iter().any(|tip| tip.contains("W") || tip.contains("phát âm")));
+
+    // 6. Test Serialization Roundtrip
+    let json = serde_json::to_string(&full_report).expect("Serialization failed");
+    let deserialized: PronunciationReport = serde_json::from_str(&json).expect("Deserialization failed");
+    assert_eq!(full_report.overall_score, deserialized.overall_score);
+    assert_eq!(full_report.cefr_level, deserialized.cefr_level);
+    assert_eq!(full_report.words.len(), deserialized.words.len());
 }
